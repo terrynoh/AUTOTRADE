@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AUTOTRADE Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', -apple-system, sans-serif;
+            background: #0a0e17;
+            color: #e1e5eb;
+            font-size: 14px;
+        }
+
+        /* ── 레이아웃 ── */
+        .header {
+            background: #111827;
+            border-bottom: 1px solid #1e293b;
+            padding: 12px 24px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .header h1 { font-size: 18px; font-weight: 600; color: #f0f4f8; }
+        .header .mode {
+            padding: 4px 12px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .mode-dry_run { background: #1e3a5f; color: #60a5fa; }
+        .mode-paper { background: #3b2f1e; color: #fbbf24; }
+        .mode-live { background: #3b1e1e; color: #f87171; }
+
+        .container { padding: 16px 24px; display: flex; flex-direction: column; gap: 16px; }
+
+        /* ── 카드 ── */
+        .row { display: flex; gap: 16px; flex-wrap: wrap; }
+        .card {
+            background: #111827;
+            border: 1px solid #1e293b;
+            border-radius: 8px;
+            padding: 16px;
+            flex: 1;
+            min-width: 200px;
+        }
+        .card h3 {
+            font-size: 12px;
+            color: #64748b;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 8px;
+        }
+        .card .value {
+            font-size: 24px;
+            font-weight: 700;
+            color: #f0f4f8;
+        }
+        .card .sub { font-size: 12px; color: #64748b; margin-top: 4px; }
+
+        /* ── 상태 표시 ── */
+        .status-dot {
+            display: inline-block;
+            width: 8px; height: 8px;
+            border-radius: 50%;
+            margin-right: 6px;
+        }
+        .dot-green { background: #22c55e; }
+        .dot-red { background: #ef4444; }
+        .dot-yellow { background: #eab308; }
+        .dot-blue { background: #3b82f6; }
+        .dot-gray { background: #6b7280; }
+
+        /* ── 버튼 ── */
+        .btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+        .btn:hover { opacity: 0.85; }
+        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-primary { background: #3b82f6; color: white; }
+        .btn-warning { background: #f59e0b; color: #1a1a1a; }
+        .btn-danger { background: #ef4444; color: white; }
+        .btn-success { background: #22c55e; color: #1a1a1a; }
+        .btn-group { display: flex; gap: 8px; }
+
+        /* ── 모니터 테이블 ── */
+        .monitor-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        .monitor-table th {
+            text-align: left;
+            padding: 8px 12px;
+            color: #64748b;
+            font-weight: 500;
+            border-bottom: 1px solid #1e293b;
+            font-size: 11px;
+            text-transform: uppercase;
+        }
+        .monitor-table td {
+            padding: 10px 12px;
+            border-bottom: 1px solid #1e293b;
+        }
+        .monitor-table tr:hover { background: #1a2332; }
+
+        .price-up { color: #ef4444; }
+        .price-down { color: #3b82f6; }
+        .price-flat { color: #64748b; }
+        .pnl-plus { color: #22c55e; }
+        .pnl-minus { color: #ef4444; }
+
+        /* ── 주문 상태 바 ── */
+        .order-bar {
+            display: flex;
+            gap: 4px;
+            align-items: center;
+        }
+        .order-chip {
+            padding: 2px 8px;
+            border-radius: 3px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .chip-pending { background: #1e3a5f; color: #60a5fa; }
+        .chip-filled { background: #14532d; color: #4ade80; }
+        .chip-none { background: #1e293b; color: #475569; }
+
+        /* ── 가격 레벨 차트 ── */
+        .price-levels {
+            position: relative;
+            height: 80px;
+            background: #0d1117;
+            border-radius: 4px;
+            margin: 8px 0;
+            overflow: hidden;
+        }
+        .price-marker {
+            position: absolute;
+            height: 2px;
+            width: 100%;
+            left: 0;
+        }
+        .price-label {
+            position: absolute;
+            right: 4px;
+            font-size: 10px;
+            transform: translateY(-50%);
+        }
+
+        /* ── 로그 ── */
+        .log-box {
+            background: #0d1117;
+            border: 1px solid #1e293b;
+            border-radius: 8px;
+            padding: 12px;
+            max-height: 250px;
+            overflow-y: auto;
+            font-family: 'Consolas', 'SF Mono', monospace;
+            font-size: 12px;
+            line-height: 1.6;
+        }
+        .log-box::-webkit-scrollbar { width: 6px; }
+        .log-box::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+        .log-entry { white-space: pre-wrap; word-break: break-all; }
+        .log-time { color: #475569; }
+        .log-INFO { color: #60a5fa; }
+        .log-WARNING { color: #fbbf24; }
+        .log-ERROR { color: #f87171; }
+
+        /* ── 상태 머신 ── */
+        .state-flow {
+            display: flex;
+            gap: 4px;
+            align-items: center;
+        }
+        .state-step {
+            padding: 4px 10px;
+            border-radius: 4px;
+            font-size: 11px;
+            font-weight: 600;
+            background: #1e293b;
+            color: #475569;
+        }
+        .state-step.active {
+            background: #1e3a5f;
+            color: #60a5fa;
+        }
+        .state-step.done {
+            background: #14532d;
+            color: #4ade80;
+        }
+        .state-arrow { color: #334155; font-size: 10px; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>AUTOTRADE</h1>
+        <div style="display: flex; align-items: center; gap: 12px;">
+            <span id="server-time" style="color: #64748b; font-size: 13px;">--:--:--</span>
+            <span id="mode-badge" class="mode mode-dry_run">--</span>
+            <span id="conn-status">
+                <span class="status-dot dot-red"></span>Disconnected
+            </span>
+        </div>
+    </div>
+
+    <div class="container">
+        <!-- 컨트롤 -->
+        <div class="row">
+            <div class="card" style="flex: none; width: auto;">
+                <div class="btn-group">
+                    <button class="btn btn-primary" id="btn-connect" onclick="doConnect()">API 연결</button>
+                    <button class="btn btn-warning" id="btn-screening" onclick="doScreening()" disabled>스크리닝</button>
+                    <button class="btn btn-danger" id="btn-disconnect" onclick="doDisconnect()" disabled>연결 해제</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- 계좌 요약 -->
+        <div class="row">
+            <div class="card">
+                <h3>예수금</h3>
+                <div class="value" id="cash">-</div>
+            </div>
+            <div class="card">
+                <h3>평가금액</h3>
+                <div class="value" id="total-eval">-</div>
+            </div>
+            <div class="card">
+                <h3>당일 P&L</h3>
+                <div class="value" id="daily-pnl">-</div>
+                <div class="sub" id="daily-trades">거래 0건</div>
+            </div>
+        </div>
+
+        <!-- 타겟 종목 모니터 -->
+        <div class="card">
+            <h3>타겟 종목 모니터</h3>
+            <div id="monitors-empty" style="color: #475569; padding: 20px; text-align: center;">
+                스크리닝 실행 전
+            </div>
+            <div id="monitors-container" style="display: none;"></div>
+        </div>
+
+        <!-- 로그 -->
+        <div class="card">
+            <h3>시스템 로그</h3>
+            <div class="log-box" id="log-box"></div>
+        </div>
+    </div>
+
+    <script>
+        /*__ADMIN__*/
+        /*__TOKEN__*/
+        let ws = null;
+
+        function adminHeaders() {
+            const h = {};
+            if (typeof ADMIN_TOKEN !== 'undefined' && ADMIN_TOKEN) {
+                h['X-Admin-Token'] = ADMIN_TOKEN;
+            }
+            return h;
+        }
+
+        // 관리자가 아니면 제어 버튼 숨김
+        if (typeof IS_ADMIN !== 'undefined' && !IS_ADMIN) {
+            document.addEventListener('DOMContentLoaded', () => {
+                const ctrl = document.querySelector('.btn-group');
+                if (ctrl) ctrl.closest('.card').style.display = 'none';
+            });
+            // 뷰어도 WebSocket으로 실시간 데이터 수신
+            connectWS();
+        }
+
+        // ── API 호출 ──
+        async function doConnect() {
+            setBtn('btn-connect', true, '연결 중...');
+            const res = await fetch('/api/connect', {method: 'POST', headers: adminHeaders()}).then(r => r.json());
+            if (res.ok) {
+                setBtn('btn-connect', true);
+                setBtn('btn-screening', false);
+                setBtn('btn-disconnect', false);
+                connectWS();
+            } else {
+                alert('연결 실패: ' + res.msg);
+                setBtn('btn-connect', false);
+            }
+        }
+
+        async function doScreening() {
+            setBtn('btn-screening', true, '실행 중...');
+            const res = await fetch('/api/screening', {method: 'POST', headers: adminHeaders()}).then(r => r.json());
+            setBtn('btn-screening', false);
+        }
+
+        async function doDisconnect() {
+            await fetch('/api/disconnect', {method: 'POST', headers: adminHeaders()});
+            setBtn('btn-connect', false);
+            setBtn('btn-screening', true);
+            setBtn('btn-disconnect', true);
+            if (ws) ws.close();
+        }
+
+        function setBtn(id, disabled, text) {
+            const btn = document.getElementById(id);
+            btn.disabled = disabled;
+            if (text) btn.textContent = text;
+            else {
+                const defaults = {'btn-connect': 'API 연결', 'btn-screening': '스크리닝', 'btn-disconnect': '연결 해제'};
+                btn.textContent = defaults[id] || btn.textContent;
+            }
+        }
+
+        // ── WebSocket ──
+        function connectWS() {
+            const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${proto}//${location.host}/ws`);
+            ws.onmessage = (e) => {
+                const data = JSON.parse(e.data);
+                updateUI(data);
+            };
+            ws.onclose = () => setTimeout(connectWS, 3000);
+        }
+
+        // ── UI 업데이트 ──
+        function updateUI(d) {
+            // 헤더
+            document.getElementById('server-time').textContent = d.server_time;
+            const badge = document.getElementById('mode-badge');
+            badge.textContent = d.trade_mode.toUpperCase();
+            badge.className = 'mode mode-' + d.trade_mode;
+
+            const conn = document.getElementById('conn-status');
+            conn.innerHTML = d.connected
+                ? '<span class="status-dot dot-green"></span>Connected'
+                : '<span class="status-dot dot-red"></span>Disconnected';
+
+            // 계좌
+            document.getElementById('cash').textContent = fmtWon(d.available_cash);
+            document.getElementById('total-eval').textContent = fmtWon(d.total_eval);
+
+            const pnlEl = document.getElementById('daily-pnl');
+            pnlEl.textContent = (d.daily_pnl >= 0 ? '+' : '') + fmtWon(d.daily_pnl);
+            pnlEl.className = 'value ' + (d.daily_pnl >= 0 ? 'pnl-plus' : 'pnl-minus');
+            document.getElementById('daily-trades').textContent = `거래 ${d.daily_trades}건`;
+
+            // 모니터
+            const emptyEl = document.getElementById('monitors-empty');
+            const contEl = document.getElementById('monitors-container');
+
+            if (d.monitors.length === 0) {
+                emptyEl.style.display = 'block';
+                contEl.style.display = 'none';
+            } else {
+                emptyEl.style.display = 'none';
+                contEl.style.display = 'block';
+                contEl.innerHTML = d.monitors.map(renderMonitor).join('');
+            }
+
+            // 로그
+            const logBox = document.getElementById('log-box');
+            const atBottom = logBox.scrollTop + logBox.clientHeight >= logBox.scrollHeight - 30;
+            logBox.innerHTML = d.logs.map(l =>
+                `<div class="log-entry"><span class="log-time">${l.time}</span> <span class="log-${l.level}">[${l.level}]</span> ${escHtml(l.msg)}</div>`
+            ).join('');
+            if (atBottom) logBox.scrollTop = logBox.scrollHeight;
+        }
+
+        function renderMonitor(m) {
+            const stateSteps = [
+                {key: 'watching_new_high', label: '신고가 대기'},
+                {key: 'tracking_high', label: '고가 추적'},
+                {key: 'high_confirmed', label: '매수 대기'},
+                {key: 'entered', label: '보유 중'},
+                {key: 'exited', label: '청산'},
+            ];
+            const currentIdx = stateSteps.findIndex(s => s.key === m.state);
+
+            const stateHtml = stateSteps.map((s, i) => {
+                let cls = 'state-step';
+                if (i < currentIdx) cls += ' done';
+                else if (i === currentIdx) cls += ' active';
+                return `<span class="${cls}">${s.label}</span>` + (i < stateSteps.length - 1 ? '<span class="state-arrow">></span>' : '');
+            }).join('');
+
+            const changeCls = m.change_pct > 0 ? 'price-up' : m.change_pct < 0 ? 'price-down' : 'price-flat';
+            const pnlCls = m.pnl >= 0 ? 'pnl-plus' : 'pnl-minus';
+
+            const buy1Chip = m.buy1_filled ? 'chip-filled' : m.buy1_placed ? 'chip-pending' : 'chip-none';
+            const buy2Chip = m.buy2_filled ? 'chip-filled' : m.buy2_placed ? 'chip-pending' : 'chip-none';
+
+            return `
+            <div style="margin-bottom: 16px; padding: 12px; background: #0d1117; border-radius: 6px; border: 1px solid #1e293b;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                    <div>
+                        <span style="font-weight: 700; font-size: 15px;">${m.name}</span>
+                        <span style="color: #64748b; font-size: 12px; margin-left: 6px;">${m.code} ${m.market}</span>
+                    </div>
+                    <div style="text-align: right;">
+                        <span style="font-size: 20px; font-weight: 700;">${fmtPrice(m.current_price)}</span>
+                        <span class="${changeCls}" style="margin-left: 8px; font-weight: 600;">${m.change_pct >= 0 ? '+' : ''}${m.change_pct.toFixed(2)}%</span>
+                    </div>
+                </div>
+
+                <div class="state-flow" style="margin-bottom: 10px;">
+                    ${stateHtml}
+                </div>
+
+                <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; font-size: 12px;">
+                    <div><span style="color: #64748b;">고가:</span> ${fmtPrice(m.intraday_high)}</div>
+                    <div><span style="color: #64748b;">1차 매수가:</span> ${fmtPrice(m.buy1_price)}</div>
+                    <div><span style="color: #64748b;">2차 매수가:</span> ${fmtPrice(m.buy2_price)}</div>
+                    <div><span style="color: #64748b;">손절가:</span> <span style="color: #ef4444;">${fmtPrice(m.hard_stop_price)}</span></div>
+                    <div><span style="color: #64748b;">목표가:</span> <span style="color: #22c55e;">${fmtPrice(m.target_price)}</span></div>
+                    <div><span style="color: #64748b;">평단가:</span> ${fmtPrice(m.avg_price)}</div>
+                    <div><span style="color: #64748b;">수량:</span> ${m.total_qty}주</div>
+                    <div><span style="color: #64748b;">P&L:</span> <span class="${pnlCls}">${m.pnl >= 0 ? '+' : ''}${fmtWon(m.pnl)}</span></div>
+                </div>
+
+                <div style="margin-top: 8px; display: flex; gap: 6px;">
+                    <span class="order-chip ${buy1Chip}">1차 ${m.buy1_filled ? '체결' : m.buy1_placed ? '대기' : '-'}</span>
+                    <span class="order-chip ${buy2Chip}">2차 ${m.buy2_filled ? '체결' : m.buy2_placed ? '대기' : '-'}</span>
+                    ${m.exit_reason ? `<span class="order-chip" style="background:#3b1e1e;color:#f87171;">청산: ${m.exit_reason}</span>` : ''}
+                </div>
+            </div>`;
+        }
+
+        // ── 포맷터 ──
+        function fmtWon(n) {
+            if (n === 0 || n === undefined) return '-';
+            return n.toLocaleString('ko-KR') + '원';
+        }
+        function fmtPrice(n) {
+            if (!n) return '-';
+            return n.toLocaleString('ko-KR');
+        }
+        function escHtml(s) {
+            return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+        }
+
+        // 페이지 로드 시 상태 확인
+        fetch('/api/status').then(r => r.json()).then(d => {
+            if (d.connected) {
+                setBtn('btn-connect', true);
+                setBtn('btn-screening', false);
+                setBtn('btn-disconnect', false);
+                connectWS();
+            }
+            updateUI(d);
+        });
+    </script>
+</body>
+</html>

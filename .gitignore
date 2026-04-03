@@ -1,0 +1,41 @@
+# Environment
+.env
+
+# KIS 토큰 캐시 (보안 — git 커밋 금지)
+token_paper.json
+token_live.json
+token_*.tmp
+
+# Runtime data
+data/
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# PyInstaller
+dist/
+build/
+*.spec.bak
+
+# OS
+Thumbs.db
+.DS_Store
+nul
+
+# Claude Code
+.claude/
