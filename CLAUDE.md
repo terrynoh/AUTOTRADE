@@ -219,7 +219,7 @@ C:\Users\terryn\AUTOTRADE\
 | Phase 4 | 주문 실행 — 모의투자 체결 확인 | 코드 완료, 미검증 |
 | Phase 5 | 운영 안정화 — 1~2주 모의투자 후 실매매 전환 | 코드 완료, 미검증 |
 | **Phase α-0** | **매매 로직 누락 부분 보강 (10시 가드 + 선물 급락)** | **✅ 완료 (2026-04-07)** |
-| **Phase α-1a** | **클라우드 lift and shift (Oracle E2.1.Micro, systemd, Quick Tunnel)** | **✅ 완료 (2026-04-08)** |
+| **Phase α-1a** | **클라우드 lift and shift (Oracle E2.1.Micro, systemd, Quick Tunnel)** | **✅ 완료 (2026-04-08 02:00 KST) — 134.185.115.229, commit ac6acd2** |
 | **Phase α-1b** | **Named Tunnel 전환 + 고정 URL** | **🟡 진행 예정 (도메인 결정 후)** |
 | Phase α-1 (잔여) | 다중 사용자 UI (인증/권한 분리) | 📅 α-1b 후 |
 | Phase α-2 | Strategy plug-in 구조 + Account Executor 구조 | 📅 α-1 안정 후 |
@@ -403,6 +403,18 @@ Phase α 진입 전 코드 base 정리. feature/dashboard-fix-v1 브랜치.
 - ❌ PostgreSQL 마이그레이션 (사용자 2명 고정 → 영영 X)
 - ❌ 텔레그램 옵션 Y (별도 결정)
 - ❌ 동적 파라미터 변경 UI (별도 결정)
+
+### α-1a 절대 원칙 예외 기록
+
+**DECISION-α1a-EXCEPTION-01** (2026-04-08 01:35 KST)
+
+α-1a 절대 원칙 "dashboard 코드 0줄 변경"에 대한 일시 예외.
+
+- **예외 범위**: `src/dashboard/app.py` + `src/dashboard/templates/index.html` 합쳐서 2줄 변경
+- **예외 사유**: ISSUE-030 두 버그가 09:00 가동 검증의 시각적 도구(예수금/평가금액 카드)를 무력화. 수정 범위가 작고 영향 격리 가능하다고 판단하여 즉시 수정 선택.
+- **수정 commit**: `fcc5a6a` (2026-04-08 01:50 KST)
+- **결과**: both-ok (수석님 시각 확인)
+- **이 예외가 정당화하지 않는 것**: 이후 dashboard 코드 변경에 대한 일반적 허용 없음. 인증 stripping 제거 같은 구조적 변경 없음.
 
 ---
 
@@ -595,44 +607,98 @@ await self.api.connect()  # 토큰 자동 발급/갱신 (24시간 유효)
 - 조사 + 해결 필요
 
 ### ISSUE-026 — Ampere A1 인스턴스 확보 후 재생성 검토
-- 현재: Oracle E2.1.Micro (AMD, 956Mi RAM, 1 OCPU)
+- 현재: Oracle E2.1.Micro (AMD, 956Mi RAM + 4GB swap, 1 OCPU) — 134.185.115.229
 - 목표: A1.Flex (Ampere ARM, 24Gi RAM, 4 OCPU) — Oracle Always Free 쿼터
 - 현황: ap-chuncheon-1 AD-1에서 A1.Flex 용량 부족으로 E2.1.Micro 채택
-- 조건: A1 용량 확보 시점에 재검토 (리소스 여유가 큼)
+- 조건: A1 용량 확보 시점에 재검토. 데이터 마이그레이션 절차 별도 작성 필요.
 
 ### ISSUE-027 — Telegram bot stop_polling 시 CancelledError traceback
 - 발생: systemd stop → SIGTERM → graceful shutdown 시 telegram bot.stop() 내부에서 traceback 출력
-- 영향: 무해 (종료 플로우 정상 완료), autotrade.err에 기록됨
-- 원인: python-telegram-bot v22.7 stop() 내부 update_queue CancelledError 미처리
-- 처리: α-1b 또는 이후 정리 예정
+- 영향: 무해 (종료 플로우 정상 완료), autotrade.err에 기록됨. 로그 noise.
+- 원인: python-telegram-bot v22.7 stop() 내부 update_queue CancelledError 미처리 (알려진 패턴 가능)
+- 처리: α-1b 또는 이후 CancelledError swallow 처리
 
-### ISSUE-028 — Quick Tunnel → Named Tunnel 전환 (α-1b 작업)
+### ISSUE-028 — Quick Tunnel → Named Tunnel 전환 (α-1b 핵심 작업)
 - 현재: Quick Tunnel (*.trycloudflare.com), 재시작 시마다 URL 변경
 - 목표: Named Tunnel (autotrade.수석님도메인.com), 고정 URL
-- 사전 필요: 도메인 결정 + Cloudflare 계정 + DNS 네임서버 이전
-- Phase B 선결: src/utils/tunnel.py CloudflareTunnel 클래스가 Named 모드를 지원하는지 코드 분석 필요
-- 예상 코드 변경: 환경변수 분기 없으면 tunnel.py 수정 필요
+- 사전 필요: 도메인 등록 + Cloudflare 계정 + DNS 네임서버 이전 + DNS 전파 확인
+- 코드 선결: `src/utils/tunnel.py` CloudflareTunnel 클래스가 Named 모드를 지원하는지 분석 필요
+- 예상 작업: cloudflared config 파일 작성, 코드 호환성 분석, 무중단 마이그레이션 (16:00 이후)
 
 ### ISSUE-029 — Dashboard 수동 종목 입력 "검증 중..." 버튼 휴장 시간 동작 확인
 - 발견: 2026-04-08 01:01 KST 새벽 휴장 시간에 "에코프로" 검증 클릭 시 응답 없음
-- 검증: 09:00 KST 장 시작 후 재시도. 작동하면 휴장 한정, 작동 안 하면 코드 분석 필요
+- 검증: 09:00 KST 장 시작 후 재시도. 작동하면 휴장 한정 → close. 작동 안 하면 dashboard 코드 분석.
 
-### ISSUE-030 — Dashboard 예수금 / 평가금액 카드 표시 버그 (2건)
+### ~~ISSUE-030~~ — Dashboard 예수금 / 평가금액 카드 표시 버그 (✅ 수정 완료 commit fcc5a6a)
 - 발견: 2026-04-08 01:30 KST 새벽 첫 dashboard 접속 시
 
-**버그 1 — 예수금 "-" (WebSocket 인증 미연동)**
-- 위치: `app.py:355, 361-364` + `index.html:467`
-- 원인: WebSocket URL에 `?token=` 미부착 → `is_admin=False` → `available_cash` strip → JS `undefined` → `"-"`
+**버그 1 — 예수금 "-" (WebSocket 인증 미연동)** — ✅ 수정
+- 원인: `index.html:467` WebSocket URL에 `?token=` 미부착 → `is_admin=False` → `available_cash` strip
+- 수정: `/*__TOKEN__*/` 주입 패턴 활용. admin은 `?token=ADMIN_TOKEN` 부착, 비-admin은 빈 문자열 유지
 
-**버그 2 — 평가금액에 투자원금 표시 (label 매핑)**
-- 위치: `app.py:405`
-- 원인: `state.total_eval = at._initial_cash` (초기 자본금 고정값)
-- 정상: `total_eval = available_cash + sum(holdings_market_value)`
+**버그 2 — 평가금액에 투자원금 표시 (label 매핑)** — ✅ 수정
+- 원인: `app.py:405` `state.total_eval = at._initial_cash` (초기 자본금 고정)
+- 수정: `state.total_eval = at._available_cash` (보유 0 가정)
 
-- 수정 범위: 2 파일, 2~5 줄
-- 수정 시기: α-1a 외. 가동 첫째 날 16:00 이후 또는 α-1b
-- 운영 우회: KIS 모의투자 앱으로 잔고 교차 검증
+**잔여 — 보유 종목 발생 후 평가금액 정확도** (α-1b 검토)
+- 현재: `total_eval = _available_cash`만. 보유 시 시가 합계 누락.
+- 정상: `total_eval = available_cash + sum(holdings_market_value)` — `holdings_market_value` 미구현
 
 **Phase α-0으로 흡수된 이슈** (별도 추적 종료):
 - ~~ISSUE-025 청산 조건 ④ 선물 급락 미구현~~ → Phase α-0 항목 2
 - ~~monitor.py "25분 타임아웃" 주석 오류~~ → Phase α-0 항목 1
+
+---
+
+## 12. 운영 Runbook (α-1a 가동 후)
+
+### 12.1 인스턴스 정보
+
+| 항목 | 값 |
+|------|-----|
+| Host | ubuntu@134.185.115.229 |
+| Region | Seoul (ap-chuncheon-1, icn05 PoP) |
+| Shape | VM.Standard.E2.1.Micro (956Mi RAM + 4GB swap, 1 OCPU AMD) |
+| OS | Ubuntu 22.04 LTS |
+| Service | autotrade.service (systemd, enabled) |
+| Tunnel | Quick Tunnel (*.trycloudflare.com) — α-1b에서 Named 전환 예정 |
+
+### 12.2 09:00 가동 직전 체크리스트
+
+1. 텔레그램 봇 → 가장 최근 Tunnel URL 확인
+2. `URL?token=$DASHBOARD_ADMIN_TOKEN` 으로 dashboard admin 접속
+3. `ssh ubuntu@134.185.115.229 'free -h'` → 메모리 정상 확인
+4. `ssh ubuntu@134.185.115.229 'sudo systemctl is-active autotrade'` → `active`
+5. `ssh ubuntu@134.185.115.229 'tail -30 ~/AUTOTRADE/logs/autotrade.err'` → ERROR 없음 확인
+
+### 12.3 매매 검증 명령어 세트
+
+```bash
+# 실시간 로그
+ssh ubuntu@134.185.115.229 'tail -f ~/AUTOTRADE/logs/autotrade.log'
+
+# 거래 카운트
+ssh ubuntu@134.185.115.229 'sqlite3 ~/AUTOTRADE/data/trades.db "select count(*) from trades"'
+
+# 최근 거래 10건
+ssh ubuntu@134.185.115.229 'sqlite3 -header -column ~/AUTOTRADE/data/trades.db "select datetime(timestamp,\"localtime\") as time, code, side, qty, price from trades order by id desc limit 10"'
+
+# 시그널 발화 로그
+ssh ubuntu@134.185.115.229 'grep -E "신고가|트리거|매수|매도|청산" ~/AUTOTRADE/logs/autotrade.log | tail -30'
+
+# 메모리
+ssh ubuntu@134.185.115.229 'free -h'
+```
+
+### 12.4 트러블슈팅
+
+```bash
+# systemd 재시작
+ssh ubuntu@134.185.115.229 'sudo systemctl restart autotrade'
+
+# systemd 정지 (긴급)
+ssh ubuntu@134.185.115.229 'sudo systemctl stop autotrade'
+
+# Tunnel URL 재발송 강제 (재시작 → cloudflared 새 URL → 텔레그램 발송)
+ssh ubuntu@134.185.115.229 'sudo systemctl restart autotrade'
+```
