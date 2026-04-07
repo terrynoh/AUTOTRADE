@@ -1013,7 +1013,39 @@ class AutoTrader:
 
 
 def main():
-    asyncio.run(AutoTrader().run())
+    import signal as _signal
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    # ── SIGTERM graceful shutdown (7단계) ──────────────────
+    # 1단계: SIGTERM 수신 → 핸들러 진입
+    def _sigterm_handler():
+        logger.info("SIGTERM 수신 → graceful shutdown 시작")
+        # 2단계: 실행 중인 모든 asyncio 태스크 cancel()
+        for task in asyncio.all_tasks(loop):
+            task.cancel()
+        # 3~7단계: CancelledError → run() finally 블록 실행
+        #   3. tasks 정리 (cancel + gather)
+        #   4. notifier.stop_polling()  — 텔레그램 봇 중지
+        #   5. api.disconnect()         — KIS WebSocket + REST 세션 종료
+        #   6. tunnel.stop()            — Cloudflare Tunnel 종료
+        #   7. logger "AUTOTRADE 종료"  — 종료 로그
+
+    if hasattr(_signal, "SIGTERM"):
+        try:
+            loop.add_signal_handler(_signal.SIGTERM, _sigterm_handler)
+        except (NotImplementedError, RuntimeError):
+            pass  # Windows는 add_signal_handler 미지원 — 무시
+
+    try:
+        loop.run_until_complete(AutoTrader().run())
+    finally:
+        try:
+            loop.run_until_complete(loop.shutdown_asyncgens())
+        except Exception:
+            pass
+        loop.close()
 
 
 if __name__ == "__main__":

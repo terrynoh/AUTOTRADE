@@ -32,6 +32,7 @@ class Database:
 
     def _init_tables(self):
         conn = self._connect()
+        conn.execute("PRAGMA journal_mode=WAL")
         conn.executescript("""
             CREATE TABLE IF NOT EXISTS trades (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
