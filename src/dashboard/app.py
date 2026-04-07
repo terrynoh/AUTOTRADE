@@ -9,29 +9,20 @@ from __future__ import annotations
 
 import asyncio
 import hmac
-import json
 import os
-from datetime import datetime
 from pathlib import Path
 
 from src.utils.market_calendar import now_kst
-from typing import Optional
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-from config.settings import Settings, StrategyParams
-from src.kis_api.kis import KISAPI
-from src.core.screener import Screener
-from src.core.monitor import TargetMonitor, MonitorState
-from src.core.trader import Trader
-from src.core.risk_manager import RiskManager
+from src.core.monitor import TargetMonitor
 
 ADMIN_TOKEN = os.getenv("DASHBOARD_ADMIN_TOKEN", "")
 
@@ -70,20 +61,13 @@ class DashboardState:
     """대시보드에서 공유하는 전역 상태."""
 
     def __init__(self):
-        self.settings: Optional[Settings] = None
-        self.params: Optional[StrategyParams] = None
-        self.api: Optional[KISAPI] = None
+        self.autotrader = None  # AutoTrader 인스턴스 (attach_autotrader로 설정)
         self.connected: bool = False
         self.trade_mode: str = ""
         self.available_cash: int = 0
         self.total_eval: int = 0
 
         self.monitors: list[TargetMonitor] = []
-        self.trader: Optional[Trader] = None
-        self.risk: Optional[RiskManager] = None
-
-        # 수동 종목 입력
-        self.manual_codes: list[str] = []
 
         # 종목명 캐시: {code: name} + {name_upper: code}
         self._stock_name_cache: dict[str, str] = {}
@@ -135,12 +119,30 @@ class DashboardState:
             "msg": msg,
         }
         # deque(maxlen=N)이 자동으로 오래된 항목 제거
-        if self.params and self.log_messages.maxlen != self.params.infra.dashboard_log_buffer_size:
+        if self.autotrader and self.log_messages.maxlen != self.autotrader.params.infra.dashboard_log_buffer_size:
             from collections import deque
-            self.log_messages = deque(self.log_messages, maxlen=self.params.infra.dashboard_log_buffer_size)
+            self.log_messages = deque(self.log_messages, maxlen=self.autotrader.params.infra.dashboard_log_buffer_size)
         self.log_messages.append(entry)
 
     def to_dict(self) -> dict:
+        at = self.autotrader
+
+        # AutoTrader 미연결 시 빈 데이터 반환
+        if not at:
+            return {
+                "connected": False,
+                "trade_mode": "",
+                "available_cash": 0,
+                "total_eval": 0,
+                "daily_pnl": 0,
+                "daily_trades": 0,
+                "monitors": [],
+                "manual_codes": [],
+                "logs": list(self.log_messages)[-100:],
+                "server_time": now_kst().strftime("%H:%M:%S"),
+            }
+
+        params = at.params
         monitors_data = []
         for mon in self.monitors:
             t = mon.target
@@ -163,22 +165,23 @@ class DashboardState:
                 "target_price": round(t.target_price),
                 "post_entry_low": t.post_entry_low,
                 "exit_reason": t.exit_reason,
-                "buy1_price": t.buy1_price(self.params) if self.params and t.intraday_high > 0 else 0,
-                "buy2_price": t.buy2_price(self.params) if self.params and t.intraday_high > 0 else 0,
-                "hard_stop_price": t.hard_stop_price(self.params) if self.params and t.intraday_high > 0 else 0,
-                "pnl": round(self.trader.get_pnl(t.stock.current_price)) if self.trader else 0,
+                "buy1_price": t.buy1_price(params) if t.intraday_high > 0 else 0,
+                "buy2_price": t.buy2_price(params) if t.intraday_high > 0 else 0,
+                "hard_stop_price": t.hard_stop_price(params) if t.intraday_high > 0 else 0,
+                "pnl": round(at.trader.get_pnl(t.stock.current_price)),
             })
 
+        log_size = params.infra.dashboard_log_return_size
         return {
             "connected": self.connected,
             "trade_mode": self.trade_mode,
             "available_cash": self.available_cash,
             "total_eval": self.total_eval,
-            "daily_pnl": round(self.risk.daily_pnl) if self.risk else 0,
-            "daily_trades": self.risk.daily_trades if self.risk else 0,
+            "daily_pnl": round(at.risk.daily_pnl),
+            "daily_trades": at.risk.daily_trades,
             "monitors": monitors_data,
-            "manual_codes": self.manual_codes,
-            "logs": list(self.log_messages)[-(self.params.infra.dashboard_log_return_size if self.params else 100):],
+            "manual_codes": list(at._manual_codes),
+            "logs": list(self.log_messages)[-log_size:],
             "server_time": now_kst().strftime("%H:%M:%S"),
         }
 
@@ -231,88 +234,14 @@ async def api_status():
     return state.to_dict()
 
 
-@app.post("/api/connect")
-async def api_connect(token: str = Header(None, alias="X-Admin-Token")):
-    """KIS API 연결."""
-    _check_admin(token)
-    try:
-        state.settings = Settings()
-        state.params = StrategyParams.load()
-        state.trade_mode = state.settings.trade_mode
-
-        state.api = KISAPI(
-            app_key=state.settings.kis_app_key,
-            app_secret=state.settings.kis_app_secret,
-            account_no=state.settings.account_no,
-            is_paper=state.settings.is_paper_mode,
-        )
-        await state.api.connect()
-        state.connected = True
-
-        if state.settings.is_dry_run and state.settings.dry_run_cash > 0:
-            state.available_cash = state.settings.dry_run_cash
-            state.total_eval = state.settings.dry_run_cash
-            state.add_log("INFO", f"[DRY_RUN] 가상 예수금: {state.available_cash:,}원")
-        else:
-            balance = await state.api.get_balance()
-            state.available_cash = balance.get("available_cash", 0)
-            state.total_eval = balance.get("total_eval", 0)
-
-        state.risk = RiskManager(state.params)
-        state.trader = Trader(state.api, state.settings, state.params)
-
-        state.add_log("INFO", f"KIS 연결 완료 ({state.api.get_server_type()})")
-        state.add_log("INFO", f"예수금: {state.available_cash:,}원")
-        return {"ok": True, "msg": "연결 성공"}
-
-    except Exception as e:
-        logger.error(f"연결 실패: {e}")
-        state.add_log("ERROR", "연결 실패")
-        return {"ok": False, "msg": "연결 중 오류 발생"}
-
-
-@app.post("/api/screening")
-async def api_screening(token: str = Header(None, alias="X-Admin-Token")):
-    """수동 스크리닝 실행."""
-    _check_admin(token)
-    if not state.connected or not state.api:
-        return {"ok": False, "msg": "API 미연결"}
-
-    try:
-        screener = Screener(state.api, state.params, is_live=(state.trade_mode == "live"), use_live_data=state.settings.use_live_data)
-
-        # loguru 로그를 대시보드 UI에도 표시
-        def _log_sink(message):
-            record = message.record
-            state.add_log(record["level"].name, record["message"])
-
-        sink_id = logger.add(_log_sink, level="DEBUG", format="{message}")
-        try:
-            targets = await screener.run()
-        finally:
-            logger.remove(sink_id)
-
-        state.monitors = []
-        for target in targets:
-            mon = TargetMonitor(target, state.params)
-            state.monitors.append(mon)
-
-        state.add_log("INFO", f"스크리닝 완료: {len(targets)}종목 선정")
-        for t in targets:
-            state.add_log("INFO", f"  타겟: {t.stock.name}({t.stock.code}) 등락{t.stock.price_change_pct:+.2f}%")
-
-        return {"ok": True, "msg": f"{len(targets)}종목 선정"}
-
-    except Exception as e:
-        logger.error(f"스크리닝 실패: {e}")
-        state.add_log("ERROR", "스크리닝 실패")
-        return {"ok": False, "msg": "스크리닝 중 오류 발생"}
-
 
 @app.post("/api/set-targets")
 async def api_set_targets(request: Request, token: str = Header(None, alias="X-Admin-Token")):
     """수동 타겟 종목 설정 — 종목코드(6자리) 또는 종목명 모두 지원."""
     _check_admin(token)
+    if not state.autotrader:
+        return {"ok": False, "msg": "AutoTrader 미연결"}
+
     try:
         body = await request.json()
         inputs = body.get("codes", [])
@@ -322,6 +251,8 @@ async def api_set_targets(request: Request, token: str = Header(None, alias="X-A
         cleaned = [c.strip() for c in inputs if c.strip()]
         if not cleaned:
             return {"ok": False, "msg": "유효한 입력 없음"}
+
+        api = state.autotrader.api
 
         # 종목코드/종목명 → 코드 변환 + KIS API 검증
         resolved: list[dict] = []
@@ -334,23 +265,18 @@ async def api_set_targets(request: Request, token: str = Header(None, alias="X-A
                 continue
 
             # KIS API로 유효성 검증 + 종목명 확인
-            if state.connected and state.api:
-                try:
-                    info = await state.api.get_current_price(code)
-                    price = info.get("current_price", 0)
-                    if price <= 0:
-                        errors.append(f"'{raw}'({code}) → 유효하지 않은 종목")
-                        continue
-                    # 종목명: API 응답 → 캐시 → 코드 그대로
-                    name = info.get("name", "") or state._stock_name_cache.get(code, "") or code
-                    state.cache_stock(code, name)
-                    resolved.append({"code": code, "name": name})
-                except Exception:
-                    errors.append(f"'{raw}'({code}) → KIS API 조회 실패")
-            else:
-                # API 미연결 시 캐시만 사용
-                name = state._stock_name_cache.get(code, "")
-                resolved.append({"code": code, "name": name or code})
+            try:
+                info = await api.get_current_price(code)
+                price = info.get("current_price", 0)
+                if price <= 0:
+                    errors.append(f"'{raw}'({code}) → 유효하지 않은 종목")
+                    continue
+                # 종목명: API 응답 → 캐시 → 코드 그대로
+                name = info.get("name", "") or state._stock_name_cache.get(code, "") or code
+                state.cache_stock(code, name)
+                resolved.append({"code": code, "name": name})
+            except Exception:
+                errors.append(f"'{raw}'({code}) → KIS API 조회 실패")
 
         if not resolved:
             msg = "유효한 종목 없음"
@@ -358,11 +284,14 @@ async def api_set_targets(request: Request, token: str = Header(None, alias="X-A
                 msg += " | " + ", ".join(errors)
             return {"ok": False, "msg": msg}
 
-        state.manual_codes = [r["code"] for r in resolved]
+        # AutoTrader에 최종 검증된 종목코드 일괄 설정
+        final_codes = [r["code"] for r in resolved]
+        state.autotrader.set_manual_codes(final_codes)
+
         display = ", ".join(f'{r["name"]}({r["code"]})' for r in resolved)
         state.add_log("INFO", f"수동 타겟 종목 설정: {display} ({len(resolved)}종목)")
 
-        result = {"ok": True, "msg": f"{len(resolved)}종목 설정 완료", "codes": state.manual_codes, "stocks": resolved}
+        result = {"ok": True, "msg": f"{len(resolved)}종목 설정 완료", "codes": final_codes, "stocks": resolved}
         if errors:
             result["errors"] = errors
         return result
@@ -382,9 +311,9 @@ async def api_search_stock(q: str = ""):
 
     # 캐시에 없고, 6자리 숫자 코드이면 KIS API로 직접 조회
     q_stripped = q.strip()
-    if not results and len(q_stripped) == 6 and q_stripped.isdigit() and state.connected and state.api:
+    if not results and len(q_stripped) == 6 and q_stripped.isdigit() and state.autotrader and state.autotrader.api:
         try:
-            info = await state.api.get_current_price(q_stripped)
+            info = await state.autotrader.api.get_current_price(q_stripped)
             if info.get("current_price", 0) > 0:
                 name = info.get("name", "") or q_stripped
                 state.cache_stock(q_stripped, name)
@@ -397,38 +326,19 @@ async def api_search_stock(q: str = ""):
 
 @app.post("/api/run-manual-screening")
 async def api_run_manual_screening(token: str = Header(None, alias="X-Admin-Token")):
-    """수동 입력 종목으로 스크리닝 실행."""
+    """수동 입력 종목으로 스크리닝 실행 — AutoTrader에 위임."""
     _check_admin(token)
-    if not state.connected or not state.api:
-        return {"ok": False, "msg": "API 미연결"}
+    if not state.autotrader:
+        return {"ok": False, "msg": "AutoTrader 미연결"}
 
-    if not state.manual_codes:
+    if not state.autotrader._manual_codes:
         return {"ok": False, "msg": "수동 타겟 종목 미설정 (/api/set-targets 먼저 호출)"}
 
     try:
-        screener = Screener(state.api, state.params, is_live=(state.trade_mode == "live"), use_live_data=state.settings.use_live_data)
-
-        # loguru 로그를 대시보드 UI에도 표시
-        def _log_sink(message):
-            record = message.record
-            state.add_log(record["level"].name, record["message"])
-
-        sink_id = logger.add(_log_sink, level="DEBUG", format="{message}")
-        try:
-            targets = await screener.run_manual(state.manual_codes)
-        finally:
-            logger.remove(sink_id)
-
-        state.monitors = []
-        for target in targets:
-            mon = TargetMonitor(target, state.params)
-            state.monitors.append(mon)
-
-        state.add_log("INFO", f"수동 스크리닝 완료: {len(targets)}종목 선정")
-        for t in targets:
-            state.add_log("INFO", f"  타겟: {t.stock.name}({t.stock.code}) 등락{t.stock.price_change_pct:+.2f}%")
-
-        return {"ok": True, "msg": f"{len(targets)}종목 선정"}
+        await state.autotrader._on_screening()
+        count = len(state.autotrader._monitors)
+        state.add_log("INFO", f"수동 스크리닝 완료: {count}종목 선정")
+        return {"ok": True, "msg": f"{count}종목 선정"}
 
     except Exception as e:
         logger.error(f"수동 스크리닝 실패: {e}")
@@ -436,16 +346,6 @@ async def api_run_manual_screening(token: str = Header(None, alias="X-Admin-Toke
         return {"ok": False, "msg": "수동 스크리닝 중 오류 발생"}
 
 
-@app.post("/api/disconnect")
-async def api_disconnect(token: str = Header(None, alias="X-Admin-Token")):
-    """KIS API 연결 해제."""
-    _check_admin(token)
-    if state.api:
-        await state.api.disconnect()
-    state.connected = False
-    state.monitors = []
-    state.add_log("INFO", "연결 해제")
-    return {"ok": True}
 
 
 # ── WebSocket (실시간 업데이트) ───────────────────────────────
@@ -477,90 +377,37 @@ async def websocket_endpoint(ws: WebSocket):
             state._ws_clients.remove(ws)
 
 
-# ── 모니터 종목 실시간 가격 갱신 ────────────────────────────────
-
-async def _price_updater():
-    """모니터 종목의 현재가를 주기적으로 KIS REST API로 갱신."""
-    while True:
-        try:
-            if state.connected and state.api and state.monitors:
-                for mon in state.monitors:
-                    try:
-                        price_info = await state.api.get_current_price(mon.target.stock.code)
-                        mon.target.stock.current_price = price_info.get("current_price", mon.target.stock.current_price)
-                        mon.target.stock.price_change_pct = price_info.get("change_pct", mon.target.stock.price_change_pct)
-                        high = price_info.get("high", 0)
-                        if high > mon.target.intraday_high:
-                            mon.target.intraday_high = high
-                    except Exception as e:
-                        logger.debug(f"가격 갱신 실패 ({mon.target.stock.code}): {e}")
-        except Exception as e:
-            logger.debug(f"가격 업데이터 오류: {e}")
-        await asyncio.sleep(3)  # 3초 간격 갱신
-
 
 # ── 실행 ──────────────────────────────────────────────────────
 
-@app.on_event("startup")
-async def _auto_connect():
-    """서버 시작 시 KIS API 자동 연결 — 대시보드 단독 실행 시에도 데이터 표시."""
+
+# ── AutoTrader 연결 ──────────────────────────────────────────
+
+def attach_autotrader(autotrader) -> None:
+    """AutoTrader 인스턴스를 대시보드에 연결 (순수 sync)."""
+    state.autotrader = autotrader
+    autotrader.on_state_update = _sync_from_autotrader
+
+
+async def _sync_from_autotrader() -> None:
+    """AutoTrader → DashboardState 상태 동기화 + WS broadcast."""
+    at = state.autotrader
+    if at is None:
+        return
+
+    state.connected = True
+    state.trade_mode = at.settings.trade_mode
+    state.monitors = list(at._monitors)
+
+    # 예수금/평가
+    state.available_cash = at._available_cash
+    state.total_eval = at._initial_cash
+
+    # broadcast to WebSocket clients
     try:
-        state.settings = Settings()
-        state.params = StrategyParams.load()
-        state.trade_mode = state.settings.trade_mode
-
-        state.api = KISAPI(
-            app_key=state.settings.kis_app_key,
-            app_secret=state.settings.kis_app_secret,
-            account_no=state.settings.account_no,
-            is_paper=state.settings.is_paper_mode,
-            infra_params=state.params.infra,
-        )
-        await state.api.connect()
-        state.connected = True
-
-        if state.settings.is_dry_run and state.settings.dry_run_cash > 0:
-            state.available_cash = state.settings.dry_run_cash
-            state.total_eval = state.settings.dry_run_cash
-            state.add_log("INFO", f"[DRY_RUN] 가상 예수금: {state.available_cash:,}원")
-        else:
-            balance = await state.api.get_balance()
-            state.available_cash = balance.get("available_cash", 0)
-            state.total_eval = balance.get("total_eval", 0)
-
-        state.risk = RiskManager(state.params)
-        state.trader = Trader(state.api, state.settings, state.params)
-
-        state.add_log("INFO", f"KIS 자동 연결 완료 ({state.trade_mode})")
-        state.add_log("INFO", f"예수금: {state.available_cash:,}원")
-        logger.info(f"대시보드 자동 연결 완료 (예수금: {state.available_cash:,}원)")
-
-        # 종목명 캐시 구축
-        try:
-            # 1) stock_master.json (전체 종목 ~2800건, 150KB)
-            master_path = Path(__file__).resolve().parents[2] / "config" / "stock_master.json"
-            if master_path.exists():
-                import json as _json
-                master = _json.loads(master_path.read_text(encoding="utf-8"))
-                for code, name in master.items():
-                    state.cache_stock(code, name)
-                logger.info(f"종목 마스터 로드: {len(master)}건")
-
-            # 2) KIS 거래량순위 (최신 종목명 반영)
-            for mkt in ["J", "Q"]:
-                ranks = await state.api.get_volume_rank(market=mkt)
-                for r in ranks:
-                    state.cache_stock(r.get("code", ""), r.get("name", ""))
-
-            logger.info(f"종목명 캐시 총: {len(state._stock_name_cache)}건")
-        except Exception as e:
-            logger.warning(f"종목명 캐시 구축 실패: {e}")
+        await state.broadcast(state.to_dict())
     except Exception as e:
-        logger.warning(f"대시보드 자동 연결 실패 (수동 연결 필요): {e}")
-        state.add_log("WARNING", "자동 연결 실패 — 수동 연결 필요")
-
-    # 모니터 종목 실시간 가격 갱신 태스크 시작
-    asyncio.create_task(_price_updater())
+        logger.debug(f"WS broadcast 실패: {e}")
 
 
 def run_dashboard(host: str = "0.0.0.0", port: int = 0):

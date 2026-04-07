@@ -21,10 +21,12 @@ asyncio 기반으로 KIS REST/WebSocket 위에서
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import threading
 from datetime import datetime, time, timedelta
+from pathlib import Path
 from typing import Optional
 
 from loguru import logger
@@ -154,9 +156,6 @@ class AutoTrader:
         logger.info("=" * 50)
         self.notifier.notify_system(f"AUTOTRADE 시작 (모드: {self.settings.trade_mode})")
 
-        # 대시보드 서버 시작 (별도 스레드)
-        self._start_dashboard_server()
-
         # 텔레그램 명령 수신 설정
         self.notifier.setup_commands(
             on_target=self.set_manual_codes,
@@ -167,15 +166,6 @@ class AutoTrader:
             on_stop=self._stop_trading,
         )
         await self.notifier.start_polling()
-
-        # Cloudflare Tunnel 시작 → URL 텔레그램 발송 (관리자 토큰 포함)
-        tunnel_url = await self._tunnel.start()
-        if tunnel_url:
-            admin_token = os.getenv("DASHBOARD_ADMIN_TOKEN", "")
-            admin_url = f"{tunnel_url}?token={admin_token}" if admin_token else tunnel_url
-            self.notifier.notify_system(
-                f"대시보드 접속 URL (관리자)\n\n{admin_url}"
-            )
 
         tasks: list[asyncio.Task] = []
         try:
@@ -198,6 +188,19 @@ class AutoTrader:
                 self._initial_cash = balance.get("available_cash", 0)
             self._available_cash = self.risk.calculate_available_cash(self._initial_cash)
             logger.info(f"예수금: {self._initial_cash:,}원 → 매매가용: {self._available_cash:,}원")
+
+            # 대시보드 서버 시작 (API 연결 + 잔고 확인 후 → attach_autotrader 가능)
+            self._start_dashboard_server()
+            await self._build_stock_name_cache()
+
+            # Cloudflare Tunnel 시작 → URL 텔레그램 발송 (관리자 토큰 포함)
+            tunnel_url = await self._tunnel.start()
+            if tunnel_url:
+                admin_token = os.getenv("DASHBOARD_ADMIN_TOKEN", "")
+                admin_url = f"{tunnel_url}?token={admin_token}" if admin_token else tunnel_url
+                self.notifier.notify_system(
+                    f"대시보드 접속 URL (관리자)\n\n{admin_url}"
+                )
 
             self._running = True
             await self._fire_state_update()
@@ -266,6 +269,7 @@ class AutoTrader:
 
         if not targets:
             logger.info("스크리닝 결과 없음 — 당일 매매 안 함")
+            await self._fire_state_update()
             return
 
         # 후보 풀 저장
@@ -481,6 +485,7 @@ class AutoTrader:
             details=details,
         )
         logger.info("일일 리포트 텔레그램 발송 완료")
+        await self._fire_state_update()
 
     def _build_trade_record(self, mon: TargetMonitor, today) -> TradeRecord:
         """모니터에서 TradeRecord 생성."""
@@ -916,9 +921,9 @@ class AutoTrader:
     # ── 대시보드 서버 ────────────────────────────────────
 
     def _start_dashboard_server(self) -> None:
-        """대시보드(uvicorn) 서버를 데몬 스레드로 시작."""
+        """대시보드(uvicorn) 서버를 데몬 스레드로 시작 + AutoTrader 연결."""
         import uvicorn
-        from src.dashboard.app import app as dashboard_app
+        from src.dashboard.app import app as dashboard_app, attach_autotrader
 
         port = self.settings.dashboard_port
 
@@ -927,7 +932,33 @@ class AutoTrader:
 
         t = threading.Thread(target=_run, daemon=True, name="dashboard")
         t.start()
+
+        # 대시보드에 AutoTrader 연결 (sync: state + callback만 설정)
+        attach_autotrader(self)
         logger.info(f"대시보드 서버 시작 (port={port})")
+
+    async def _build_stock_name_cache(self) -> None:
+        """종목명 캐시 구축 — stock_master.json + KIS 거래량순위."""
+        from src.dashboard.app import state as dashboard_state
+
+        try:
+            # 1) stock_master.json (전체 종목 ~2800건)
+            master_path = Path(__file__).resolve().parents[1] / "config" / "stock_master.json"
+            if master_path.exists():
+                master = json.loads(master_path.read_text(encoding="utf-8"))
+                for code, name in master.items():
+                    dashboard_state.cache_stock(code, name)
+                logger.info(f"종목 마스터 로드: {len(master)}건")
+
+            # 2) KIS 거래량순위 (최신 종목명 반영)
+            for mkt in ["J", "Q"]:
+                ranks = await self.api.get_volume_rank(market=mkt)
+                for r in ranks:
+                    dashboard_state.cache_stock(r.get("code", ""), r.get("name", ""))
+
+            logger.info(f"종목명 캐시 총: {len(dashboard_state._stock_name_cache)}건")
+        except Exception as e:
+            logger.warning(f"종목명 캐시 구축 실패: {e}")
 
     # ── 유틸리티 ──────────────────────────────────────────
 
