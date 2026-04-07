@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AUTOTRADE 사용자 매뉴얼 v1.0</title>
+<style>
+    @media print {
+        body { font-size: 11pt; }
+        .page-break { page-break-before: always; }
+        .no-print { display: none; }
+    }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+        font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', sans-serif;
+        color: #1a1a1a;
+        line-height: 1.7;
+        max-width: 800px;
+        margin: 0 auto;
+        padding: 40px 30px;
+        background: #fff;
+    }
+    h1 { font-size: 28px; font-weight: 800; margin-bottom: 8px; color: #111; }
+    h2 { font-size: 22px; font-weight: 700; margin: 40px 0 16px; color: #1e40af; border-bottom: 2px solid #1e40af; padding-bottom: 6px; }
+    h3 { font-size: 17px; font-weight: 700; margin: 28px 0 12px; color: #333; }
+    h4 { font-size: 14px; font-weight: 700; margin: 16px 0 8px; color: #555; }
+    p { margin: 8px 0; }
+    .subtitle { font-size: 14px; color: #666; margin-bottom: 30px; }
+    .version { font-size: 12px; color: #999; }
+
+    /* 목차 */
+    .toc { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px; padding: 20px 28px; margin: 20px 0 40px; }
+    .toc h3 { margin: 0 0 12px; color: #1e40af; }
+    .toc ol { padding-left: 20px; }
+    .toc li { margin: 4px 0; }
+    .toc a { color: #1e40af; text-decoration: none; }
+    .toc a:hover { text-decoration: underline; }
+
+    /* UI 모킹 */
+    .ui-mock {
+        background: #0a0e17;
+        border: 2px solid #334155;
+        border-radius: 10px;
+        padding: 20px;
+        margin: 16px 0;
+        color: #e1e5eb;
+        font-family: 'Segoe UI', sans-serif;
+        font-size: 13px;
+        position: relative;
+    }
+    .ui-mock .mock-header {
+        background: #111827;
+        border-bottom: 1px solid #1e293b;
+        padding: 10px 16px;
+        margin: -20px -20px 16px;
+        border-radius: 8px 8px 0 0;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+    }
+    .ui-mock .mock-header h4 { color: #f0f4f8; font-size: 16px; font-weight: 600; margin: 0; }
+    .ui-mock .mock-badge {
+        padding: 3px 10px;
+        border-radius: 4px;
+        font-size: 11px;
+        font-weight: 600;
+    }
+    .badge-dry { background: #1e3a5f; color: #60a5fa; }
+    .badge-connected { background: #14532d; color: #4ade80; }
+
+    .mock-btn {
+        display: inline-block;
+        padding: 7px 14px;
+        border-radius: 6px;
+        font-size: 12px;
+        font-weight: 600;
+        cursor: default;
+        border: none;
+    }
+    .mock-btn-blue { background: #3b82f6; color: white; }
+    .mock-btn-yellow { background: #f59e0b; color: #1a1a1a; }
+    .mock-btn-red { background: #ef4444; color: white; }
+    .mock-btn-green { background: #22c55e; color: #1a1a1a; }
+
+    .mock-input {
+        width: 100%;
+        padding: 8px 12px;
+        background: #0d1117;
+        border: 1px solid #1e293b;
+        border-radius: 6px;
+        color: #e1e5eb;
+        font-size: 13px;
+        margin: 4px 0;
+    }
+
+    .mock-card {
+        background: #111827;
+        border: 1px solid #1e293b;
+        border-radius: 8px;
+        padding: 14px;
+        margin: 8px 0;
+    }
+    .mock-card-title { font-size: 11px; color: #64748b; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+    .mock-card-value { font-size: 22px; font-weight: 700; color: #f0f4f8; }
+
+    .mock-tag {
+        display: inline-block;
+        padding: 3px 10px;
+        background: #1e3a5f;
+        color: #60a5fa;
+        border-radius: 4px;
+        font-size: 12px;
+        margin: 2px;
+    }
+    .mock-tag .x { color: #93c5fd; margin-left: 6px; cursor: default; }
+
+    /* 주석 화살표 */
+    .annotation {
+        background: #fef3c7;
+        border-left: 4px solid #f59e0b;
+        padding: 10px 14px;
+        margin: 12px 0;
+        font-size: 13px;
+        color: #92400e;
+        border-radius: 0 6px 6px 0;
+    }
+    .annotation strong { color: #78350f; }
+
+    .callout-num {
+        display: inline-flex;
+        width: 22px; height: 22px;
+        background: #ef4444;
+        color: white;
+        font-size: 12px;
+        font-weight: 700;
+        border-radius: 50%;
+        align-items: center;
+        justify-content: center;
+        margin-right: 4px;
+        vertical-align: middle;
+    }
+
+    /* 텔레그램 모킹 */
+    .tg-chat {
+        background: #e5ddd5;
+        border-radius: 10px;
+        padding: 16px;
+        margin: 16px 0;
+        max-width: 420px;
+    }
+    .tg-msg {
+        max-width: 85%;
+        padding: 8px 12px;
+        border-radius: 8px;
+        margin: 6px 0;
+        font-size: 13px;
+        line-height: 1.5;
+    }
+    .tg-user {
+        background: #dcf8c6;
+        margin-left: auto;
+        border-radius: 8px 0 8px 8px;
+        text-align: right;
+    }
+    .tg-bot {
+        background: #fff;
+        margin-right: auto;
+        border-radius: 0 8px 8px 8px;
+    }
+    .tg-cmd { font-weight: 700; color: #1e40af; }
+
+    /* 테이블 */
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        margin: 12px 0;
+        font-size: 13px;
+    }
+    th { background: #f1f5f9; text-align: left; padding: 10px 12px; border: 1px solid #e2e8f0; font-weight: 600; }
+    td { padding: 8px 12px; border: 1px solid #e2e8f0; }
+    tr:nth-child(even) { background: #f8fafc; }
+
+    /* 코드 */
+    code {
+        background: #f1f5f9;
+        padding: 2px 6px;
+        border-radius: 3px;
+        font-family: 'Consolas', 'D2Coding', monospace;
+        font-size: 12px;
+        color: #1e40af;
+    }
+
+    /* 단계 */
+    .step {
+        display: flex;
+        gap: 14px;
+        margin: 14px 0;
+        align-items: flex-start;
+    }
+    .step-num {
+        flex-shrink: 0;
+        width: 30px; height: 30px;
+        background: #1e40af;
+        color: white;
+        font-size: 14px;
+        font-weight: 700;
+        border-radius: 50%;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    .step-content { flex: 1; }
+
+    .warning-box {
+        background: #fef2f2;
+        border: 1px solid #fecaca;
+        border-radius: 8px;
+        padding: 12px 16px;
+        margin: 12px 0;
+        color: #991b1b;
+        font-size: 13px;
+    }
+    .info-box {
+        background: #eff6ff;
+        border: 1px solid #bfdbfe;
+        border-radius: 8px;
+        padding: 12px 16px;
+        margin: 12px 0;
+        color: #1e3a8a;
+        font-size: 13px;
+    }
+
+    .flow-diagram {
+        background: #f8fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        padding: 16px;
+        margin: 16px 0;
+        font-family: 'Consolas', monospace;
+        font-size: 12px;
+        line-height: 1.8;
+        white-space: pre;
+        overflow-x: auto;
+    }
+</style>
+</head>
+<body>
+
+<!-- ======== 표지 ======== -->
+<h1>AUTOTRADE 사용자 매뉴얼</h1>
+<p class="subtitle">대시보드 수동 설정 + 텔레그램 매매 명령어 가이드</p>
+<p class="version">v1.0 | 2026-04-06 | KOSPI/KOSDAQ 장중 단타 자동매매 시스템</p>
+
+<!-- 목차 -->
+<div class="toc">
+    <h3>목차</h3>
+    <ol>
+        <li><a href="#s1">매매 흐름 요약</a></li>
+        <li><a href="#s2">대시보드 접속 방법</a></li>
+        <li><a href="#s3">대시보드 화면 구성</a></li>
+        <li><a href="#s4">대시보드 수동 종목 설정 (Step by Step)</a></li>
+        <li><a href="#s5">대시보드 메뉴 설명</a></li>
+        <li><a href="#s6">텔레그램 명령어 가이드</a></li>
+        <li><a href="#s7">텔레그램 매매 시나리오 (실전 예시)</a></li>
+        <li><a href="#s8">전략 파라미터 요약</a></li>
+        <li><a href="#s9">FAQ / 주의사항</a></li>
+    </ol>
+</div>
+
+<!-- ======== 1. 매매 흐름 요약 ======== -->
+<h2 id="s1">1. 매매 흐름 요약</h2>
+
+<div class="flow-diagram">09:00  시스템 자동 시작 → KIS 토큰 발급, 대시보드 URL 텔레그램 전송
+ │
+09:30  사용자가 후보 종목 입력 (대시보드 또는 텔레그램 /target)
+ │
+09:50  스크리닝 실행 → 상승률/거래대금/상한가/프로그램순매수비중 필터
+ │
+09:55~ 타겟 종목 실시간 감시 시작
+ │     └── 당일 신고가 달성 → 고가 추적
+ │         └── 고가에서 1% 하락 → 매수 지정가 2건 진입
+ │             └── 고가 갱신 시 → 주문 취소 + 새 고가 기준 재주문
+ │
+매수 후  6개 청산 조건 동시 모니터링
+ │     ① 하드 손절 (KOSPI -4.1% / KOSDAQ -6.2%)
+ │     ② 추세 이탈 (반등 후 higher lows 깨짐)
+ │     ③ 20분 타임아웃 (눌림 최저가 기준)
+ │     ④ 목표가 도달 (고가+눌림저가)/2
+ │     ⑤ 선물 급락 (-1%)
+ │     ⑥ 강제 청산 (15:20)
+ │
+15:30  장 마감 → 일일 리포트 텔레그램 발송</div>
+
+<!-- ======== 2. 대시보드 접속 ======== -->
+<h2 id="s2">2. 대시보드 접속 방법</h2>
+
+<h3>로컬 접속 (같은 PC)</h3>
+<p>브라우저에서 <code>http://localhost:8503</code> 접속 → 자동으로 관리자 권한 부여</p>
+
+<h3>원격 접속 (텔레그램 URL)</h3>
+<p>매일 09:00에 텔레그램으로 전송되는 <b>Cloudflare Tunnel URL</b>로 접속합니다.</p>
+<div class="tg-chat">
+    <div class="tg-msg tg-bot">
+        <b>AUTOTRADE 대시보드 시작</b><br>
+        시각: 2026-04-07 09:00 KST<br>
+        모드: dry_run<br><br>
+        관리자 접속:<br>
+        https://xxx-yyy.trycloudflare.com?token=d952...<br><br>
+        읽기 전용:<br>
+        https://xxx-yyy.trycloudflare.com
+    </div>
+</div>
+
+<div class="info-box">
+    <b>관리자 vs 읽기 전용</b><br>
+    - <b>관리자 URL</b> (?token= 포함): 종목 설정, 스크리닝, 연결 등 모든 기능 사용 가능<br>
+    - <b>읽기 전용 URL</b>: 모니터링만 가능 (버튼 숨김)
+</div>
+
+<!-- ======== 3. 대시보드 화면 구성 ======== -->
+<h2 id="s3" class="page-break">3. 대시보드 화면 구성</h2>
+
+<h3>3-1. 헤더 영역</h3>
+<div class="ui-mock">
+    <div class="mock-header">
+        <h4>AUTOTRADE</h4>
+        <div style="display:flex; align-items:center; gap:10px;">
+            <span style="color:#64748b; font-size:12px;">09:52:31</span>
+            <span class="mock-badge badge-dry">DRY_RUN</span>
+            <span style="color:#4ade80;">● Connected</span>
+        </div>
+    </div>
+    <div style="height: 1px;"></div>
+</div>
+
+<table>
+    <tr><th style="width:150px;">요소</th><th>설명</th></tr>
+    <tr><td><b>서버 시각</b></td><td>KST 기준 현재 시각 (1초 갱신)</td></tr>
+    <tr><td><b>모드 배지</b></td><td>
+        <code>DRY_RUN</code> (파란색) = 가상 매매<br>
+        <code>PAPER</code> (노란색) = 모의투자<br>
+        <code>LIVE</code> (빨간색) = 실매매
+    </td></tr>
+    <tr><td><b>연결 상태</b></td><td>
+        <span style="color:green;">● Connected</span> = KIS API 연결됨<br>
+        <span style="color:red;">● Disconnected</span> = 미연결
+    </td></tr>
+</table>
+
+<h3>3-2. 제어 버튼 (관리자 전용)</h3>
+<div class="ui-mock">
+    <div style="display:flex; gap:8px;">
+        <span class="mock-btn mock-btn-blue">API 연결</span>
+        <span class="mock-btn mock-btn-yellow">자동 스크리닝</span>
+        <span class="mock-btn mock-btn-red">연결 해제</span>
+    </div>
+</div>
+
+<table>
+    <tr><th>버튼</th><th>기능</th><th>사용 시점</th></tr>
+    <tr><td><span class="mock-btn mock-btn-blue" style="font-size:11px;padding:4px 8px;">API 연결</span></td>
+        <td>KIS API 서버에 연결하고 토큰을 발급</td>
+        <td>서버 시작 시 자동 실행. 수동 재연결 필요 시 사용</td></tr>
+    <tr><td><span class="mock-btn mock-btn-yellow" style="font-size:11px;padding:4px 8px;">자동 스크리닝</span></td>
+        <td>거래량/거래대금 순위 기반 자동 종목 선정</td>
+        <td>수동 종목 미설정 시 폴백용. 평상시 수동 입력 권장</td></tr>
+    <tr><td><span class="mock-btn mock-btn-red" style="font-size:11px;padding:4px 8px;">연결 해제</span></td>
+        <td>KIS API 연결 종료, 모니터 초기화</td>
+        <td>시스템 종료 시</td></tr>
+</table>
+
+<h3>3-3. 수동 종목 입력 영역</h3>
+<div class="ui-mock">
+    <div class="mock-card">
+        <div class="mock-card-title">수동 종목 입력</div>
+        <input class="mock-input" value="" placeholder="종목 검색 (예: 삼성, 에코프로, 006400)" readonly>
+        <div style="display:flex; flex-wrap:wrap; gap:6px; margin:8px 0;">
+            <span class="mock-tag">삼성SDI (006400) <span class="x">×</span></span>
+            <span class="mock-tag">에코프로비엠 (247540) <span class="x">×</span></span>
+            <span class="mock-tag">롯데에너지머티리얼즈 (020150) <span class="x">×</span></span>
+        </div>
+        <div style="display:flex; gap:8px; align-items:center; margin-top:10px;">
+            <input class="mock-input" value="" placeholder="직접 입력 (쉼표 구분, 예: 006400, 에코프로비엠)" readonly style="flex:1;">
+            <span class="mock-btn mock-btn-blue">종목 설정</span>
+            <span class="mock-btn mock-btn-green">수동 스크리닝</span>
+        </div>
+        <div style="font-size:12px; color:#4ade80; margin-top:8px;">설정된 종목: 삼성SDI(006400), 에코프로비엠(247540), 롯데에너지머티리얼즈(020150)</div>
+    </div>
+</div>
+
+<div class="annotation">
+    <span class="callout-num">1</span> <b>종목 검색 입력란</b> — 한글 종목명 또는 6자리 코드를 입력하면 자동완성 드롭다운이 표시됩니다. 전체 KOSPI+KOSDAQ ~2,800종목 검색 가능.<br><br>
+    <span class="callout-num">2</span> <b>선택된 종목 태그</b> — 검색 결과에서 클릭하면 파란 태그로 추가됩니다. × 클릭으로 제거.<br><br>
+    <span class="callout-num">3</span> <b>직접 입력란</b> — 검색 대신 코드/종목명을 쉼표로 직접 입력 가능. 예: <code>006400, 에코프로비엠, 020150</code><br><br>
+    <span class="callout-num">4</span> <b>종목 설정</b> 버튼 — 태그 + 직접 입력을 합쳐 KIS API로 유효성 검증 후 타겟 종목으로 등록<br><br>
+    <span class="callout-num">5</span> <b>수동 스크리닝</b> 버튼 — 설정된 종목에 대해 상승률/거래대금/프로그램순매수비중 필터 실행
+</div>
+
+<h3>3-4. 계좌 요약 카드</h3>
+<div class="ui-mock">
+    <div style="display:flex; gap:12px;">
+        <div class="mock-card" style="flex:1;">
+            <div class="mock-card-title">예수금</div>
+            <div class="mock-card-value">50,000,000원</div>
+        </div>
+        <div class="mock-card" style="flex:1;">
+            <div class="mock-card-title">평가금액</div>
+            <div class="mock-card-value">50,000,000원</div>
+        </div>
+        <div class="mock-card" style="flex:1;">
+            <div class="mock-card-title">당일 P&L</div>
+            <div class="mock-card-value" style="color:#4ade80;">+125,000원</div>
+            <div style="font-size:11px; color:#64748b;">거래 1건</div>
+        </div>
+    </div>
+</div>
+
+<h3>3-5. 타겟 종목 모니터</h3>
+<p>스크리닝 후 타겟 종목의 실시간 상태를 표시합니다.</p>
+<div class="ui-mock">
+    <div class="mock-card">
+        <div class="mock-card-title">타겟 종목 모니터</div>
+        <table style="width:100%; border-collapse:collapse; color:#e1e5eb; font-size:12px; margin-top:8px;">
+            <tr style="border-bottom:1px solid #1e293b;">
+                <th style="background:transparent; color:#64748b; border:none; padding:6px 8px; font-size:10px;">종목</th>
+                <th style="background:transparent; color:#64748b; border:none; padding:6px 8px; font-size:10px;">현재가</th>
+                <th style="background:transparent; color:#64748b; border:none; padding:6px 8px; font-size:10px;">등락</th>
+                <th style="background:transparent; color:#64748b; border:none; padding:6px 8px; font-size:10px;">당일고가</th>
+                <th style="background:transparent; color:#64748b; border:none; padding:6px 8px; font-size:10px;">상태</th>
+                <th style="background:transparent; color:#64748b; border:none; padding:6px 8px; font-size:10px;">매수</th>
+            </tr>
+            <tr style="border-bottom:1px solid #1e293b;">
+                <td style="border:none; padding:8px;">삼성SDI (006400)</td>
+                <td style="border:none; padding:8px; color:#ef4444;">470,000</td>
+                <td style="border:none; padding:8px; color:#ef4444;">+3.42%</td>
+                <td style="border:none; padding:8px;">470,000</td>
+                <td style="border:none; padding:8px;"><span style="background:#1e3a5f; color:#60a5fa; padding:2px 8px; border-radius:4px; font-size:10px;">고가추적중</span></td>
+                <td style="border:none; padding:8px;"><span style="background:#1e293b; color:#475569; padding:2px 8px; border-radius:4px; font-size:10px;">대기</span></td>
+            </tr>
+        </table>
+    </div>
+</div>
+
+<table>
+    <tr><th>상태</th><th>의미</th></tr>
+    <tr><td><code>watching_new_high</code></td><td>09:55 이후 신고가 대기 중</td></tr>
+    <tr><td><code>tracking_high</code></td><td>신고가 달성, 고가 추적 중 (1% 하락 대기)</td></tr>
+    <tr><td><code>high_confirmed</code></td><td>고가 확정, 매수 주문 배치됨</td></tr>
+    <tr><td><code>entered</code></td><td>매수 체결 완료, 청산 조건 모니터링 중</td></tr>
+    <tr><td><code>exited</code></td><td>청산 완료</td></tr>
+    <tr><td><code>skipped</code></td><td>매매 안 함 (눌림 미발생 등)</td></tr>
+</table>
+
+<h3>3-6. 시스템 로그</h3>
+<p>하단에 실시간 로그가 표시됩니다. API 연결, 스크리닝 결과, 매수/매도 체결 등 모든 이벤트가 시간순으로 기록됩니다.</p>
+
+
+<!-- ======== 4. 수동 종목 설정 Step by Step ======== -->
+<h2 id="s4" class="page-break">4. 대시보드 수동 종목 설정 (Step by Step)</h2>
+
+<div class="step">
+    <div class="step-num">1</div>
+    <div class="step-content">
+        <b>대시보드 접속</b><br>
+        텔레그램에서 받은 관리자 URL 클릭, 또는 <code>http://localhost:8503</code> 접속
+    </div>
+</div>
+
+<div class="step">
+    <div class="step-num">2</div>
+    <div class="step-content">
+        <b>KIS API 연결 확인</b><br>
+        헤더에 <span style="color:green;">● Connected</span>가 표시되어야 합니다.<br>
+        Disconnected이면 <b>API 연결</b> 버튼 클릭
+    </div>
+</div>
+
+<div class="step">
+    <div class="step-num">3</div>
+    <div class="step-content">
+        <b>종목 검색 또는 직접 입력</b><br>
+        <b>방법 A</b>: 상단 검색창에 <code>삼성</code> 입력 → 드롭다운에서 <b>삼성SDI(006400)</b> 클릭 → 파란 태그 추가<br>
+        <b>방법 B</b>: 하단 직접 입력란에 <code>006400, 에코프로비엠, 020150</code> 입력
+    </div>
+</div>
+
+<div class="step">
+    <div class="step-num">4</div>
+    <div class="step-content">
+        <b>"종목 설정" 버튼 클릭</b><br>
+        KIS API로 종목 유효성 검증 → 하단에 <span style="color:green;">설정된 종목: 삼성SDI(006400), ...</span> 표시
+    </div>
+</div>
+
+<div class="step">
+    <div class="step-num">5</div>
+    <div class="step-content">
+        <b>"수동 스크리닝" 버튼 클릭</b><br>
+        설정된 종목에 대해 5단계 필터 실행:<br>
+        ① 상승률 > 0% → ② 거래대금 ≥ 500억 → ③ 상한가 미도달 → ④ 프로그램순매수비중 ≥ 5% → ⑤ 상승률 최고 종목<br>
+        통과 종목이 타겟 종목 모니터에 표시됩니다.
+    </div>
+</div>
+
+<div class="step">
+    <div class="step-num">6</div>
+    <div class="step-content">
+        <b>자동 매매 진행</b><br>
+        이후 자동으로 신고가 감시 → 매수 → 청산까지 진행됩니다.<br>
+        텔레그램으로 매수/매도 알림이 전송됩니다.
+    </div>
+</div>
+
+<div class="warning-box">
+    <b>주의사항</b><br>
+    - 종목 설정은 <b>09:50 전</b>에 완료하세요. 09:50에 자동 스크리닝이 실행됩니다.<br>
+    - 종목 설정 없이 09:50을 지나면 자동 스크리닝(거래량 순위 기반)으로 폴백됩니다.<br>
+    - 종목은 최대 <b>10개</b>까지 입력 가능합니다 (필터 후 최대 5종목 선정).
+</div>
+
+
+<!-- ======== 5. 대시보드 메뉴 설명 ======== -->
+<h2 id="s5">5. 대시보드 메뉴 설명</h2>
+
+<table>
+    <tr><th style="width:180px;">메뉴/영역</th><th>기능</th><th>권한</th></tr>
+    <tr><td>API 연결</td><td>KIS 서버 연결 + 토큰 발급 + 예수금 조회</td><td>관리자</td></tr>
+    <tr><td>자동 스크리닝</td><td>거래량/거래대금/급등 순위 기반 자동 종목 선정</td><td>관리자</td></tr>
+    <tr><td>연결 해제</td><td>KIS API 연결 종료</td><td>관리자</td></tr>
+    <tr><td>종목 검색</td><td>KOSPI+KOSDAQ 전종목 한글 검색 (자동완성)</td><td>관리자</td></tr>
+    <tr><td>종목 설정</td><td>선택한 종목을 타겟으로 등록 (KIS API 검증)</td><td>관리자</td></tr>
+    <tr><td>수동 스크리닝</td><td>등록된 종목에 5단계 필터 적용</td><td>관리자</td></tr>
+    <tr><td>계좌 요약</td><td>예수금, 평가금액, 당일 P&L 실시간 표시</td><td>모두</td></tr>
+    <tr><td>타겟 모니터</td><td>종목별 현재가, 상태, 매수/청산 정보</td><td>모두</td></tr>
+    <tr><td>시스템 로그</td><td>실시간 이벤트 로그</td><td>모두</td></tr>
+</table>
+
+
+<!-- ======== 6. 텔레그램 명령어 ======== -->
+<h2 id="s6" class="page-break">6. 텔레그램 명령어 가이드</h2>
+
+<h3>6-1. 종목 설정 명령</h3>
+
+<h4>/target — 종목 설정 및 조회</h4>
+
+<div class="tg-chat">
+    <div class="tg-msg tg-user"><span class="tg-cmd">/target</span> 006400,247540,020150</div>
+    <div class="tg-msg tg-bot">✅ 타겟 종목 설정: 006400, 247540, 020150 (3종목)</div>
+</div>
+
+<p><b>종목명도 사용 가능:</b></p>
+<div class="tg-chat">
+    <div class="tg-msg tg-user"><span class="tg-cmd">/target</span> 삼성SDI,에코프로비엠,롯데에너지머티리얼즈</div>
+    <div class="tg-msg tg-bot">✅ 타겟 종목 설정: 삼성SDI, 에코프로비엠, 롯데에너지머티리얼즈 (3종목)</div>
+</div>
+
+<p><b>코드+종목명 혼합 가능:</b></p>
+<div class="tg-chat">
+    <div class="tg-msg tg-user"><span class="tg-cmd">/target</span> 006400,에코프로비엠,020150</div>
+    <div class="tg-msg tg-bot">✅ 타겟 종목 설정: 006400, 에코프로비엠, 020150 (3종목)</div>
+</div>
+
+<p><b>현재 설정 조회 (인자 없이):</b></p>
+<div class="tg-chat">
+    <div class="tg-msg tg-user"><span class="tg-cmd">/target</span></div>
+    <div class="tg-msg tg-bot">현재 타겟 종목: 006400, 247540, 020150 (3종목)</div>
+</div>
+
+<h4>/clear — 종목 초기화</h4>
+<div class="tg-chat">
+    <div class="tg-msg tg-user"><span class="tg-cmd">/clear</span></div>
+    <div class="tg-msg tg-bot">✅ 타겟 종목 초기화 완료</div>
+</div>
+
+<h3>6-2. 매매 제어 명령</h3>
+
+<h4>/screen — 스크리닝 실행</h4>
+<div class="tg-chat">
+    <div class="tg-msg tg-user"><span class="tg-cmd">/screen</span></div>
+    <div class="tg-msg tg-bot">🔍 스크리닝 실행 중...</div>
+    <div class="tg-msg tg-bot">
+        <b>스크리닝 결과: 1종목</b><br>
+        ★ 삼성SDI(006400) KOSPI<br>
+        &nbsp;&nbsp;등락 +3.42%
+    </div>
+</div>
+
+<h4>/stop — 당일 매매 중단</h4>
+<div class="tg-chat">
+    <div class="tg-msg tg-user"><span class="tg-cmd">/stop</span></div>
+    <div class="tg-msg tg-bot">🛑 당일 매매 중단됨. 미체결 주문 취소 처리 중.</div>
+</div>
+
+<h3>6-3. 모니터링 명령</h3>
+
+<h4>/status — 현재 상태 조회</h4>
+<div class="tg-chat">
+    <div class="tg-msg tg-user"><span class="tg-cmd">/status</span></div>
+    <div class="tg-msg tg-bot">
+        <b>AUTOTRADE 상태</b><br>
+        모드: dry_run<br>
+        예수금: 50,000,000원<br>
+        당일 매매: 1회<br>
+        당일 P&L: +125,000원<br>
+        타겟 종목: 006400, 247540<br><br>
+        <b>감시 중 (1종목)</b><br>
+        &nbsp;&nbsp;삼성SDI(006400) 상태=entered 고가=470,000
+    </div>
+</div>
+
+<h4>/help — 명령어 도움말</h4>
+<div class="tg-chat">
+    <div class="tg-msg tg-user"><span class="tg-cmd">/help</span></div>
+    <div class="tg-msg tg-bot">
+        <b>AUTOTRADE 텔레그램 명령어</b><br><br>
+        <b>종목 설정</b><br>
+        /target 006400,247540 — 코드로 설정<br>
+        /target 삼성SDI — 종목명으로 설정<br>
+        /target — 현재 종목 조회<br>
+        /clear — 초기화<br><br>
+        <b>매매 제어</b><br>
+        /screen — 스크리닝 실행<br>
+        /stop — 매매 중단<br><br>
+        <b>모니터링</b><br>
+        /status — 상태 조회<br>
+        /help — 도움말
+    </div>
+</div>
+
+
+<!-- ======== 7. 실전 시나리오 ======== -->
+<h2 id="s7" class="page-break">7. 텔레그램 매매 시나리오 (실전 예시)</h2>
+
+<p>PC 없이 스마트폰 텔레그램만으로 매매하는 전체 흐름입니다.</p>
+
+<h3>Step 1: 09:00 — 대시보드 URL 수신</h3>
+<div class="tg-chat">
+    <div class="tg-msg tg-bot">
+        🖥️ <b>AUTOTRADE 대시보드 시작</b><br>
+        시각: 2026-04-07 09:00 KST<br>
+        모드: dry_run<br><br>
+        📎 관리자 접속:<br>
+        https://icy-hill-abc.trycloudflare.com?token=d952...
+    </div>
+</div>
+<p style="color:#666; font-size:13px;">→ 링크 클릭하면 스마트폰 브라우저에서 대시보드 확인 가능</p>
+
+<h3>Step 2: 09:30 — HTS에서 후보 종목 확인 후 입력</h3>
+<div class="tg-chat">
+    <div class="tg-msg tg-user"><span class="tg-cmd">/target</span> 삼성SDI,에코프로비엠,롯데에너지머티리얼즈</div>
+    <div class="tg-msg tg-bot">✅ 타겟 종목 설정: 삼성SDI, 에코프로비엠, 롯데에너지머티리얼즈 (3종목)</div>
+</div>
+
+<h3>Step 3: 09:45 — 스크리닝 실행</h3>
+<div class="tg-chat">
+    <div class="tg-msg tg-user"><span class="tg-cmd">/screen</span></div>
+    <div class="tg-msg tg-bot">🔍 스크리닝 실행 중...</div>
+    <div class="tg-msg tg-bot">
+        <b>스크리닝 결과: 2종목</b><br>
+        ★ 삼성SDI(006400) KOSPI<br>
+        &nbsp;&nbsp;등락 +3.42%<br>
+        ★ 롯데에너지머티리얼즈(020150) KOSPI<br>
+        &nbsp;&nbsp;등락 +12.36%
+    </div>
+</div>
+<p style="color:#666; font-size:13px;">→ 에코프로비엠은 프로그램순매수비중 미달로 탈락</p>
+
+<h3>Step 4: 09:55~ — 자동 매매 진행 (알림 수신)</h3>
+<div class="tg-chat">
+    <div class="tg-msg tg-bot">
+        🟢 <b>매수 (buy1)</b><br>
+        롯데에너지머티리얼즈 | 542주 @ 46,068원<br>
+        금액: 24,968,856원
+    </div>
+</div>
+
+<h3>Step 5: 매매 중 — 상태 확인</h3>
+<div class="tg-chat">
+    <div class="tg-msg tg-user"><span class="tg-cmd">/status</span></div>
+    <div class="tg-msg tg-bot">
+        <b>AUTOTRADE 상태</b><br>
+        모드: dry_run<br>
+        예수금: 25,031,144원<br>
+        당일 매매: 1회<br>
+        당일 P&L: +0원<br><br>
+        <b>감시 중 (1종목)</b><br>
+        &nbsp;&nbsp;롯데에너지머티리얼즈(020150) 상태=entered 고가=47,250
+    </div>
+</div>
+
+<h3>Step 6: 청산 알림 수신</h3>
+<div class="tg-chat">
+    <div class="tg-msg tg-bot">
+        🎯 <b>매도 (target)</b><br>
+        롯데에너지머티리얼즈 | 542주 @ 46,425원<br>
+        P&L: +193,494원 (+0.77%)
+    </div>
+</div>
+
+<h3>긴급 상황: 매매 중단</h3>
+<div class="tg-chat">
+    <div class="tg-msg tg-user"><span class="tg-cmd">/stop</span></div>
+    <div class="tg-msg tg-bot">🛑 당일 매매 중단됨. 미체결 주문 취소 처리 중.</div>
+</div>
+<div class="warning-box">
+    <b>/stop은 긴급 상황에서만 사용하세요.</b><br>
+    이미 보유 중인 포지션은 자동 청산되지 않습니다. HTS에서 수동 확인이 필요합니다.
+</div>
+
+
+<!-- ======== 8. 전략 파라미터 ======== -->
+<h2 id="s8" class="page-break">8. 전략 파라미터 요약</h2>
+
+<h3>분할 매수 기준 (고가 대비 하락률)</h3>
+<table>
+    <tr><th>시장</th><th>1차 매수 (예수금 50%)</th><th>2차 매수 (예수금 50%)</th></tr>
+    <tr><td><b>KOSPI</b></td><td>-2.5%</td><td>-3.5%</td></tr>
+    <tr><td><b>KOSDAQ</b></td><td>-3.75%</td><td>-5.25%</td></tr>
+</table>
+
+<h3>청산 조건 (먼저 도달하는 조건 실행)</h3>
+<table>
+    <tr><th>조건</th><th>기준</th><th>청산 방식</th></tr>
+    <tr><td>① 하드 손절</td><td>KOSPI -4.1% / KOSDAQ -6.2%</td><td>즉시 시장가</td></tr>
+    <tr><td>② 추세 이탈</td><td>반등 확인 후 higher lows 깨짐</td><td>현재가 전량 청산</td></tr>
+    <tr><td>③ 타임아웃</td><td>눌림 최저가 후 20분</td><td>현재가 청산</td></tr>
+    <tr><td>④ 목표가</td><td>(고가 + 눌림 최저가) / 2</td><td>지정가 전량 매도</td></tr>
+    <tr><td>⑤ 선물 급락</td><td>고점시각 선물가 대비 -1%</td><td>시장가 청산</td></tr>
+    <tr><td>⑥ 강제 청산</td><td>15:20 KST</td><td>시장가 청산</td></tr>
+</table>
+
+<h3>스크리닝 필터</h3>
+<table>
+    <tr><th>순서</th><th>조건</th></tr>
+    <tr><td>1</td><td>상승률 > 0%</td></tr>
+    <tr><td>2</td><td>거래대금 ≥ 500억원</td></tr>
+    <tr><td>3</td><td>상한가 미도달 (등락률 < 20%)</td></tr>
+    <tr><td>4</td><td>프로그램순매수비중 ≥ 5%</td></tr>
+    <tr><td>5</td><td>상승률 최고 1종목 선정</td></tr>
+</table>
+
+
+<!-- ======== 9. FAQ ======== -->
+<h2 id="s9">9. FAQ / 주의사항</h2>
+
+<h4>Q: 종목은 몇 개까지 입력할 수 있나요?</h4>
+<p>최대 <b>10개</b>까지 입력 가능합니다. 스크리닝 후 최대 5종목이 후보 풀로 선정됩니다.</p>
+
+<h4>Q: 종목명으로 검색이 안 되는 종목이 있어요</h4>
+<p>종목 마스터(~2,800종목)에 없는 종목은 6자리 코드로 직접 입력하세요. ETF/ETN은 코드 입력을 권장합니다.</p>
+
+<h4>Q: 대시보드 URL이 매일 바뀌나요?</h4>
+<p>네. Cloudflare Quick Tunnel은 매번 새 URL을 발급합니다. 매일 09:00에 텔레그램으로 새 URL이 전송됩니다.</p>
+
+<h4>Q: DRY_RUN 모드에서는 실제 돈이 빠지나요?</h4>
+<p><b>아니요.</b> DRY_RUN은 완전한 가상 매매입니다. 실제 주문이 전송되지 않으며 가상 예수금(5천만원)으로 시뮬레이션합니다.</p>
+
+<h4>Q: 텔레그램 명령은 누가 사용할 수 있나요?</h4>
+<p><code>.env</code>의 <code>TELEGRAM_CHAT_ID</code>에 등록된 사용자만 명령을 실행할 수 있습니다. 미등록 사용자의 명령은 무시됩니다.</p>
+
+<h4>Q: 매매 중 네트워크가 끊기면?</h4>
+<p>WebSocket 끊김 감지 시 자동으로 미체결 매수 주문을 취소합니다. 이미 보유 중인 포지션은 텔레그램으로 수동 청산 안내가 발송됩니다.</p>
+
+<div class="warning-box" style="margin-top: 30px;">
+    <b>면책 조항</b><br>
+    이 시스템은 투자 자문을 제공하지 않습니다. 모든 매매 결과에 대한 책임은 사용자에게 있습니다.
+    반드시 DRY_RUN → PAPER(모의투자) 순서로 충분히 검증한 후 실매매로 전환하세요.
+</div>
+
+<div style="text-align:center; margin-top:40px; padding-top:20px; border-top:1px solid #e2e8f0; color:#999; font-size:12px;">
+    AUTOTRADE 사용자 매뉴얼 v1.0 | 2026-04-06
+</div>
+
+</body>
+</html>

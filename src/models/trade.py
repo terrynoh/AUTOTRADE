@@ -12,8 +12,9 @@ from typing import Optional
 class ExitReason(str, Enum):
     TARGET = "TARGET"                   # 목표가 도달
     HARD_STOP = "HARD_STOP"             # 하드 손절 (구조 붕괴)
-    TREND_BREAK = "TREND_BREAK"         # 추세 이탈 (higher lows 깨짐)
-    TIMEOUT = "TIMEOUT"                 # 25분 타임아웃
+    TREND_BREAK = "TREND_BREAK"         # (삭제됨, DB 하위호환 전용)
+    TIMEOUT = "TIMEOUT"                 # 20분 타임아웃
+    FUTURES_STOP = "FUTURES_STOP"       # 선물 급락 청산
     FORCE_LIQUIDATE = "FORCE_LIQUIDATE" # 15:20 강제 청산
     MANUAL = "MANUAL"                   # 수동 청산
     NO_ENTRY = "NO_ENTRY"               # 조정 미발생, 매매 미진입

@@ -1,11 +1,11 @@
 """
-실시간 감시 — 신고가 추적, 고가 확정 트리거, 6중 청산 조건 모니터링.
+실시간 감시 — 신고가 추적, 고가 확정 트리거, 5중 청산 조건 모니터링.
 
 핵심 로직:
 1. 9:55 이후 당일 신고가 달성 감시
 2. 고가에서 1% 하락 → 고가 확정, 매수 주문 진입
 3. 고가 갱신 → 기존 주문 취소, 새 고가에서 1% 하락 대기
-4. 매수 후: 하드손절/추세이탈/25분타임아웃/목표가/선물급락/강제청산
+4. 매수 후: 하드손절/25분타임아웃/목표가/선물급락/강제청산
 """
 from __future__ import annotations
 
@@ -52,9 +52,6 @@ class TargetMonitor:
         self._futures_price: int = 0
         self._futures_at_high: int = 0   # 종목 고점 시각의 선물 가격
 
-        # 1분봉 추적 (추세 이탈용)
-        self._minute_candle_low: int = 0
-        self._minute_candle_start: Optional[datetime] = None
 
         # ── 시그널 (main.py에서 polling) ──
         self.signal_place_orders: bool = False     # 매수 주문 배치 요청
@@ -190,7 +187,6 @@ class TargetMonitor:
             self.state = MonitorState.ENTERED
             self.target.post_entry_low = filled_price
             self.target.post_entry_low_time = ts
-            self._start_minute_candle(filled_price, ts)
 
         logger.info(
             f"[{self.target.stock.name}] {label} 체결: {filled_price:,}원 × {filled_qty}주 "
@@ -200,16 +196,8 @@ class TargetMonitor:
     # ── Phase 4: 매수 후 청산 조건 모니터링 ──────────────
 
     def _handle_entered(self, price: int, ts: datetime) -> None:
-        # 최저가 갱신/재터치 → minute_lows 리셋 (눌림 최저가 "이후" higher lows만 추적)
-        old_low = self.target.post_entry_low
+        # 최저가 갱신
         self.target.update_post_entry_low(price, ts)
-        if price <= old_low:
-            # 최저가 갱신됨 → 분봉 저가 추적 리셋
-            self.target.minute_lows.clear()
-            self._minute_candle_low = price
-            self._minute_candle_start = ts.replace(second=0, microsecond=0)
-        else:
-            self._update_minute_candle(price, ts)
 
         # ① 하드 손절
         stop_price = self.target.hard_stop_price(self.params)
@@ -221,19 +209,13 @@ class TargetMonitor:
             )
             return
 
-        # ② 추세 이탈 (higher lows 깨짐)
-        if self.params.exit.trend_break_check and self._check_trend_break():
-            self._emit_exit("trend_break", price, ts)
-            logger.warning(f"[{self.target.stock.name}] 추세 이탈: higher lows 깨짐")
-            return
-
-        # ③ 25분 타임아웃
+        # ② 25분 타임아웃
         if self._check_timeout(ts):
             self._emit_exit("timeout", price, ts)
             logger.warning(f"[{self.target.stock.name}] 25분 타임아웃")
             return
 
-        # ④ 목표가
+        # ③ 목표가
         target_price = self.target.target_price
         if target_price > 0 and price >= target_price:
             self._emit_exit("target", int(target_price), ts)
@@ -242,7 +224,7 @@ class TargetMonitor:
             )
             return
 
-        # ⑤ 선물 급락
+        # ④ 선물 급락
         if self._check_futures_drop():
             self._emit_exit("futures_stop", 0, ts)  # 시장가
             logger.warning(
@@ -251,16 +233,9 @@ class TargetMonitor:
             )
             return
 
-        # ⑥ 강제 청산은 main.py 스케줄러에서 처리
+        # ⑤ 강제 청산은 main.py 스케줄러에서 처리
 
     # ── 청산 조건 헬퍼 ────────────────────────────────────
-
-    def _check_trend_break(self) -> bool:
-        """1분봉 저가가 직전보다 낮아지면 추세 이탈."""
-        lows = self.target.minute_lows
-        if len(lows) < 2:
-            return False
-        return lows[-1] < lows[-2]
 
     def _check_timeout(self, ts: datetime) -> bool:
         """눌림 최저가 시점부터 N분 경과."""
@@ -284,28 +259,6 @@ class TargetMonitor:
         self.target.exited = True
         self.target.exit_reason = reason
         self.state = MonitorState.EXITED
-
-    # ── 1분봉 추적 ───────────────────────────────────────
-
-    def _start_minute_candle(self, price: int, ts: datetime) -> None:
-        self._minute_candle_low = price
-        self._minute_candle_start = ts.replace(second=0, microsecond=0)
-
-    def _update_minute_candle(self, price: int, ts: datetime) -> None:
-        current_minute = ts.replace(second=0, microsecond=0)
-
-        if self._minute_candle_start is None:
-            self._start_minute_candle(price, ts)
-            return
-
-        if current_minute > self._minute_candle_start:
-            # 이전 분봉 완료 → 저가 기록
-            self.target.minute_lows.append(self._minute_candle_low)
-            self._minute_candle_low = price
-            self._minute_candle_start = current_minute
-        else:
-            if price < self._minute_candle_low:
-                self._minute_candle_low = price
 
     # ── 강제 청산 (main.py에서 호출) ─────────────────────
 

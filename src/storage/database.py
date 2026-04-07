@@ -86,101 +86,115 @@ class Database:
     def save_trade(self, trade: TradeRecord) -> int:
         """거래 기록 저장. 반환값: row id."""
         conn = self._connect()
-        cur = conn.execute(
-            """
-            INSERT INTO trades (
-                trade_date, code, name, market,
-                avg_buy_price, total_buy_qty, total_buy_amount, buy_count, first_buy_time,
-                avg_sell_price, total_sell_amount, sell_time,
-                exit_reason, pnl, pnl_pct, holding_minutes,
-                rolling_high, entry_trigger_price, target_price, trade_mode
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(trade.trade_date),
-                trade.code, trade.name, trade.market,
-                trade.avg_buy_price, trade.total_buy_qty, trade.total_buy_amount,
-                trade.buy_count,
-                trade.first_buy_time.isoformat() if trade.first_buy_time else None,
-                trade.avg_sell_price, trade.total_sell_amount,
-                trade.sell_time.isoformat() if trade.sell_time else None,
-                trade.exit_reason.value, trade.pnl, trade.pnl_pct,
-                trade.holding_minutes,
-                trade.rolling_high, trade.entry_trigger_price, trade.target_price,
-                trade.trade_mode,
-            ),
-        )
-        conn.commit()
-        row_id = cur.lastrowid
-        conn.close()
-        logger.debug(f"거래 저장: #{row_id} {trade.name} {trade.exit_reason.value}")
-        return row_id
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO trades (
+                    trade_date, code, name, market,
+                    avg_buy_price, total_buy_qty, total_buy_amount, buy_count, first_buy_time,
+                    avg_sell_price, total_sell_amount, sell_time,
+                    exit_reason, pnl, pnl_pct, holding_minutes,
+                    rolling_high, entry_trigger_price, target_price, trade_mode
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(trade.trade_date),
+                    trade.code, trade.name, trade.market,
+                    trade.avg_buy_price, trade.total_buy_qty, trade.total_buy_amount,
+                    trade.buy_count,
+                    trade.first_buy_time.isoformat() if trade.first_buy_time else None,
+                    trade.avg_sell_price, trade.total_sell_amount,
+                    trade.sell_time.isoformat() if trade.sell_time else None,
+                    trade.exit_reason.value, trade.pnl, trade.pnl_pct,
+                    trade.holding_minutes,
+                    trade.rolling_high, trade.entry_trigger_price, trade.target_price,
+                    trade.trade_mode,
+                ),
+            )
+            conn.commit()
+            row_id = cur.lastrowid
+            logger.debug(f"거래 저장: #{row_id} {trade.name} {trade.exit_reason.value}")
+            return row_id
+        finally:
+            conn.close()
 
     def get_trades_by_date(self, trade_date: date) -> list[dict]:
         conn = self._connect()
-        rows = conn.execute(
-            "SELECT * FROM trades WHERE trade_date = ? ORDER BY first_buy_time",
-            (str(trade_date),),
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
+        try:
+            rows = conn.execute(
+                "SELECT * FROM trades WHERE trade_date = ? ORDER BY first_buy_time",
+                (str(trade_date),),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
 
     # ── 일일 요약 ───────────────────────────────────────────────
 
     def save_daily_summary(self, summary: DailySummary) -> None:
         conn = self._connect()
-        conn.execute(
-            """
-            INSERT OR REPLACE INTO daily_summary (
-                summary_date, trade_mode,
-                candidates_count, targets_count,
-                total_trades, winning_trades, losing_trades, no_entry_count,
-                total_pnl, max_single_loss, max_single_gain
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                str(summary.summary_date), summary.trade_mode,
-                summary.candidates_count, summary.targets_count,
-                summary.total_trades, summary.winning_trades,
-                summary.losing_trades, summary.no_entry_count,
-                summary.total_pnl, summary.max_single_loss, summary.max_single_gain,
-            ),
-        )
-        conn.commit()
-        conn.close()
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO daily_summary (
+                    summary_date, trade_mode,
+                    candidates_count, targets_count,
+                    total_trades, winning_trades, losing_trades, no_entry_count,
+                    total_pnl, max_single_loss, max_single_gain
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(summary.summary_date), summary.trade_mode,
+                    summary.candidates_count, summary.targets_count,
+                    summary.total_trades, summary.winning_trades,
+                    summary.losing_trades, summary.no_entry_count,
+                    summary.total_pnl, summary.max_single_loss, summary.max_single_gain,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def get_summary_range(self, start: date, end: date) -> list[dict]:
         conn = self._connect()
-        rows = conn.execute(
-            "SELECT * FROM daily_summary WHERE summary_date BETWEEN ? AND ? ORDER BY summary_date",
-            (str(start), str(end)),
-        ).fetchall()
-        conn.close()
-        return [dict(r) for r in rows]
+        try:
+            rows = conn.execute(
+                "SELECT * FROM daily_summary WHERE summary_date BETWEEN ? AND ? ORDER BY summary_date",
+                (str(start), str(end)),
+            ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
 
     # ── 통계 ────────────────────────────────────────────────────
 
     def get_stats(self, days: int = 30) -> dict:
-        """최근 N일 통계."""
-        conn = self._connect()
-        row = conn.execute(
-            """
-            SELECT
-                COUNT(*) as total_trades,
-                SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
-                SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses,
-                SUM(pnl) as total_pnl,
-                AVG(pnl_pct) as avg_pnl_pct,
-                MIN(pnl) as max_loss,
-                MAX(pnl) as max_gain
-            FROM trades
-            WHERE trade_date >= date('now', ?)
-              AND exit_reason != 'NO_ENTRY'
-            """,
-            (f"-{days} days",),
-        ).fetchone()
-        conn.close()
+        """최근 N일 통계 (KST 기준)."""
+        from src.utils.market_calendar import now_kst
+        from datetime import timedelta
 
-        if row is None:
-            return {}
-        return dict(row)
+        start_date = (now_kst().date() - timedelta(days=days)).isoformat()
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                """
+                SELECT
+                    COUNT(*) as total_trades,
+                    SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
+                    SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) as losses,
+                    SUM(pnl) as total_pnl,
+                    AVG(pnl_pct) as avg_pnl_pct,
+                    MIN(pnl) as max_loss,
+                    MAX(pnl) as max_gain
+                FROM trades
+                WHERE trade_date >= ?
+                  AND exit_reason != 'NO_ENTRY'
+                """,
+                (start_date,),
+            ).fetchone()
+
+            if row is None:
+                return {}
+            return dict(row)
+        finally:
+            conn.close()

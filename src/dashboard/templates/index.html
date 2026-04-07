@@ -219,9 +219,37 @@
             <div class="card" style="flex: none; width: auto;">
                 <div class="btn-group">
                     <button class="btn btn-primary" id="btn-connect" onclick="doConnect()">API 연결</button>
-                    <button class="btn btn-warning" id="btn-screening" onclick="doScreening()" disabled>스크리닝</button>
+                    <button class="btn btn-warning" id="btn-screening" onclick="doScreening()" disabled>자동 스크리닝</button>
                     <button class="btn btn-danger" id="btn-disconnect" onclick="doDisconnect()" disabled>연결 해제</button>
                 </div>
+            </div>
+        </div>
+
+        <!-- 수동 종목 입력 -->
+        <div class="card" id="manual-input-section">
+            <h3>수동 종목 입력</h3>
+            <!-- 종목 검색 -->
+            <div style="position: relative; margin-bottom: 8px;">
+                <input type="text" id="stock-search-input"
+                    placeholder="종목 검색 (예: 삼성, 에코프로, 006400)"
+                    autocomplete="off"
+                    style="width: 100%; padding: 8px 12px; background: #0d1117; border: 1px solid #1e293b; border-radius: 6px; color: #e1e5eb; font-size: 13px; outline: none;"
+                />
+                <div id="search-results" style="display:none; position:absolute; top:100%; left:0; right:0; background:#111827; border:1px solid #1e293b; border-radius:0 0 6px 6px; max-height:200px; overflow-y:auto; z-index:100;"></div>
+            </div>
+            <!-- 선택된 종목 태그 -->
+            <div id="selected-stocks" style="display:flex; flex-wrap:wrap; gap:6px; margin-bottom:10px; min-height:28px;"></div>
+            <!-- 버튼 -->
+            <div style="display: flex; gap: 8px; align-items: center; margin-bottom: 10px;">
+                <input type="text" id="manual-codes-input"
+                    placeholder="직접 입력 (쉼표 구분, 예: 006400, 에코프로비엠, 020150)"
+                    style="flex: 1; padding: 8px 12px; background: #0d1117; border: 1px solid #1e293b; border-radius: 6px; color: #e1e5eb; font-size: 13px; outline: none;"
+                />
+                <button class="btn btn-primary" id="btn-set-targets" onclick="doSetTargets()" disabled>종목 설정</button>
+                <button class="btn btn-success" id="btn-manual-screening" onclick="doManualScreening()" disabled>수동 스크리닝</button>
+            </div>
+            <div id="manual-codes-display" style="font-size: 12px; color: #64748b;">
+                설정된 종목: 없음
             </div>
         </div>
 
@@ -262,6 +290,8 @@
         /*__ADMIN__*/
         /*__TOKEN__*/
         let ws = null;
+        let wsConnected = false;
+        let pollTimer = null;
 
         function adminHeaders() {
             const h = {};
@@ -271,14 +301,14 @@
             return h;
         }
 
-        // 관리자가 아니면 제어 버튼 숨김
+        // 관리자가 아니면 제어 버튼 + 수동 입력 숨김
         if (typeof IS_ADMIN !== 'undefined' && !IS_ADMIN) {
             document.addEventListener('DOMContentLoaded', () => {
                 const ctrl = document.querySelector('.btn-group');
                 if (ctrl) ctrl.closest('.card').style.display = 'none';
+                const manualSection = document.getElementById('manual-input-section');
+                if (manualSection) manualSection.style.display = 'none';
             });
-            // 뷰어도 WebSocket으로 실시간 데이터 수신
-            connectWS();
         }
 
         // ── API 호출 ──
@@ -289,6 +319,7 @@
                 setBtn('btn-connect', true);
                 setBtn('btn-screening', false);
                 setBtn('btn-disconnect', false);
+                setBtn('btn-set-targets', false);
                 connectWS();
             } else {
                 alert('연결 실패: ' + res.msg);
@@ -307,28 +338,209 @@
             setBtn('btn-connect', false);
             setBtn('btn-screening', true);
             setBtn('btn-disconnect', true);
+            setBtn('btn-set-targets', true);
+            setBtn('btn-manual-screening', true);
             if (ws) ws.close();
+        }
+
+        // ── 종목 검색 자동완성 ──
+        let searchTimer = null;
+        let selectedStocks = []; // [{code, name}]
+
+        document.getElementById('stock-search-input').addEventListener('input', (e) => {
+            clearTimeout(searchTimer);
+            const q = e.target.value.trim();
+            if (q.length < 1) { hideSearch(); return; }
+            searchTimer = setTimeout(() => searchStock(q), 200);
+        });
+
+        document.getElementById('stock-search-input').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                const q = e.target.value.trim();
+                if (q) {
+                    // 6자리 코드면 바로 추가
+                    if (/^\d{6}$/.test(q)) {
+                        addSelectedStock(q, q);
+                        e.target.value = '';
+                        hideSearch();
+                    }
+                }
+            }
+        });
+
+        document.addEventListener('click', (e) => {
+            if (!e.target.closest('#stock-search-input') && !e.target.closest('#search-results')) {
+                hideSearch();
+            }
+        });
+
+        async function searchStock(q) {
+            try {
+                const res = await fetch('/api/search-stock?q=' + encodeURIComponent(q)).then(r => r.json());
+                const el = document.getElementById('search-results');
+                if (!res.results || res.results.length === 0) {
+                    el.innerHTML = '<div style="padding:8px 12px; color:#475569; font-size:12px;">검색 결과 없음</div>';
+                    el.style.display = 'block';
+                    return;
+                }
+                el.innerHTML = res.results.map(r =>
+                    `<div data-code="${escHtml(r.code)}" data-name="${escHtml(r.name)}" class="search-pick" style="padding:8px 12px; cursor:pointer; font-size:13px; border-bottom:1px solid #1e293b; display:flex; justify-content:space-between;" onmouseover="this.style.background='#1a2332'" onmouseout="this.style.background=''">
+                        <span style="color:#e1e5eb;">${escHtml(r.name)}</span>
+                        <span style="color:#64748b; font-size:11px;">${escHtml(r.code)}</span>
+                    </div>`
+                ).join('');
+                el.querySelectorAll('.search-pick').forEach(el => {
+                    el.addEventListener('click', () => pickStock(el.dataset.code, el.dataset.name));
+                });
+                el.style.display = 'block';
+            } catch(e) {}
+        }
+
+        function pickStock(code, name) {
+            addSelectedStock(code, name);
+            document.getElementById('stock-search-input').value = '';
+            hideSearch();
+        }
+
+        function addSelectedStock(code, name) {
+            if (selectedStocks.find(s => s.code === code)) return;
+            selectedStocks.push({code, name});
+            renderSelectedStocks();
+        }
+
+        function removeSelectedStock(code) {
+            selectedStocks = selectedStocks.filter(s => s.code !== code);
+            renderSelectedStocks();
+        }
+
+        function renderSelectedStocks() {
+            const el = document.getElementById('selected-stocks');
+            el.innerHTML = selectedStocks.map(s =>
+                `<span style="display:inline-flex; align-items:center; gap:4px; padding:4px 10px; background:#1e3a5f; color:#60a5fa; border-radius:4px; font-size:12px; font-weight:600;">
+                    ${escHtml(s.name)}(${s.code})
+                    <span onclick="removeSelectedStock('${s.code}')" style="cursor:pointer; color:#94a3b8; margin-left:2px;">&times;</span>
+                </span>`
+            ).join('');
+            // 선택된 종목을 직접입력 필드에도 동기화
+            document.getElementById('manual-codes-input').value = selectedStocks.map(s => s.code).join(', ');
+        }
+
+        function hideSearch() {
+            document.getElementById('search-results').style.display = 'none';
+        }
+
+        async function doSetTargets() {
+            // 선택된 태그 + 직접 입력 병합
+            const inputText = document.getElementById('manual-codes-input').value.trim();
+            const inputCodes = inputText ? inputText.split(/[,\s]+/).map(c => c.trim()).filter(c => c) : [];
+            // 태그에서 코드만 추출
+            const tagCodes = selectedStocks.map(s => s.code);
+            // 병합 (중복 제거)
+            const allCodes = [...new Set([...tagCodes, ...inputCodes])];
+
+            if (allCodes.length === 0) { alert('종목코드 또는 종목명을 입력하세요'); return; }
+
+            setBtn('btn-set-targets', true, '검증 중...');
+            const res = await fetch('/api/set-targets', {
+                method: 'POST',
+                headers: {...adminHeaders(), 'Content-Type': 'application/json'},
+                body: JSON.stringify({codes: allCodes}),
+            }).then(r => r.json());
+
+            setBtn('btn-set-targets', false);
+            if (res.ok) {
+                setBtn('btn-manual-screening', false);
+                // 검증된 종목으로 태그 갱신
+                if (res.stocks) {
+                    selectedStocks = res.stocks;
+                    renderSelectedStocks();
+                }
+                updateManualCodesDisplay(res.stocks || res.codes);
+                if (res.errors && res.errors.length > 0) {
+                    alert('일부 종목 오류:\n' + res.errors.join('\n'));
+                }
+            } else {
+                alert('종목 설정 실패: ' + res.msg);
+            }
+        }
+
+        async function doManualScreening() {
+            setBtn('btn-manual-screening', true, '실행 중...');
+            const res = await fetch('/api/run-manual-screening', {method: 'POST', headers: adminHeaders()}).then(r => r.json());
+            setBtn('btn-manual-screening', false);
+            if (!res.ok) {
+                alert('수동 스크리닝 실패: ' + res.msg);
+            }
+        }
+
+        function updateManualCodesDisplay(data) {
+            const el = document.getElementById('manual-codes-display');
+            if (!data || data.length === 0) {
+                el.textContent = '설정된 종목: 없음';
+                return;
+            }
+            // data가 [{code, name}] 배열이면 종목명 표시, 아니면 코드만
+            if (typeof data[0] === 'object') {
+                el.innerHTML = '설정된 종목: <span style="color: #60a5fa; font-weight: 600;">' +
+                    data.map(s => escHtml(s.name) + '(' + escHtml(s.code) + ')').join(', ') +
+                    '</span> (' + data.length + '종목)';
+            } else {
+                el.innerHTML = '설정된 종목: <span style="color: #60a5fa; font-weight: 600;">' +
+                    data.map(s => escHtml(s)).join(', ') + '</span> (' + data.length + '종목)';
+            }
         }
 
         function setBtn(id, disabled, text) {
             const btn = document.getElementById(id);
+            if (!btn) return;
             btn.disabled = disabled;
             if (text) btn.textContent = text;
             else {
-                const defaults = {'btn-connect': 'API 연결', 'btn-screening': '스크리닝', 'btn-disconnect': '연결 해제'};
+                const defaults = {
+                    'btn-connect': 'API 연결',
+                    'btn-screening': '자동 스크리닝',
+                    'btn-disconnect': '연결 해제',
+                    'btn-set-targets': '종목 설정',
+                    'btn-manual-screening': '수동 스크리닝',
+                };
                 btn.textContent = defaults[id] || btn.textContent;
             }
         }
 
-        // ── WebSocket ──
+        // ── WebSocket + HTTP 폴링 백업 ──
         function connectWS() {
+            if (ws && ws.readyState <= 1) return;
             const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
             ws = new WebSocket(`${proto}//${location.host}/ws`);
+            ws.onopen = () => {
+                wsConnected = true;
+                stopPolling();
+            };
             ws.onmessage = (e) => {
                 const data = JSON.parse(e.data);
                 updateUI(data);
             };
-            ws.onclose = () => setTimeout(connectWS, 3000);
+            ws.onclose = () => {
+                wsConnected = false;
+                startPolling();
+                setTimeout(connectWS, 3000);
+            };
+            ws.onerror = () => {
+                wsConnected = false;
+                startPolling();
+            };
+        }
+
+        function startPolling() {
+            if (pollTimer) return;
+            pollTimer = setInterval(() => {
+                fetch('/api/status').then(r => r.json()).then(updateUI).catch(() => {});
+            }, 2000);
+        }
+
+        function stopPolling() {
+            if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
         }
 
         // ── UI 업데이트 ──
@@ -349,8 +561,8 @@
             document.getElementById('total-eval').textContent = fmtWon(d.total_eval);
 
             const pnlEl = document.getElementById('daily-pnl');
-            pnlEl.textContent = (d.daily_pnl >= 0 ? '+' : '') + fmtWon(d.daily_pnl);
-            pnlEl.className = 'value ' + (d.daily_pnl >= 0 ? 'pnl-plus' : 'pnl-minus');
+            pnlEl.textContent = (d.daily_pnl > 0 ? '+' : '') + fmtWon(d.daily_pnl);
+            pnlEl.className = 'value ' + (d.daily_pnl > 0 ? 'pnl-plus' : d.daily_pnl < 0 ? 'pnl-minus' : '');
             document.getElementById('daily-trades').textContent = `거래 ${d.daily_trades}건`;
 
             // 모니터
@@ -364,6 +576,11 @@
                 emptyEl.style.display = 'none';
                 contEl.style.display = 'block';
                 contEl.innerHTML = d.monitors.map(renderMonitor).join('');
+            }
+
+            // 수동 종목코드 표시
+            if (d.manual_codes) {
+                updateManualCodesDisplay(d.manual_codes);
             }
 
             // 로그
@@ -402,8 +619,8 @@
             <div style="margin-bottom: 16px; padding: 12px; background: #0d1117; border-radius: 6px; border: 1px solid #1e293b;">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
                     <div>
-                        <span style="font-weight: 700; font-size: 15px;">${m.name}</span>
-                        <span style="color: #64748b; font-size: 12px; margin-left: 6px;">${m.code} ${m.market}</span>
+                        <span style="font-weight: 700; font-size: 15px;">${escHtml(m.name)}</span>
+                        <span style="color: #64748b; font-size: 12px; margin-left: 6px;">${escHtml(m.code)} ${escHtml(m.market)}</span>
                     </div>
                     <div style="text-align: right;">
                         <span style="font-size: 20px; font-weight: 700;">${fmtPrice(m.current_price)}</span>
@@ -429,14 +646,15 @@
                 <div style="margin-top: 8px; display: flex; gap: 6px;">
                     <span class="order-chip ${buy1Chip}">1차 ${m.buy1_filled ? '체결' : m.buy1_placed ? '대기' : '-'}</span>
                     <span class="order-chip ${buy2Chip}">2차 ${m.buy2_filled ? '체결' : m.buy2_placed ? '대기' : '-'}</span>
-                    ${m.exit_reason ? `<span class="order-chip" style="background:#3b1e1e;color:#f87171;">청산: ${m.exit_reason}</span>` : ''}
+                    ${m.exit_reason ? `<span class="order-chip" style="background:#3b1e1e;color:#f87171;">청산: ${escHtml(m.exit_reason)}</span>` : ''}
                 </div>
             </div>`;
         }
 
         // ── 포맷터 ──
         function fmtWon(n) {
-            if (n === 0 || n === undefined) return '-';
+            if (n === undefined || n === null) return '-';
+            if (n === 0) return '0원';
             return n.toLocaleString('ko-KR') + '원';
         }
         function fmtPrice(n) {
@@ -444,18 +662,25 @@
             return n.toLocaleString('ko-KR');
         }
         function escHtml(s) {
-            return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+            if (!s) return '';
+            return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
         }
 
-        // 페이지 로드 시 상태 확인
+        // 페이지 로드 시 상태 확인 + 실시간 연결 시작
         fetch('/api/status').then(r => r.json()).then(d => {
             if (d.connected) {
                 setBtn('btn-connect', true);
                 setBtn('btn-screening', false);
                 setBtn('btn-disconnect', false);
-                connectWS();
+                setBtn('btn-set-targets', false);
+                if (d.manual_codes && d.manual_codes.length > 0) {
+                    setBtn('btn-manual-screening', false);
+                }
             }
             updateUI(d);
+            connectWS();
+            // WebSocket 3초 내 연결 실패 시 폴링 시작
+            setTimeout(() => { if (!wsConnected) startPolling(); }, 3000);
         });
     </script>
 </body>

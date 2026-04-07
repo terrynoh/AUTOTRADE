@@ -1,25 +1,24 @@
 """
-백테스트 시뮬레이터 — 과거 데이터로 전략 시뮬레이션.
+백테스트 시뮬레이터 — KIS API 분봉 데이터로 전략 시뮬레이션.
 
-분봉 데이터를 시간순으로 재생하면서:
-1. 11시 기준 스크리닝 통과 여부 확인
-2. rolling high 계산
-3. 조정 발생 → 가상 매수
-4. 청산 조건 → 가상 매도
-5. 결과 기록
+현재 전략 로직 (CLAUDE.md 기준):
+1. 09:55 이후 당일 신고가 감시
+2. 고가에서 1% 하락 → 고가 확정
+3. 고가 확정 후 분할매수 (KOSPI -2.5%/-3.5%, KOSDAQ -3.75%/-4.25%)
+4. 고가 갱신 시 → 기존 주문 취소, 새 고가 기준 재주문
+5. 5개 청산 조건 동시 모니터링
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
-from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 from loguru import logger
 
 from config.settings import StrategyParams
-from src.models.trade import TradeRecord, ExitReason
+from src.models.trade import ExitReason
 
 
 @dataclass
@@ -29,13 +28,20 @@ class SimResult:
     code: str
     name: str
     market: str
-    rolling_high: int = 0
-    entry_price: int = 0
+    intraday_high: int = 0
+    high_confirmed_at: str = ""      # 고가 확정 시각
+    buy1_price: int = 0
+    buy2_price: int = 0
+    buy1_filled: bool = False
+    buy2_filled: bool = False
+    avg_entry_price: int = 0
     exit_price: int = 0
     exit_reason: ExitReason = ExitReason.NO_ENTRY
     pnl_pct: float = 0.0
-    entry_time: Optional[datetime] = None
-    exit_time: Optional[datetime] = None
+    entry_time: Optional[str] = None
+    exit_time: Optional[str] = None
+    pullback_low: int = 0            # 눌림 최저가
+    target_price: int = 0
 
 
 @dataclass
@@ -74,7 +80,7 @@ class BacktestResult:
 
 
 class Simulator:
-    """백테스트 시뮬레이터."""
+    """백테스트 시뮬레이터 — 현재 전략 로직 완전 반영."""
 
     def __init__(self, params: StrategyParams):
         self.params = params
@@ -83,15 +89,16 @@ class Simulator:
         self,
         trade_date: date,
         candidate_info: dict,
-        minute_df: pd.DataFrame,
+        candles: list[dict],
     ) -> SimResult:
         """
         하루치 시뮬레이션.
 
         Args:
             trade_date: 거래일
-            candidate_info: {"code", "name", "market", ...}
-            minute_df: 분봉 DataFrame (index=시간, columns=[시가,고가,저가,종가,거래량])
+            candidate_info: {"code", "name", "market"}
+            candles: KIS API 분봉 [{time, open, high, low, close, volume}, ...]
+                     시간순 정렬 (090000 → 153000)
         """
         code = candidate_info["code"]
         name = candidate_info.get("name", code)
@@ -106,162 +113,200 @@ class Simulator:
             market=market,
         )
 
-        if minute_df.empty:
+        if not candles:
             return result
 
-        # 분봉을 시간순으로 정렬
-        minute_df = minute_df.sort_index()
+        # 시간순 정렬
+        candles = sorted(candles, key=lambda c: c["time"])
 
-        # ── Rolling High (10:50~11:10) ──────────────────────────
-        window_start = time(
-            int(ep.high_window_start.split(":")[0]),
-            int(ep.high_window_start.split(":")[1]),
-        )
-        window_end = time(
-            int(ep.high_window_end.split(":")[0]),
-            int(ep.high_window_end.split(":")[1]),
-        )
+        # KOSDAQ 판별: "KOSDAQ", "KSQ" 등 포함 시 KOSDAQ
+        is_kosdaq = any(k in market.upper() for k in ("KOSDAQ", "KSQ"))
 
-        rolling_high = 0
-        for idx, row in minute_df.iterrows():
-            t = _to_time(idx)
-            if t is None:
-                continue
-            if window_start <= t <= window_end:
-                high = int(row.get("고가", row.get("high", 0)))
-                if high > rolling_high:
-                    rolling_high = high
+        # 파라미터
+        high_confirm_drop = ep.high_confirm_drop_pct / 100   # 1% → 0.01
+        if not is_kosdaq:
+            buy1_drop = ep.kospi_buy1_pct / 100               # 2.5% → 0.025
+            buy2_drop = ep.kospi_buy2_pct / 100               # 3.5% → 0.035
+            hard_stop_drop = xp.kospi_hard_stop_pct / 100     # 4.1% → 0.041
+        else:
+            buy1_drop = ep.kosdaq_buy1_pct / 100               # 3.75%
+            buy2_drop = ep.kosdaq_buy2_pct / 100               # 5.25%
+            hard_stop_drop = xp.kosdaq_hard_stop_pct / 100     # 6.2%
 
-        if rolling_high <= 0:
-            return result
+        # ── 상태 머신 ─────────────────────────────────────────
+        # Phase 1: 09:55 이후 신고가 추적
+        intraday_high = 0
+        high_confirmed = False
+        high_confirm_price = 0
 
-        result.rolling_high = rolling_high
-
-        # 조정 임계값
-        drop_pct = ep.kospi_drop_pct if market == "KOSPI" else ep.kosdaq_drop_pct
-        trigger_price = int(rolling_high * (1 - drop_pct / 100))
-
-        # 하드 손절가
-        hard_pct = xp.kospi_hard_stop_pct if market == "KOSPI" else xp.kosdaq_hard_stop_pct
-        hard_stop = int(rolling_high * (1 - hard_pct / 100))
-
-        # ── 조정 감지 + 가상 매수 ──────────────────────────────
-        entered = False
-        entry_price = 0
+        # Phase 2: 매수 대기
+        buy1_price = 0
+        buy2_price = 0
+        buy1_filled = False
+        buy2_filled = False
+        avg_entry = 0
         entry_time = None
-        low_since_entry = 0
-        low_time = None
-        prev_minute_low = None
 
-        for idx, row in minute_df.iterrows():
-            t = _to_time(idx)
-            if t is None:
+        # Phase 3: 청산 모니터링
+        entered = False
+        pullback_low = 0
+        pullback_low_time = None
+        target_price = 0
+        hard_stop_price = 0
+
+        # 진입 마감 시각
+        entry_deadline = ep.entry_deadline.replace(":", "")  # "11:00" → "1100"
+        entry_deadline += "00"  # → "110000"
+
+        # 강제 청산 시각
+        force_time = xp.force_liquidate_time.replace(":", "") + "00"
+
+        for candle in candles:
+            t = candle["time"]
+            o = candle["open"]
+            h = candle["high"]
+            low = candle["low"]
+            c = candle["close"]
+
+            # ── Phase 1: 09:55 이후 신고가 추적 ──────────────
+            if t < "095500":
+                # 09:55 이전 고가도 기록 (기준점)
+                if h > intraday_high:
+                    intraday_high = h
                 continue
-
-            # 11시 이후만
-            if t <= window_end:
-                continue
-
-            close = abs(int(row.get("종가", row.get("close", 0))))
-            low = abs(int(row.get("저가", row.get("low", 0))))
-            high = abs(int(row.get("고가", row.get("high", 0))))
 
             if not entered:
-                # 조정 감지 (저가 기준)
-                if low <= trigger_price:
+                # 진입 마감 이후 신규 매수 불가
+                if t > entry_deadline and not buy1_filled and not buy2_filled:
+                    continue
+
+                # 고가 갱신 체크
+                if h > intraday_high:
+                    intraday_high = h
+                    high_confirmed = False
+                    # 기존 미체결 매수 주문 취소 (시뮬레이션)
+                    if not buy1_filled:
+                        buy1_price = 0
+                    if not buy2_filled:
+                        buy2_price = 0
+
+                # 고가 확정 체크: 현재가가 고가 대비 1% 이상 하락
+                if not high_confirmed and intraday_high > 0:
+                    high_confirm_price = int(intraday_high * (1 - high_confirm_drop))
+                    if c <= high_confirm_price or low <= high_confirm_price:
+                        high_confirmed = True
+                        result.high_confirmed_at = t
+
+                        # 매수 지정가 설정
+                        buy1_price = int(intraday_high * (1 - buy1_drop))
+                        buy2_price = int(intraday_high * (1 - buy2_drop))
+                        hard_stop_price = int(intraday_high * (1 - hard_stop_drop))
+
+                # 매수 체결 체크
+                if high_confirmed and not buy1_filled and buy1_price > 0:
+                    if low <= buy1_price:
+                        buy1_filled = True
+                        entry_time = t
+
+                if high_confirmed and not buy2_filled and buy2_price > 0:
+                    if low <= buy2_price:
+                        buy2_filled = True
+                        if not entry_time:
+                            entry_time = t
+
+                # 매수 체결 후 청산 모드 진입
+                if buy1_filled or buy2_filled:
+                    if buy1_filled and buy2_filled:
+                        avg_entry = (buy1_price + buy2_price) // 2
+                    elif buy1_filled:
+                        avg_entry = buy1_price
+                    else:
+                        avg_entry = buy2_price
+
                     entered = True
-                    # 분할매수 평균 추정: trigger_price 근처
-                    entry_price = trigger_price
-                    entry_time = _to_datetime(trade_date, idx)
-                    low_since_entry = low
-                    low_time = entry_time
-                    prev_minute_low = low
+                    # 눌림 최저가 초기화
+                    pullback_low = low
+                    pullback_low_time = t
+                    # 목표가: (고가 + 눌림저가) / 2 → 일단 현재 low 기준, 이후 갱신
+                    target_price = (intraday_high + pullback_low) // 2
 
-                    result.entry_price = entry_price
+                    result.intraday_high = intraday_high
+                    result.buy1_price = buy1_price
+                    result.buy2_price = buy2_price
+                    result.buy1_filled = buy1_filled
+                    result.buy2_filled = buy2_filled
+                    result.avg_entry_price = avg_entry
                     result.entry_time = entry_time
+                    result.pullback_low = pullback_low
+                    result.target_price = target_price
 
-                    target_price = (rolling_high + entry_price) / 2
+                    # 2차 미체결 상태에서도 일단 진입 처리 → 이후 봉에서 2차 체결 가능
 
-            else:
-                # 최저가 갱신
-                if low < low_since_entry:
-                    low_since_entry = low
-                    low_time = _to_datetime(trade_date, idx)
+            # ── Phase 3: 청산 모니터링 ────────────────────────
+            if entered:
+                # 2차 매수 추가 체결 체크
+                if not buy2_filled and buy2_price > 0 and low <= buy2_price:
+                    buy2_filled = True
+                    avg_entry = (buy1_price + buy2_price) // 2
+                    result.buy2_filled = True
+                    result.avg_entry_price = avg_entry
+
+                # 눌림 최저가 갱신
+                if low < pullback_low:
+                    pullback_low = low
+                    pullback_low_time = t
+                    # 목표가 재계산
+                    target_price = (intraday_high + pullback_low) // 2
+                    result.pullback_low = pullback_low
+                    result.target_price = target_price
 
                 # ① 하드 손절
-                if low <= hard_stop:
-                    result.exit_price = hard_stop
+                if low <= hard_stop_price:
+                    result.exit_price = hard_stop_price
                     result.exit_reason = ExitReason.HARD_STOP
-                    result.exit_time = _to_datetime(trade_date, idx)
+                    result.exit_time = t
                     break
 
-                # ② 추세 이탈 (higher lows 깨짐)
-                if xp.trend_break_check and prev_minute_low is not None:
-                    if low < prev_minute_low:
-                        # 최소 진입 후 3분은 지나야 판단
-                        if entry_time and _to_datetime(trade_date, idx):
-                            elapsed = (_to_datetime(trade_date, idx) - entry_time).total_seconds()
-                            if elapsed > 180:
-                                result.exit_price = close
-                                result.exit_reason = ExitReason.TREND_BREAK
-                                result.exit_time = _to_datetime(trade_date, idx)
-                                break
-
-                # ③ 25분 타임아웃
-                if low_time:
-                    now_dt = _to_datetime(trade_date, idx)
-                    if now_dt and (now_dt - low_time).total_seconds() >= xp.timeout_from_low_min * 60:
-                        result.exit_price = close
+                # ② 타임아웃: 눌림 최저가 시점부터 N분
+                if pullback_low_time:
+                    low_sec = _time_to_sec(pullback_low_time)
+                    now_sec = _time_to_sec(t)
+                    if now_sec - low_sec >= xp.timeout_from_low_min * 60:
+                        result.exit_price = c
                         result.exit_reason = ExitReason.TIMEOUT
-                        result.exit_time = now_dt
+                        result.exit_time = t
                         break
 
-                # ④ 목표가 도달
-                if high >= target_price:
-                    result.exit_price = int(target_price)
+                # ③ 목표가 도달
+                if h >= target_price:
+                    result.exit_price = target_price
                     result.exit_reason = ExitReason.TARGET
-                    result.exit_time = _to_datetime(trade_date, idx)
+                    result.exit_time = t
                     break
 
-                # ⑤ 강제 청산 시각
-                force_h, force_m = map(int, xp.force_liquidate_time.split(":"))
-                if t >= time(force_h, force_m):
-                    result.exit_price = close
+                # ④ 강제 청산
+                if t >= force_time:
+                    result.exit_price = c
                     result.exit_reason = ExitReason.FORCE_LIQUIDATE
-                    result.exit_time = _to_datetime(trade_date, idx)
+                    result.exit_time = t
                     break
-
-                prev_minute_low = low
 
         # P&L 계산
-        if entered and result.exit_price > 0:
-            # 거래비용 추정 (0.5%)
-            cost_pct = 0.5
-            raw_pnl = (result.exit_price - entry_price) / entry_price * 100
-            result.pnl_pct = raw_pnl - cost_pct
+        if entered and result.exit_price > 0 and avg_entry > 0:
+            cost_pct = 0.5  # 거래비용 0.5%
+            raw_pnl = (result.exit_price - avg_entry) / avg_entry * 100
+            result.pnl_pct = round(raw_pnl - cost_pct, 2)
+
+        # 미체결(눌림 미발생)
+        if not entered:
+            result.intraday_high = intraday_high
 
         return result
 
 
-# ── 유틸리티 ────────────────────────────────────────────────────
-
-def _to_time(idx) -> Optional[time]:
-    """인덱스를 time으로 변환."""
-    try:
-        if isinstance(idx, datetime):
-            return idx.time()
-        if isinstance(idx, str):
-            return datetime.strptime(idx[:5], "%H:%M").time()
-        if isinstance(idx, pd.Timestamp):
-            return idx.time()
-    except Exception:
-        pass
-    return None
-
-
-def _to_datetime(d: date, idx) -> Optional[datetime]:
-    """인덱스를 datetime으로 변환."""
-    t = _to_time(idx)
-    if t:
-        return datetime.combine(d, t)
-    return None
+def _time_to_sec(t: str) -> int:
+    """HHMMSS → 초 변환."""
+    if len(t) < 6:
+        t = t.ljust(6, "0")
+    h, m, s = int(t[:2]), int(t[2:4]), int(t[4:6])
+    return h * 3600 + m * 60 + s

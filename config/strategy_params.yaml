@@ -28,7 +28,7 @@ entry:
 
   # KOSDAQ 분할매수
   kosdaq_buy1_pct: 3.75
-  kosdaq_buy2_pct: 4.25
+  kosdaq_buy2_pct: 5.25
 
   buy1_ratio: 50                      # 1차 매수 비중 (예수금 대비 %)
   buy2_ratio: 50                      # 2차 매수 비중 (예수금 대비 %)
@@ -37,11 +37,9 @@ entry:
 exit:
   profit_target_recovery_pct: 50      # 고가-저가 50% 회복 시 매도
   timeout_from_low_min: 20            # 눌림 최저가 후 N분 내 목표 미도달 시 청산
-  trend_break_check: true             # 1분봉 higher lows 깨지면 청산
-
   # 하드 손절 (고가 대비 %)
-  kospi_hard_stop_pct: 4.5
-  kosdaq_hard_stop_pct: 6.5
+  kospi_hard_stop_pct: 4.1
+  kosdaq_hard_stop_pct: 6.2
 
   # 선물 급락 손절
   futures_drop_pct: 1.0               # 종목 고점 시각의 선물가 대비 N% 하락 시 청산
@@ -64,3 +62,38 @@ api:
   rate_limit_per_sec: 20              # KIS 초당 조회 제한
   screening_start: "09:45"            # 스크리닝 데이터 사전 수집 시작
   polling_interval_sec: 30
+
+# ── 시장 시간 ──────────────────────────────────────────────
+market:
+  open_time: "09:00"                  # 장 시작
+  close_time: "15:30"                 # 장 마감
+  report_time: "15:30"                # 마감 리포트 시각
+
+# ── 인프라 ─────────────────────────────────────────────────
+infra:
+  # HTTP 타임아웃
+  http_timeout_total_sec: 10          # REST API 전체 타임아웃
+  http_timeout_connect_sec: 5         # REST API 연결 타임아웃
+  http_retry_delay_sec: 1.0           # HTTP 재시도 대기
+
+  # WebSocket
+  ws_ping_interval_sec: 30            # WebSocket ping 간격
+  ws_timeout_sec: 60                  # WebSocket 무응답 판정 기준
+  ws_max_backoff_sec: 30.0            # WebSocket 재접속 최대 백오프
+
+  # 헬스체크
+  health_check_interval_sec: 5        # 네트워크 헬스체크 주기
+
+  # 대시보드
+  dashboard_log_buffer_size: 200      # 대시보드 로그 버퍼 최대 크기
+  dashboard_log_return_size: 100      # 클라이언트에 반환할 로그 수
+
+  # 로깅 — 파일당 10MB 롤링, 7일 보관 (최대 ~70MB)
+  log_rotation: "10 MB"              # 파일당 최대 10MB, 초과 시 자동 롤링
+  log_retention_main: "7 days"       # 전체 로그 보관 기간
+  log_retention_trade: "7 days"      # 거래 로그 보관 기간
+  log_retention_error: "7 days"      # 에러 로그 보관 기간
+
+  # 상한가 체크
+  upper_limit_check_pct: 20.0         # 상한가 체크 대상 등락률 임계값
+  upper_limit_multiplier: 1.30        # 상한가 배수 (1.30 = +30%)

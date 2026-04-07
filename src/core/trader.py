@@ -10,6 +10,8 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Optional
 
+from src.utils.market_calendar import now_kst
+
 from loguru import logger
 
 from config.settings import Settings, StrategyParams
@@ -43,7 +45,7 @@ class Trader:
         buy1_qty = max(1, buy1_amount // buy1_price) if buy1_price > 0 else 0
         buy2_qty = max(1, buy2_amount // buy2_price) if buy2_price > 0 else 0
 
-        now = datetime.now()
+        now = now_kst()
         self.pending_buy_orders = []
 
         # 1차 매수
@@ -171,7 +173,7 @@ class Trader:
 
         qty = self.position.total_qty
         code = target.stock.code
-        now = datetime.now()
+        now = now_kst()
 
         # 시장가: hard_stop, futures_stop, force
         use_market = reason in ("hard_stop", "futures_stop", "force")

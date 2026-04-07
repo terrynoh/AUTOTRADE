@@ -24,8 +24,9 @@ EP_DAILY_PRICE = "/uapi/domestic-stock/v1/quotations/inquire-daily-price"
 EP_MINUTE_CHART = "/uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice"
 EP_VOLUME_RANK = "/uapi/domestic-stock/v1/quotations/volume-rank"
 
-# 프로그램매매 — 당일/일별 구분
-EP_PROGRAM_TRADE_TODAY = "/uapi/domestic-stock/v1/quotations/comp-program-trade-today"
+# 프로그램매매
+EP_PROGRAM_TRADE_TODAY = "/uapi/domestic-stock/v1/quotations/comp-program-trade-today"       # 시장 전체 집계
+EP_PROGRAM_TRADE_BY_STOCK = "/uapi/domestic-stock/v1/quotations/program-trade-by-stock"      # 종목별 프로그램매매
 EP_PROGRAM_TRADE_DAILY = "/uapi/domestic-stock/v1/quotations/comp-program-trade-daily"
 
 # ── 주문 엔드포인트 ────────────────────────────────────────────
@@ -42,8 +43,9 @@ TR_DAILY_PRICE = "FHKST01010400"        # 주식현재가 일자별
 TR_MINUTE_CHART = "FHKST03010200"       # 주식현재가 분봉조회
 TR_VOLUME_RANK = "FHPST01710000"        # 거래량순위
 
-TR_PROGRAM_TRADE_TODAY = "FHPPG04600101"   # 프로그램매매 당일 종목별
-TR_PROGRAM_TRADE_DAILY = "FHPPG04600001"   # 프로그램매매 일별 종목별
+TR_PROGRAM_TRADE_TODAY = "FHPPG04600101"      # 프로그램매매 당일 시장 집계
+TR_PROGRAM_TRADE_BY_STOCK = "FHPPG04650101"   # 프로그램매매 종목별
+TR_PROGRAM_TRADE_DAILY = "FHPPG04600001"      # 프로그램매매 일별
 
 TR_ORDER_BUY = "TTTC0012U"              # 현금매수 (실거래)
 TR_ORDER_SELL = "TTTC0011U"             # 현금매도 (실거래)

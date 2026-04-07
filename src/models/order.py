@@ -36,7 +36,7 @@ class Order:
     status: OrderStatus = OrderStatus.PENDING
     created_at: Optional[datetime] = None
     filled_at: Optional[datetime] = None
-    label: str = ""                     # "buy1", "buy2", "target", "hard_stop", "trend_break", "timeout", "futures_stop", "force"
+    label: str = ""                     # "buy1", "buy2", "target", "hard_stop", "timeout", "futures_stop", "force"
 
     @property
     def is_filled(self) -> bool:

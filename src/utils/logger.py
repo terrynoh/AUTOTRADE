@@ -11,14 +11,22 @@ from pathlib import Path
 from loguru import logger
 
 
-def setup_logger(log_level: str = "DEBUG", log_dir: str | Path | None = None):
+def setup_logger(
+    log_level: str = "DEBUG",
+    log_dir: str | Path | None = None,
+    infra_params: object | None = None,
+):
     """
     로거 초기화.
 
     Args:
         log_level: 로그 레벨 (DEBUG, INFO, WARNING, ERROR)
         log_dir: 로그 파일 디렉토리 (None이면 프로젝트/logs/)
+        infra_params: InfraParams 인스턴스 (로테이션/보관 설정)
     """
+    from config.settings import InfraParams
+    infra = infra_params if infra_params else InfraParams()
+
     # 기본 핸들러 제거
     logger.remove()
 
@@ -45,8 +53,8 @@ def setup_logger(log_level: str = "DEBUG", log_dir: str | Path | None = None):
         log_dir / "autotrade_{time:YYYY-MM-DD}.log",
         level="DEBUG",
         format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level: <8} | {name}:{function}:{line} | {message}",
-        rotation="00:00",       # 매일 자정 로테이션
-        retention="30 days",
+        rotation=infra.log_rotation,
+        retention=infra.log_retention_main,
         encoding="utf-8",
     )
 
@@ -59,8 +67,8 @@ def setup_logger(log_level: str = "DEBUG", log_dir: str | Path | None = None):
             kw in record["message"]
             for kw in ["매수", "매도", "손절", "청산", "체결", "DCA", "P&L"]
         ),
-        rotation="00:00",
-        retention="90 days",
+        rotation=infra.log_rotation,
+        retention=infra.log_retention_trade,
         encoding="utf-8",
     )
 
@@ -69,8 +77,8 @@ def setup_logger(log_level: str = "DEBUG", log_dir: str | Path | None = None):
         log_dir / "errors_{time:YYYY-MM-DD}.log",
         level="ERROR",
         format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {name}:{function}:{line} | {message}\n{exception}",
-        rotation="00:00",
-        retention="90 days",
+        rotation=infra.log_rotation,
+        retention=infra.log_retention_error,
         encoding="utf-8",
     )
 

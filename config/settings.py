@@ -35,9 +35,20 @@ class Settings(BaseSettings):
     # 매매 모드
     trade_mode: Literal["dry_run", "paper", "live"] = "dry_run"
 
+    # 데이터 소스: 실전 API로 시세 조회하면서 주문은 가상 실행
+    # True: 실전 API URL + 실전 TR ID로 시세 조회, 주문은 trade_mode에 따라
+    use_live_api: bool = False
+
+    # dry_run 가상 예수금 (원). 실계좌에 입금 없이 테스트할 때 사용
+    dry_run_cash: int = 50_000_000
+
     # 텔레그램
     telegram_bot_token: str = ""
     telegram_chat_id: str = ""
+
+    # 대시보드
+    dashboard_admin_token: str = ""
+    dashboard_port: int = 8503
 
     # 로깅
     log_level: str = "DEBUG"
@@ -49,7 +60,7 @@ class Settings(BaseSettings):
 
     @property
     def account_no(self) -> str:
-        if self.trade_mode == "live":
+        if self.trade_mode == "live" or self.use_live_api:
             return self.kis_account_no
         return self.kis_account_no_paper or self.kis_account_no
 
@@ -67,8 +78,15 @@ class Settings(BaseSettings):
 
     @property
     def is_paper_mode(self) -> bool:
-        """KIS API 모의투자 여부 (dry_run도 모의투자 URL 사용)."""
+        """KIS API 모의투자 여부. use_live_api=True면 실전 API 사용."""
+        if self.use_live_api:
+            return False
         return self.trade_mode != "live"
+
+    @property
+    def use_live_data(self) -> bool:
+        """실전 API 데이터 사용 여부 (live 모드 또는 use_live_api=True)."""
+        return self.trade_mode == "live" or self.use_live_api
 
 
 # ── 전략 파라미터 (YAML) ────────────────────────────────────────
@@ -102,7 +120,7 @@ class EntryParams(BaseModel):
 
     # KOSDAQ 분할매수
     kosdaq_buy1_pct: float = Field(default=3.75, ge=0.1, le=15.0)
-    kosdaq_buy2_pct: float = Field(default=4.25, ge=0.1, le=15.0)
+    kosdaq_buy2_pct: float = Field(default=5.25, ge=0.1, le=15.0)
 
     # 매수 비중 (예수금 대비 %)
     buy1_ratio: float = Field(default=50.0, ge=1.0, le=100.0)
@@ -112,10 +130,9 @@ class EntryParams(BaseModel):
 class ExitParams(BaseModel):
     profit_target_recovery_pct: float = Field(default=50.0, ge=1.0, le=100.0)  # 고가-저가 50% 회복
     timeout_from_low_min: int = Field(default=20, ge=1, le=120)  # 최저가 후 20분
-    trend_break_check: bool = True                # higher lows 깨짐
 
-    kospi_hard_stop_pct: float = Field(default=4.5, ge=0.1, le=30.0)  # KOSPI 하드 손절 (고가 대비 %)
-    kosdaq_hard_stop_pct: float = Field(default=6.5, ge=0.1, le=30.0)  # KOSDAQ 하드 손절
+    kospi_hard_stop_pct: float = Field(default=4.1, ge=0.1, le=30.0)  # KOSPI 하드 손절 (고가 대비 %)
+    kosdaq_hard_stop_pct: float = Field(default=6.2, ge=0.1, le=30.0)  # KOSDAQ 하드 손절
 
     futures_drop_pct: float = Field(default=1.0, ge=0.1, le=20.0)  # 선물 급락 손절 (%)
 
@@ -139,6 +156,41 @@ class ApiParams(BaseModel):
     polling_interval_sec: int = Field(default=30, ge=1, le=300)
 
 
+class MarketParams(BaseModel):
+    open_time: str = "09:00"
+    close_time: str = "15:30"
+    report_time: str = "15:30"
+
+
+class InfraParams(BaseModel):
+    # HTTP
+    http_timeout_total_sec: int = Field(default=10, ge=1, le=120)
+    http_timeout_connect_sec: int = Field(default=5, ge=1, le=60)
+    http_retry_delay_sec: float = Field(default=1.0, ge=0.1, le=30.0)
+
+    # WebSocket
+    ws_ping_interval_sec: int = Field(default=30, ge=5, le=120)
+    ws_timeout_sec: int = Field(default=60, ge=10, le=300)
+    ws_max_backoff_sec: float = Field(default=30.0, ge=1.0, le=300.0)
+
+    # 헬스체크
+    health_check_interval_sec: int = Field(default=5, ge=1, le=60)
+
+    # 대시보드
+    dashboard_log_buffer_size: int = Field(default=200, ge=50, le=10000)
+    dashboard_log_return_size: int = Field(default=100, ge=10, le=5000)
+
+    # 로깅 — 파일당 10MB 롤링, 7일 보관 (최대 ~70MB)
+    log_rotation: str = "10 MB"
+    log_retention_main: str = "7 days"
+    log_retention_trade: str = "7 days"
+    log_retention_error: str = "7 days"
+
+    # 상한가 체크
+    upper_limit_check_pct: float = Field(default=20.0, ge=1.0, le=30.0)
+    upper_limit_multiplier: float = Field(default=1.30, ge=1.0, le=1.50)
+
+
 class StrategyParams(BaseModel):
     """strategy_params.yaml 전체 로드."""
 
@@ -149,6 +201,8 @@ class StrategyParams(BaseModel):
     order: OrderParams = OrderParams()
     risk: RiskParams = RiskParams()
     api: ApiParams = ApiParams()
+    market: MarketParams = MarketParams()
+    infra: InfraParams = InfraParams()
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> StrategyParams:

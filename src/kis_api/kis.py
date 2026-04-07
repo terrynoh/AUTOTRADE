@@ -13,6 +13,8 @@ import os
 import stat
 import time
 from datetime import datetime, timedelta
+
+from src.utils.market_calendar import now_kst
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -66,7 +68,7 @@ def _load_token_cache(path: Path, app_key: str) -> dict | None:
             return None
         # 만료 확인
         expires_at = datetime.fromisoformat(data["expires_at"])
-        if datetime.now() >= expires_at:
+        if now_kst() >= expires_at:
             logger.info("토큰 캐시 만료 → 재발급")
             return None
         return data
@@ -84,6 +86,7 @@ from src.kis_api.constants import (
     EP_PRICE,
     EP_VOLUME_RANK,
     EP_PROGRAM_TRADE_TODAY,
+    EP_PROGRAM_TRADE_BY_STOCK,
     EP_ORDER,
     EP_ORDER_CANCEL,
     EP_BALANCE,
@@ -91,6 +94,7 @@ from src.kis_api.constants import (
     TR_PRICE,
     TR_VOLUME_RANK,
     TR_PROGRAM_TRADE_TODAY,
+    TR_PROGRAM_TRADE_BY_STOCK,
     TR_ORDER_BUY,
     TR_ORDER_SELL,
     TR_ORDER_BUY_PAPER,
@@ -117,11 +121,16 @@ class KISAPI:
         app_secret: str,
         account_no: str,
         is_paper: bool = True,
+        infra_params: object | None = None,
     ):
         self.app_key = app_key
         self.app_secret = app_secret
         self.account_no = account_no
         self.is_paper = is_paper
+
+        # 인프라 파라미터 (None이면 기본값 사용)
+        from config.settings import InfraParams
+        self._infra = infra_params if infra_params else InfraParams()
 
         self.base_url = BASE_URL_PAPER if is_paper else BASE_URL_REAL
         self.ws_url = WS_URL_PAPER if is_paper else WS_URL_REAL
@@ -153,7 +162,10 @@ class KISAPI:
 
     async def connect(self):
         """세션 생성 + 토큰 발급."""
-        timeout = aiohttp.ClientTimeout(total=10, connect=5)
+        timeout = aiohttp.ClientTimeout(
+            total=self._infra.http_timeout_total_sec,
+            connect=self._infra.http_timeout_connect_sec,
+        )
         self._session = aiohttp.ClientSession(timeout=timeout)
         await self._get_token()
         logger.info(f"KIS API 연결 완료 ({'모의투자' if self.is_paper else '실거래'})")
@@ -177,7 +189,7 @@ class KISAPI:
     async def _get_token(self):
         """OAuth2 접근 토큰 발급/갱신. 파일 캐시 우선 사용."""
         # 1. 메모리 캐시 유효
-        if self._token and datetime.now() < self._token_expires:
+        if self._token and now_kst() < self._token_expires:
             return
 
         # 2. 파일 캐시 확인
@@ -205,7 +217,7 @@ class KISAPI:
 
             self._token = data["access_token"]
             expires_in = data.get("expires_in", 86400)
-            self._token_expires = datetime.now() + timedelta(seconds=expires_in - 3600)
+            self._token_expires = now_kst() + timedelta(seconds=expires_in - 3600)
             _save_token_cache(_token_cache_path(self.is_paper), self._token,
                               self._token_expires, self.app_key, self._ws_key)
             logger.info(f"KIS 토큰 발급 완료 (만료: {self._token_expires.strftime('%Y-%m-%d %H:%M')})")
@@ -290,7 +302,7 @@ class KISAPI:
                             # 5xx 에러 시 재시도
                             if resp.status >= 500 and attempt < max_retries:
                                 logger.warning(f"HTTP {resp.status} [{tr_id}], 재시도 {attempt + 1}/{max_retries}")
-                                await asyncio.sleep(1.0)
+                                await asyncio.sleep(self._infra.http_retry_delay_sec)
                                 continue
                             data = await resp.json()
                     elif method == "POST":
@@ -347,6 +359,7 @@ class KISAPI:
             "high": int(output.get("stck_hgpr", "0")),
             "low": int(output.get("stck_lwpr", "0")),
             "open": int(output.get("stck_oprc", "0")),
+            "market_name": output.get("rprs_mrkt_kor_name", ""),
         }
 
     async def get_volume_rank(
@@ -354,14 +367,13 @@ class KISAPI:
         market: str = "J",
         min_volume: int = 0,
     ) -> list[dict]:
-        """거래량순위 + 급등종목 통합 조회.
+        """거래량순위 + 거래대금순위 + 급등종목 통합 조회.
 
-        KIS API에 '거래대금 순위' 직접 조회가 없으므로:
-          - 20171 (거래량 상위 30종목)
-          - 20170 (급등률 상위 30종목)
-        두 결과를 합쳐서 중복 제거 후 반환.
-        고가 종목(SK이터닉스 등)은 주식 수가 적어 거래량순위에서 누락될 수 있으므로
-        급등률순위를 보조 소스로 활용한다.
+        KIS API 순위 조회 3종 병합:
+          - 20171 (거래량 상위 30종목) — 소형주 포착
+          - 20176 (거래대금 상위 30종목) — 대형주 포착 (삼성SDI, SK하이닉스 등)
+          - 20170 (급등률 상위 30종목) — 테마주 포착
+        세 결과를 합쳐서 중복 제거 후 반환.
         """
         base_params = {
             "FID_COND_MRKT_DIV_CODE": market,
@@ -379,8 +391,8 @@ class KISAPI:
         seen_codes: set[str] = set()
         results: list[dict] = []
 
-        # 두 가지 순위 조회: 거래량(20171) + 급등률(20170)
-        for scr_code, label in [("20171", "거래량"), ("20170", "급등률")]:
+        # 세 가지 순위 조회: 거래량(20171) + 거래대금(20176) + 급등률(20170)
+        for scr_code, label in [("20171", "거래량"), ("20176", "거래대금"), ("20170", "급등률")]:
             params = {**base_params, "FID_COND_SCR_DIV_CODE": scr_code}
             try:
                 data = await self._get(EP_VOLUME_RANK, TR_VOLUME_RANK, params)
@@ -411,60 +423,40 @@ class KISAPI:
         return results
 
     async def get_program_trade(self, code: str) -> dict:
-        """종목별 당일 프로그램매매 조회.
+        """종목별 프로그램매매 조회.
 
-        comp-program-trade-today 엔드포인트 사용.
-        출력 필드는 실제 확인 후 조정 필요.
+        program-trade-by-stock (FHPPG04650101) 엔드포인트 사용.
+        시간대별 누적 프로그램 순매수 데이터를 반환하며,
+        최신(마지막) 레코드에 현재까지의 누적값이 들어있다.
         """
         params = {
             "FID_COND_MRKT_DIV_CODE": "J",
-            "FID_COND_MRKT_DIV_CODE1": "J",  # 필수 파라미터 (없으면 INPUT FIELD NOT FOUND 오류)
             "FID_INPUT_ISCD": code,
-            "FID_INPUT_HOUR_1": "",
-            "FID_MRKT_CLS_CODE": "",
-            "FID_SCTN_CLS_CODE": "",
         }
-        data = await self._get(EP_PROGRAM_TRADE_TODAY, TR_PROGRAM_TRADE_TODAY, params)
+        data = await self._get(EP_PROGRAM_TRADE_BY_STOCK, TR_PROGRAM_TRADE_BY_STOCK, params)
 
-        output = data.get("output", {})
+        output = data.get("output", [])
 
         # 디버그: 실제 응답 구조 로깅 (최초 1회)
         if not self._prog_trade_logged:
             self._prog_trade_logged = True
             logger.debug(f"프로그램매매 응답 키: {list(data.keys())}")
-            logger.debug(f"프로그램매매 output 타입: {type(output).__name__}, 값: {output}")
+            if isinstance(output, list) and output:
+                logger.debug(f"프로그램매매 output[0] 키: {list(output[0].keys())}")
+                logger.debug(f"프로그램매매 output[0]: {output[0]}")
+            else:
+                logger.debug(f"프로그램매매 output: {output}")
             logger.debug(f"프로그램매매 rt_cd={data.get('rt_cd')}, msg1={data.get('msg1')}")
 
-        # output이 list인 경우
+        # output이 시간대별 리스트 — 첫 번째가 최신(누적값)
         if isinstance(output, list) and output:
-            output1 = output[0]
-        elif isinstance(output, list):
-            return {"program_net_buy": 0, "buy_amount": 0, "sell_amount": 0}
+            latest = output[0]
         else:
-            output1 = output
+            return {"program_net_buy": 0, "buy_amount": 0, "sell_amount": 0}
 
-        # 필드명 매핑 시도 (KIS API 실제 응답 기준)
-        # 가능한 필드: ntby_qty, ntby_tr_pbmn, seln_tr_pbmn, shnu_tr_pbmn 등
-        net_buy = 0
-        for key in ["ntby_tr_pbmn", "pgtr_ntby_amt", "ntby_qty", "pgmg_ntby_qty"]:
-            val = output1.get(key, "")
-            if val and val != "0":
-                net_buy = int(val)
-                break
-
-        buy_amt = 0
-        for key in ["shnu_tr_pbmn", "pgtr_shnu_amt", "seln_vol"]:
-            val = output1.get(key, "")
-            if val and val != "0":
-                buy_amt = int(val)
-                break
-
-        sell_amt = 0
-        for key in ["seln_tr_pbmn", "pgtr_seln_amt", "shnu_vol"]:
-            val = output1.get(key, "")
-            if val and val != "0":
-                sell_amt = int(val)
-                break
+        net_buy = int(latest.get("whol_smtn_ntby_tr_pbmn", "0"))
+        buy_amt = int(latest.get("whol_smtn_shnu_tr_pbmn", "0"))
+        sell_amt = int(latest.get("whol_smtn_seln_tr_pbmn", "0"))
 
         return {
             "program_net_buy": net_buy,
@@ -474,7 +466,7 @@ class KISAPI:
 
     async def get_minute_chart(self, code: str) -> list[dict]:
         """1분봉 차트 조회."""
-        now = datetime.now()
+        now = now_kst()
         params = {
             "FID_ETC_CLS_CODE": "",
             "FID_COND_MRKT_DIV_CODE": "J",
@@ -645,7 +637,17 @@ class KISAPI:
         """실시간 데이터 콜백 등록."""
         if tr_id not in self._realtime_callbacks:
             self._realtime_callbacks[tr_id] = []
-        self._realtime_callbacks[tr_id].append(callback)
+        # 중복 콜백 방지
+        if callback not in self._realtime_callbacks[tr_id]:
+            self._realtime_callbacks[tr_id].append(callback)
+
+    def clear_realtime_callbacks(self):
+        """모든 실시간 콜백 초기화."""
+        self._realtime_callbacks.clear()
+
+    def clear_subscribed_codes(self):
+        """구독 종목 코드 초기화 (재스크리닝 시 호출)."""
+        self._subscribed_codes.clear()
 
     async def subscribe_realtime(self, codes: list[str]):
         """실시간 체결가 구독."""
@@ -653,7 +655,7 @@ class KISAPI:
             await self._get_ws_key()
 
         if not self._ws:
-            self._ws = await websockets.connect(self.ws_url, ping_interval=30)
+            self._ws = await websockets.connect(self.ws_url, ping_interval=self._infra.ws_ping_interval_sec, ping_timeout=self._infra.ws_timeout_sec)
             self._ws_task = asyncio.create_task(self._ws_receiver())
 
         for code in codes:
@@ -707,7 +709,7 @@ class KISAPI:
     async def _ws_receiver(self):
         """WebSocket 메시지 수신 루프. 연결 끊김 시 지수 백오프로 재접속."""
         backoff = 1.0
-        max_backoff = 30.0
+        max_backoff = self._infra.ws_max_backoff_sec
 
         while True:
             try:
@@ -771,7 +773,7 @@ class KISAPI:
             backoff = min(backoff * 2, max_backoff)
 
             try:
-                self._ws = await websockets.connect(self.ws_url, ping_interval=30)
+                self._ws = await websockets.connect(self.ws_url, ping_interval=self._infra.ws_ping_interval_sec, ping_timeout=self._infra.ws_timeout_sec)
                 self._ws_connected = True
                 self._ws_last_recv = time.time()
                 logger.info("WebSocket 재접속 성공")

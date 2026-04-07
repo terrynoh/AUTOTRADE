@@ -1,13 +1,28 @@
 """
 거래일 확인 — pykrx 기반.
+KST 시간 유틸리티 포함.
 
 공휴일, 주말 등 비거래일에는 프로그램을 실행하지 않는다.
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from loguru import logger
+
+# ── KST 시간대 ──────────────────────────────────────────
+KST = timezone(timedelta(hours=9))
+
+
+def now_kst() -> datetime:
+    """현재 한국시간(KST) 반환. 시스템 시간대와 무관."""
+    return datetime.now(KST)
+
+
+def today_kst() -> date:
+    """오늘 날짜(KST) 반환."""
+    return now_kst().date()
+
 
 try:
     from pykrx import stock as pykrx_stock
@@ -24,7 +39,7 @@ def is_trading_day(target_date: date | None = None) -> bool:
     pykrx가 있으면 KRX 캘린더 기반, 없으면 평일만 체크.
     """
     if target_date is None:
-        target_date = date.today()
+        target_date = today_kst()
 
     # 주말 체크 (빠른 필터)
     if target_date.weekday() >= 5:
@@ -62,7 +77,7 @@ def is_trading_day(target_date: date | None = None) -> bool:
 def get_next_trading_day(from_date: date | None = None) -> date:
     """다음 거래일 반환."""
     if from_date is None:
-        from_date = date.today()
+        from_date = today_kst()
 
     check = from_date + timedelta(days=1)
     for _ in range(10):  # 최대 10일 탐색

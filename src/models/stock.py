@@ -3,7 +3,6 @@
 """
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -70,10 +69,9 @@ class TradeTarget:
     total_buy_amount: int = 0
     total_buy_qty: int = 0
 
-    # ── 최저가 추적 (25분 타이머, 추세 이탈용) ──
+    # ── 최저가 추적 (25분 타이머용) ──
     post_entry_low: int = 0
     post_entry_low_time: Optional[datetime] = None
-    minute_lows: deque[int] = field(default_factory=lambda: deque(maxlen=60))
 
     # ── 상태 ──
     exited: bool = False
