@@ -214,17 +214,6 @@
     </div>
 
     <div class="container">
-        <!-- 컨트롤 -->
-        <div class="row">
-            <div class="card" style="flex: none; width: auto;">
-                <div class="btn-group">
-                    <button class="btn btn-primary" id="btn-connect" onclick="doConnect()">API 연결</button>
-                    <button class="btn btn-warning" id="btn-screening" onclick="doScreening()" disabled>자동 스크리닝</button>
-                    <button class="btn btn-danger" id="btn-disconnect" onclick="doDisconnect()" disabled>연결 해제</button>
-                </div>
-            </div>
-        </div>
-
         <!-- 수동 종목 입력 -->
         <div class="card" id="manual-input-section">
             <h3>수동 종목 입력</h3>
@@ -301,46 +290,12 @@
             return h;
         }
 
-        // 관리자가 아니면 제어 버튼 + 수동 입력 숨김
+        // 관리자가 아니면 수동 입력 숨김
         if (typeof IS_ADMIN !== 'undefined' && !IS_ADMIN) {
             document.addEventListener('DOMContentLoaded', () => {
-                const ctrl = document.querySelector('.btn-group');
-                if (ctrl) ctrl.closest('.card').style.display = 'none';
                 const manualSection = document.getElementById('manual-input-section');
                 if (manualSection) manualSection.style.display = 'none';
             });
-        }
-
-        // ── API 호출 ──
-        async function doConnect() {
-            setBtn('btn-connect', true, '연결 중...');
-            const res = await fetch('/api/connect', {method: 'POST', headers: adminHeaders()}).then(r => r.json());
-            if (res.ok) {
-                setBtn('btn-connect', true);
-                setBtn('btn-screening', false);
-                setBtn('btn-disconnect', false);
-                setBtn('btn-set-targets', false);
-                connectWS();
-            } else {
-                alert('연결 실패: ' + res.msg);
-                setBtn('btn-connect', false);
-            }
-        }
-
-        async function doScreening() {
-            setBtn('btn-screening', true, '실행 중...');
-            const res = await fetch('/api/screening', {method: 'POST', headers: adminHeaders()}).then(r => r.json());
-            setBtn('btn-screening', false);
-        }
-
-        async function doDisconnect() {
-            await fetch('/api/disconnect', {method: 'POST', headers: adminHeaders()});
-            setBtn('btn-connect', false);
-            setBtn('btn-screening', true);
-            setBtn('btn-disconnect', true);
-            setBtn('btn-set-targets', true);
-            setBtn('btn-manual-screening', true);
-            if (ws) ws.close();
         }
 
         // ── 종목 검색 자동완성 ──
@@ -498,9 +453,6 @@
             if (text) btn.textContent = text;
             else {
                 const defaults = {
-                    'btn-connect': 'API 연결',
-                    'btn-screening': '자동 스크리닝',
-                    'btn-disconnect': '연결 해제',
                     'btn-set-targets': '종목 설정',
                     'btn-manual-screening': '수동 스크리닝',
                 };
@@ -669,9 +621,6 @@
         // 페이지 로드 시 상태 확인 + 실시간 연결 시작
         fetch('/api/status').then(r => r.json()).then(d => {
             if (d.connected) {
-                setBtn('btn-connect', true);
-                setBtn('btn-screening', false);
-                setBtn('btn-disconnect', false);
                 setBtn('btn-set-targets', false);
                 if (d.manual_codes && d.manual_codes.length > 0) {
                     setBtn('btn-manual-screening', false);
