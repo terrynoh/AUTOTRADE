@@ -218,8 +218,10 @@ C:\Users\terryn\AUTOTRADE\
 | Phase 3 | 실시간 감시 + 분할매수 — DRY_RUN 풀가동 | 코드 완료, 미검증 |
 | Phase 4 | 주문 실행 — 모의투자 체결 확인 | 코드 완료, 미검증 |
 | Phase 5 | 운영 안정화 — 1~2주 모의투자 후 실매매 전환 | 코드 완료, 미검증 |
-| **Phase α-0** | **매매 로직 누락 부분 보강 (10시 가드 + 선물 급락)** | **🟡 진행 예정 (다음 작업)** |
-| Phase α-1 | 클라우드 lift and shift + 다중 사용자 UI | 📅 α-0 후 |
+| **Phase α-0** | **매매 로직 누락 부분 보강 (10시 가드 + 선물 급락)** | **✅ 완료 (2026-04-07)** |
+| **Phase α-1a** | **클라우드 lift and shift (Oracle E2.1.Micro, systemd, Quick Tunnel)** | **✅ 완료 (2026-04-08)** |
+| **Phase α-1b** | **Named Tunnel 전환 + 고정 URL** | **🟡 진행 예정 (도메인 결정 후)** |
+| Phase α-1 (잔여) | 다중 사용자 UI (인증/권한 분리) | 📅 α-1b 후 |
 | Phase α-2 | Strategy plug-in 구조 + Account Executor 구조 | 📅 α-1 안정 후 |
 | Phase β | KIS 계좌 분리 + 매매 로직 B/C/D 추가 | 📅 α-2 후 |
 
@@ -591,6 +593,45 @@ await self.api.connect()  # 토큰 자동 발급/갱신 (24시간 유효)
 - 5원칙 3번 위반 (시스템이 종목을 자동 추가)
 - 가능 원인: (a) 카테고리 A 후속 보정 전의 자동 폴백, (b) 세션 간 상태 잔존
 - 조사 + 해결 필요
+
+### ISSUE-026 — Ampere A1 인스턴스 확보 후 재생성 검토
+- 현재: Oracle E2.1.Micro (AMD, 956Mi RAM, 1 OCPU)
+- 목표: A1.Flex (Ampere ARM, 24Gi RAM, 4 OCPU) — Oracle Always Free 쿼터
+- 현황: ap-chuncheon-1 AD-1에서 A1.Flex 용량 부족으로 E2.1.Micro 채택
+- 조건: A1 용량 확보 시점에 재검토 (리소스 여유가 큼)
+
+### ISSUE-027 — Telegram bot stop_polling 시 CancelledError traceback
+- 발생: systemd stop → SIGTERM → graceful shutdown 시 telegram bot.stop() 내부에서 traceback 출력
+- 영향: 무해 (종료 플로우 정상 완료), autotrade.err에 기록됨
+- 원인: python-telegram-bot v22.7 stop() 내부 update_queue CancelledError 미처리
+- 처리: α-1b 또는 이후 정리 예정
+
+### ISSUE-028 — Quick Tunnel → Named Tunnel 전환 (α-1b 작업)
+- 현재: Quick Tunnel (*.trycloudflare.com), 재시작 시마다 URL 변경
+- 목표: Named Tunnel (autotrade.수석님도메인.com), 고정 URL
+- 사전 필요: 도메인 결정 + Cloudflare 계정 + DNS 네임서버 이전
+- Phase B 선결: src/utils/tunnel.py CloudflareTunnel 클래스가 Named 모드를 지원하는지 코드 분석 필요
+- 예상 코드 변경: 환경변수 분기 없으면 tunnel.py 수정 필요
+
+### ISSUE-029 — Dashboard 수동 종목 입력 "검증 중..." 버튼 휴장 시간 동작 확인
+- 발견: 2026-04-08 01:01 KST 새벽 휴장 시간에 "에코프로" 검증 클릭 시 응답 없음
+- 검증: 09:00 KST 장 시작 후 재시도. 작동하면 휴장 한정, 작동 안 하면 코드 분석 필요
+
+### ISSUE-030 — Dashboard 예수금 / 평가금액 카드 표시 버그 (2건)
+- 발견: 2026-04-08 01:30 KST 새벽 첫 dashboard 접속 시
+
+**버그 1 — 예수금 "-" (WebSocket 인증 미연동)**
+- 위치: `app.py:355, 361-364` + `index.html:467`
+- 원인: WebSocket URL에 `?token=` 미부착 → `is_admin=False` → `available_cash` strip → JS `undefined` → `"-"`
+
+**버그 2 — 평가금액에 투자원금 표시 (label 매핑)**
+- 위치: `app.py:405`
+- 원인: `state.total_eval = at._initial_cash` (초기 자본금 고정값)
+- 정상: `total_eval = available_cash + sum(holdings_market_value)`
+
+- 수정 범위: 2 파일, 2~5 줄
+- 수정 시기: α-1a 외. 가동 첫째 날 16:00 이후 또는 α-1b
+- 운영 우회: KIS 모의투자 앱으로 잔고 교차 검증
 
 **Phase α-0으로 흡수된 이슈** (별도 추적 종료):
 - ~~ISSUE-025 청산 조건 ④ 선물 급락 미구현~~ → Phase α-0 항목 2
