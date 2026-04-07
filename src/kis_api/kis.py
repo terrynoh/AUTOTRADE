@@ -105,6 +105,8 @@ from src.kis_api.constants import (
     TR_BALANCE_PAPER,
     TR_MINUTE_CHART,
     WS_TR_PRICE,
+    WS_TR_FUTURES,
+    FUTURES_KOSPI200_NEAR,
     ORDER_TYPE_LIMIT,
     ORDER_TYPE_MARKET,
     RATE_LIMIT_REAL,
@@ -148,6 +150,7 @@ class KISAPI:
 
         self._realtime_callbacks: dict[str, list[Callable]] = {}
         self._subscribed_codes: set[str] = set()
+        self._futures_subscribed: bool = False  # 선물 구독 상태
         self._prog_trade_logged: bool = False
         self._ws_connected: bool = False  # WebSocket 연결 상태
         self._ws_last_recv: float = 0.0   # 마지막 수신 시각 (time.time())
@@ -706,6 +709,33 @@ class KISAPI:
             await self._ws.close()
             self._ws = None
 
+    async def subscribe_futures(self):
+        """KOSPI200 선물 실시간 체결가 구독."""
+        if not self._ws_key:
+            await self._get_ws_key()
+
+        if not self._ws:
+            self._ws = await websockets.connect(self.ws_url, ping_interval=self._infra.ws_ping_interval_sec, ping_timeout=self._infra.ws_timeout_sec)
+            self._ws_task = asyncio.create_task(self._ws_receiver())
+
+        msg = {
+            "header": {
+                "approval_key": self._ws_key,
+                "custtype": "P",
+                "tr_type": "1",
+                "content-type": "utf-8",
+            },
+            "body": {
+                "input": {
+                    "tr_id": WS_TR_FUTURES,
+                    "tr_key": FUTURES_KOSPI200_NEAR,
+                }
+            },
+        }
+        await self._ws.send(json.dumps(msg))
+        self._futures_subscribed = True
+        logger.info(f"선물 실시간 구독: {FUTURES_KOSPI200_NEAR} (TR: {WS_TR_FUTURES})")
+
     async def _ws_receiver(self):
         """WebSocket 메시지 수신 루프. 연결 끊김 시 지수 백오프로 재접속."""
         backoff = 1.0
@@ -752,6 +782,20 @@ class KISAPI:
                                         except Exception as e:
                                             logger.error(f"실시간 콜백 에러: {e}")
 
+                                elif tr_id == WS_TR_FUTURES:
+                                    fields = body.split("^")
+                                    if len(fields) >= 3:
+                                        futures_data = {
+                                            "code": fields[0],
+                                            "time": fields[1],
+                                            "current_price": float(fields[2]),
+                                        }
+                                        for cb in self._realtime_callbacks.get(WS_TR_FUTURES, []):
+                                            try:
+                                                cb(futures_data)
+                                            except Exception as e:
+                                                logger.error(f"선물 콜백 에러: {e}")
+
                     except Exception as e:
                         logger.error(f"WebSocket 메시지 파싱 에러: {e}")
 
@@ -796,6 +840,25 @@ class KISAPI:
                     }
                     await self._ws.send(json.dumps(msg))
                     logger.info(f"재구독 완료: {code}")
+
+                # 선물 재구독
+                if self._futures_subscribed:
+                    futures_msg = {
+                        "header": {
+                            "approval_key": self._ws_key,
+                            "custtype": "P",
+                            "tr_type": "1",
+                            "content-type": "utf-8",
+                        },
+                        "body": {
+                            "input": {
+                                "tr_id": WS_TR_FUTURES,
+                                "tr_key": FUTURES_KOSPI200_NEAR,
+                            }
+                        },
+                    }
+                    await self._ws.send(json.dumps(futures_msg))
+                    logger.info(f"선물 재구독 완료: {FUTURES_KOSPI200_NEAR}")
 
             except asyncio.CancelledError:
                 return

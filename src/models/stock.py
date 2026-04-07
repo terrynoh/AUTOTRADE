@@ -55,7 +55,7 @@ class TradeTarget:
     high_confirmed: bool = False                  # 고가 확정 (1% 하락 트리거)
 
     # ── 선물 추적 ──
-    futures_price_at_high: int = 0               # 종목 고점 시각의 선물 가격
+    futures_price_at_high: float = 0.0            # 종목 고점 시각의 선물 가격 (소수점 포함)
 
     # ── 매수 주문 ──
     buy1_placed: bool = False                    # 1차 매수 주문 접수 여부

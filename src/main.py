@@ -33,7 +33,7 @@ from loguru import logger
 
 from config.settings import Settings, StrategyParams
 from src.kis_api.kis import KISAPI
-from src.kis_api.constants import WS_TR_PRICE
+from src.kis_api.constants import WS_TR_PRICE, WS_TR_FUTURES
 from src.core.screener import Screener
 from src.core.monitor import TargetMonitor, MonitorState
 from src.core.trader import Trader
@@ -84,7 +84,7 @@ class AutoTrader:
         # ── 기타 ──
         self._available_cash: int = 0
         self._initial_cash: int = 0
-        self._futures_price: int = 0
+        self._futures_price: float = 0.0
         self._running: bool = False
         self._network_ok: bool = True       # 네트워크 정상 여부
         self._emergency_cancel_done: bool = False  # 긴급 취소 실행 여부 (중복 방지)
@@ -174,10 +174,17 @@ class AutoTrader:
             # 실시간 콜백 1회 등록 (중복 방지)
             if not self._realtime_callback_registered:
                 self.api.add_realtime_callback(WS_TR_PRICE, self._on_realtime_price)
+                self.api.add_realtime_callback(WS_TR_FUTURES, self._on_futures_price)
                 self._realtime_callback_registered = True
 
             # WebSocket 끊김 콜백 등록 (1차 방어: 즉시 미체결 매수 취소)
             self.api.set_ws_disconnect_callback(self._on_ws_disconnect)
+
+            # KOSPI200 선물 실시간 구독 (청산 조건 ④ 선물 급락용)
+            try:
+                await self.api.subscribe_futures()
+            except Exception as e:
+                logger.error(f"선물 구독 실패: {e}")
 
             # 계좌 잔고 확인
             if self.settings.is_dry_run and self.settings.dry_run_cash > 0:
@@ -751,8 +758,17 @@ class AutoTrader:
             mon.on_price(price, ts)
             logger.debug(f"[실시간] {mon.target.stock.name} {price:,}원 ({change_pct:+.2f}%)")
 
-        # 선물 가격 업데이트 (별도 TR ID로 올 경우)
-        # TODO: WS_TR_FUTURES 콜백 분리
+    def _on_futures_price(self, data: dict) -> None:
+        """KOSPI200 선물 실시간 체결가 수신 콜백."""
+        price = data.get("current_price", 0.0)
+        if price <= 0:
+            return
+        self._futures_price = price
+
+        # 활성 모니터에 선물 가격 전달
+        if self._active_monitor:
+            self._active_monitor.on_futures_price(price)
+            logger.debug(f"[선물] {price:.2f}")
 
     # ── 모니터 루프 (시그널 폴링) ─────────────────────────
 

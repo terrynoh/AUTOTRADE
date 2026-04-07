@@ -48,9 +48,9 @@ class TargetMonitor:
         # 고가 확정 시각 (타임아웃용)
         self._high_confirmed_at: Optional[datetime] = None
 
-        # 선물 가격
-        self._futures_price: int = 0
-        self._futures_at_high: int = 0   # 종목 고점 시각의 선물 가격
+        # 선물 가격 (KOSPI200 선물은 소수점 포함 — 예: 350.25)
+        self._futures_price: float = 0.0
+        self._futures_at_high: float = 0.0  # 종목 고점 시각의 선물 가격
 
 
         # ── 시그널 (main.py에서 polling) ──
@@ -75,7 +75,7 @@ class TargetMonitor:
         elif self.state == MonitorState.ENTERED:
             self._handle_entered(price, ts)
 
-    def on_futures_price(self, price: int) -> None:
+    def on_futures_price(self, price: float) -> None:
         """선물 실시간 가격 업데이트."""
         self._futures_price = price
 
@@ -99,7 +99,7 @@ class TargetMonitor:
             self.state = MonitorState.TRACKING_HIGH
             logger.info(
                 f"[{self.target.stock.name}] 9:55 이후 신고가 달성: {price:,}원 "
-                f"(선물 {self._futures_at_high:,})"
+                f"(선물 {self._futures_at_high:.2f})"
             )
         elif price > self.target.intraday_high:
             # 9:55 이후 고가 갱신 (아직 이전 고가 못 넘음)
@@ -229,7 +229,7 @@ class TargetMonitor:
             self._emit_exit("futures_stop", 0, ts)  # 시장가
             logger.warning(
                 f"[{self.target.stock.name}] 선물 급락: "
-                f"고점시각 {self._futures_at_high:,} → 현재 {self._futures_price:,}"
+                f"고점시각 {self._futures_at_high:.2f} → 현재 {self._futures_price:.2f}"
             )
             return
 
