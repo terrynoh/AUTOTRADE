@@ -69,7 +69,7 @@ class TradeTarget:
     total_buy_amount: int = 0
     total_buy_qty: int = 0
 
-    # ── 최저가 추적 (25분 타이머용) ──
+    # ── 최저가 추적 (20분 타이머용) ──
     post_entry_low: int = 0
     post_entry_low_time: Optional[datetime] = None
 

@@ -136,6 +136,8 @@ class ExitParams(BaseModel):
 
     futures_drop_pct: float = Field(default=1.0, ge=0.1, le=20.0)  # 선물 급락 손절 (%)
 
+    timeout_start_after_kst: str = "10:00"  # 타임아웃 가드: 이 시각 이전 최저가는 타이머 시작 안 함
+
     force_liquidate_time: str = "15:20"
 
 

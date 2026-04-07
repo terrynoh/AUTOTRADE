@@ -5,7 +5,7 @@
 1. 9:55 이후 당일 신고가 달성 감시
 2. 고가에서 1% 하락 → 고가 확정, 매수 주문 진입
 3. 고가 갱신 → 기존 주문 취소, 새 고가에서 1% 하락 대기
-4. 매수 후: 하드손절/25분타임아웃/목표가/선물급락/강제청산
+4. 매수 후: 하드손절/20분타임아웃/목표가/선물급락/강제청산
 """
 from __future__ import annotations
 
@@ -209,10 +209,10 @@ class TargetMonitor:
             )
             return
 
-        # ② 25분 타임아웃
+        # ② 20분 타임아웃 (10시 이후 최저가 기준)
         if self._check_timeout(ts):
             self._emit_exit("timeout", price, ts)
-            logger.warning(f"[{self.target.stock.name}] 25분 타임아웃")
+            logger.warning(f"[{self.target.stock.name}] 20분 타임아웃")
             return
 
         # ③ 목표가
@@ -238,10 +238,16 @@ class TargetMonitor:
     # ── 청산 조건 헬퍼 ────────────────────────────────────
 
     def _check_timeout(self, ts: datetime) -> bool:
-        """눌림 최저가 시점부터 N분 경과."""
+        """눌림 최저가 시점부터 N분 경과. 10시 이전 최저가는 타이머 시작 안 함."""
         low_time = self.target.post_entry_low_time
         if low_time is None:
             return False
+
+        # 10시 이후 가드: 10시 이전에 찍힌 최저가는 타이머 시작 안 함
+        guard = time.fromisoformat(self.params.exit.timeout_start_after_kst)
+        if low_time.time() < guard:
+            return False
+
         timeout = timedelta(minutes=self.params.exit.timeout_from_low_min)
         return (ts - low_time) >= timeout
 
