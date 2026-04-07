@@ -227,14 +227,18 @@ class Screener:
         return targets
 
     async def run(self) -> list[TradeTarget]:
-        """
-        스크리닝 실행.
+        """⚠ DEPRECATED (ISSUE-010): 수동 입력 방식으로 전환됨.
 
-        1. 거래대금 상위 종목 조회 (KOSPI + KOSDAQ 통합)
-        2. ETF/ETN/스팩/우선주 제외
-        3. 프로그램순매수비중 ≥ N% 필터 (실매매만, 모의투자 건너뜀)
-        4. 상승률 최고 N종목 선택
+        프로덕션 호출 금지. run_manual(codes)를 사용하세요.
+
+        이 메서드는 KIS API의 get_volume_rank를 호출하지만, market="Q" 미지원
+        (ISSUE-007 3-2)으로 KOSDAQ 종목이 누락됩니다. 백테스트 호환성을 위해
+        메서드는 보존되며, 다음 sprint에서 정리 예정입니다.
         """
+        logger.warning(
+            "screener.run() 호출됨 — 이 메서드는 DEPRECATED입니다 (ISSUE-010). "
+            "run_manual(codes)를 사용하세요. 백테스트 외 호출 금지."
+        )
         sp = self.params.screening
         logger.info(f"스크리닝 시작: 거래대금≥{sp.volume_min/1e8:.0f}억, 프로그램비중≥{sp.program_net_buy_ratio_min}%, 상승률 상위{sp.top_n_gainers}종목")
 

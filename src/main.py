@@ -259,13 +259,22 @@ class AutoTrader:
             logger.warning("매매 불가 상태")
             return
 
-        # 수동 종목코드가 설정되어 있으면 수동 스크리닝 사용
-        if self._manual_codes:
-            logger.info(f"수동 입력 종목으로 스크리닝: {', '.join(self._manual_codes)}")
-            targets = await self.screener.run_manual(self._manual_codes)
-        else:
-            logger.info("자동 스크리닝 실행 (수동 종목 미설정)")
-            targets = await self.screener.run()
+        # 자동 스크리닝은 ISSUE-010 (수동 입력 방식 전환)으로 deprecated.
+        # 종목 미입력 = 오늘 매매 안 함 (운영자에게 즉시 알림).
+        if not self._manual_codes:
+            logger.warning(
+                "수동 입력 종목 없음 — 매매 진행 불가. "
+                "자동 스크리닝은 ISSUE-010에 의해 deprecated."
+            )
+            self.notifier.notify_system(
+                "⚠ 종목 미입력 → 오늘 매매 안 함\n\n"
+                "텔레그램 /target 또는 대시보드에서 종목을 입력해주세요."
+            )
+            await self._fire_state_update()
+            return
+
+        logger.info(f"수동 스크리닝 실행 ({len(self._manual_codes)}종목)")
+        targets = await self.screener.run_manual(self._manual_codes)
 
         if not targets:
             logger.info("스크리닝 결과 없음 — 당일 매매 안 함")
@@ -938,25 +947,23 @@ class AutoTrader:
         logger.info(f"대시보드 서버 시작 (port={port})")
 
     async def _build_stock_name_cache(self) -> None:
-        """종목명 캐시 구축 — stock_master.json + KIS 거래량순위."""
+        """종목명 캐시 구축. stock_master.json만 사용.
+
+        Note: 거래량순위 API 호출은 deprecated (ISSUE-010 수동 입력 전환).
+        신규 종목 검증은 /api/set-targets와 /api/search-stock에서 lazy fill.
+        """
         from src.dashboard.app import state as dashboard_state
 
         try:
-            # 1) stock_master.json (전체 종목 ~2800건)
             master_path = Path(__file__).resolve().parents[1] / "config" / "stock_master.json"
             if master_path.exists():
                 master = json.loads(master_path.read_text(encoding="utf-8"))
                 for code, name in master.items():
                     dashboard_state.cache_stock(code, name)
                 logger.info(f"종목 마스터 로드: {len(master)}건")
-
-            # 2) KIS 거래량순위 (최신 종목명 반영)
-            for mkt in ["J", "Q"]:
-                ranks = await self.api.get_volume_rank(market=mkt)
-                for r in ranks:
-                    dashboard_state.cache_stock(r.get("code", ""), r.get("name", ""))
-
-            logger.info(f"종목명 캐시 총: {len(dashboard_state._stock_name_cache)}건")
+                logger.info(f"종목명 캐시 총: {len(dashboard_state._stock_name_cache)}건")
+            else:
+                logger.warning(f"stock_master.json 없음: {master_path}")
         except Exception as e:
             logger.warning(f"종목명 캐시 구축 실패: {e}")
 
