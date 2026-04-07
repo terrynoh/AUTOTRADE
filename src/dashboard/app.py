@@ -118,10 +118,6 @@ class DashboardState:
             "level": level,
             "msg": msg,
         }
-        # deque(maxlen=N)이 자동으로 오래된 항목 제거
-        if self.autotrader and self.log_messages.maxlen != self.autotrader.params.infra.dashboard_log_buffer_size:
-            from collections import deque
-            self.log_messages = deque(self.log_messages, maxlen=self.autotrader.params.infra.dashboard_log_buffer_size)
         self.log_messages.append(entry)
 
     def to_dict(self) -> dict:
@@ -385,8 +381,13 @@ async def websocket_endpoint(ws: WebSocket):
 
 def attach_autotrader(autotrader) -> None:
     """AutoTrader 인스턴스를 대시보드에 연결 (순수 sync)."""
+    from collections import deque
     state.autotrader = autotrader
     autotrader.on_state_update = _sync_from_autotrader
+    # deque maxlen을 설정값으로 1회 재생성 (기존 로그 보존)
+    buf_size = autotrader.params.infra.dashboard_log_buffer_size
+    if state.log_messages.maxlen != buf_size:
+        state.log_messages = deque(state.log_messages, maxlen=buf_size)
 
 
 async def _sync_from_autotrader() -> None:
