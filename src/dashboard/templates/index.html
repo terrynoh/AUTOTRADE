@@ -464,7 +464,7 @@
         function connectWS() {
             if (ws && ws.readyState <= 1) return;
             const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-            ws = new WebSocket(`${proto}//${location.host}/ws`);
+            ws = new WebSocket(`${proto}//${location.host}/ws${(typeof ADMIN_TOKEN !== 'undefined' && ADMIN_TOKEN) ? '?token=' + ADMIN_TOKEN : ''}`);
             ws.onopen = () => {
                 wsConnected = true;
                 stopPolling();

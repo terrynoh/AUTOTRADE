@@ -402,7 +402,7 @@ async def _sync_from_autotrader() -> None:
 
     # 예수금/평가
     state.available_cash = at._available_cash
-    state.total_eval = at._initial_cash
+    state.total_eval = at._available_cash
 
     # broadcast to WebSocket clients
     try:
