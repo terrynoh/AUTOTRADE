@@ -22,7 +22,7 @@ from loguru import logger
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
-from src.core.monitor import TargetMonitor
+from src.core.watcher import Watcher
 
 ADMIN_TOKEN = os.getenv("DASHBOARD_ADMIN_TOKEN", "")
 
@@ -67,7 +67,7 @@ class DashboardState:
         self.available_cash: int = 0
         self.total_eval: int = 0
 
-        self.monitors: list[TargetMonitor] = []
+        self.monitors: list[Watcher] = []
 
         # 종목명 캐시: {code: name} + {name_upper: code}
         self._stock_name_cache: dict[str, str] = {}
@@ -140,31 +140,30 @@ class DashboardState:
 
         params = at.params
         monitors_data = []
-        for mon in self.monitors:
-            t = mon.target
+        for watcher in self.monitors:
             monitors_data.append({
-                "code": t.stock.code,
-                "name": t.stock.name,
-                "market": t.stock.market.value,
-                "current_price": t.stock.current_price,
-                "change_pct": t.stock.price_change_pct,
-                "intraday_high": t.intraday_high,
-                "new_high_achieved": t.new_high_achieved,
-                "high_confirmed": t.high_confirmed,
-                "state": mon.state.value,
-                "buy1_placed": t.buy1_placed,
-                "buy2_placed": t.buy2_placed,
-                "buy1_filled": t.buy1_filled,
-                "buy2_filled": t.buy2_filled,
-                "avg_price": round(t.avg_price),
-                "total_qty": t.total_buy_qty,
-                "target_price": round(t.target_price),
-                "post_entry_low": t.post_entry_low,
-                "exit_reason": t.exit_reason,
-                "buy1_price": t.buy1_price(params) if t.intraday_high > 0 else 0,
-                "buy2_price": t.buy2_price(params) if t.intraday_high > 0 else 0,
-                "hard_stop_price": t.hard_stop_price(params) if t.intraday_high > 0 else 0,
-                "pnl": round(at.trader.get_pnl(t.stock.current_price)),
+                "code": watcher.code,
+                "name": watcher.name,
+                "market": watcher.market.value,
+                "current_price": watcher.current_price,
+                "change_pct": 0,
+                "intraday_high": watcher.intraday_high,
+                "new_high_achieved": watcher.new_high_achieved,
+                "high_confirmed": watcher.high_confirmed_at is not None,
+                "state": watcher.state.value,
+                "buy1_placed": watcher.buy1_placed,
+                "buy2_placed": watcher.buy2_placed,
+                "buy1_filled": watcher.buy1_filled,
+                "buy2_filled": watcher.buy2_filled,
+                "avg_price": round(watcher.total_buy_amount / watcher.total_buy_qty if watcher.total_buy_qty > 0 else 0),
+                "total_qty": watcher.total_buy_qty,
+                "target_price": round(watcher.target_price),
+                "post_entry_low": watcher.post_entry_low,
+                "exit_reason": watcher.exit_reason,
+                "buy1_price": watcher.target_buy1_price,
+                "buy2_price": watcher.target_buy2_price,
+                "hard_stop_price": watcher.hard_stop_price_value,
+                "pnl": round(at.trader.get_pnl(watcher.current_price)),
             })
 
         log_size = params.infra.dashboard_log_return_size
@@ -398,7 +397,7 @@ async def _sync_from_autotrader() -> None:
 
     state.connected = True
     state.trade_mode = at.settings.trade_mode
-    state.monitors = list(at._monitors)
+    state.monitors = list(at._coordinator.watchers)
 
     # 예수금/평가
     state.available_cash = at._available_cash
