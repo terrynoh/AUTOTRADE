@@ -272,7 +272,6 @@ async def api_set_targets(request: Request, token: str = Header(None, alias="X-A
                 state.cache_stock(code, name)
                 resolved.append({"code": code, "name": name})
             except Exception:
-                logger.exception(f"set-targets validation failed: raw={raw} code={code}")
                 errors.append(f"'{raw}'({code}) → KIS API 조회 실패")
 
         if not resolved:
