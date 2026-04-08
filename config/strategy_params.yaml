@@ -3,7 +3,7 @@ screening:
   screening_time: "09:50"             # 스크리닝 실행 시각
   volume_min: 50000000000             # 거래대금 최소 (500억)
   program_net_buy_ratio_min: 5.0      # 프로그램순매수비중 최소 (%)
-  top_n_gainers: 1                    # 상승률 상위 N종목 선택
+  top_n_gainers: 3                    # 상승률 상위 N종목 선택
   max_change_pct: 29.5                # 상한가(+30%) 제외: 이 값 이상 등락률 종목 스킵
   top_n_candidates: 5                  # 후보 풀 크기 (멀티 트레이드용)
 
@@ -18,17 +18,17 @@ multi_trade:
 # ── 매수 진입 ──────────────────────────────────────────────
 entry:
   new_high_watch_start: "09:55"       # 신고가 감시 시작 시각
-  entry_deadline: "11:00"             # 매수 진입 마감 (이후 신규 매수 불가)
+  entry_deadline: "10:55"             # 매수 진입 마감 (이후 신규 매수 불가)
   high_confirm_drop_pct: 1.0          # 고가 확정 트리거: 고가 대비 N% 하락
   high_confirm_timeout_min: 10        # 고가 확정 후 N분 내 미체결 시 주문 취소 (모멘텀 소멸)
 
   # KOSPI 분할매수 (고가 대비 하락률 %)
-  kospi_buy1_pct: 2.5                 # 1차 매수 (예수금 50%)
-  kospi_buy2_pct: 3.5                 # 2차 매수 (예수금 50%)
+  kospi_buy1_pct: 2.7                 # 1차 매수 (예수금 50%)
+  kospi_buy2_pct: 3.3                 # 2차 매수 (예수금 50%)
 
   # KOSDAQ 분할매수
-  kosdaq_buy1_pct: 3.75
-  kosdaq_buy2_pct: 5.25
+  kosdaq_buy1_pct: 4.0
+  kosdaq_buy2_pct: 5.0
 
   buy1_ratio: 50                      # 1차 매수 비중 (예수금 대비 %)
   buy2_ratio: 50                      # 2차 매수 비중 (예수금 대비 %)
@@ -39,14 +39,14 @@ exit:
   timeout_from_low_min: 20            # 눌림 최저가 후 N분 내 목표 미도달 시 청산
   # 하드 손절 (고가 대비 %)
   kospi_hard_stop_pct: 4.1
-  kosdaq_hard_stop_pct: 6.2
+  kosdaq_hard_stop_pct: 6.15
 
   # 선물 급락 손절
   futures_drop_pct: 1.0               # 종목 고점 시각의 선물가 대비 N% 하락 시 청산
 
   timeout_start_after_kst: "10:00"    # 타임아웃 가드: 이 시각 이전 최저가는 타이머 시작 안 함
 
-  force_liquidate_time: "15:20"
+  force_liquidate_time: "11:20"
 
 # ── 주문 ───────────────────────────────────────────────────
 order:
