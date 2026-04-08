@@ -34,10 +34,10 @@ from config.settings import Settings, StrategyParams
 from src.kis_api.kis import KISAPI
 from src.kis_api.constants import WS_TR_PRICE, WS_TR_FUTURES
 from src.core.screener import Screener
-from src.core.monitor import TargetMonitor, MonitorState
+from src.core.stock_master import StockMaster
 from src.core.trader import Trader
 from src.core.risk_manager import RiskManager
-from src.models.stock import TradeTarget
+from src.core.watcher import Watcher, WatcherCoordinator
 from src.models.trade import TradeRecord, DailySummary, ExitReason
 from src.storage.database import Database
 from src.utils.notifier import Notifier
@@ -59,20 +59,20 @@ class AutoTrader:
             is_paper=self.settings.is_paper_mode,
             infra_params=self.params.infra,
         )
-        self.screener = Screener(self.api, self.params, is_live=self.settings.is_live, use_live_data=self.settings.use_live_data)
+        # ── StockMaster (W-02 결과물, Screener/Notifier 공유) ──
+        self._stock_master = StockMaster(Path(__file__).parent.parent / "config" / "stock_master.json")
+
+        self.screener = Screener(self.api, self.params, stock_master=self._stock_master, is_live=self.settings.is_live, use_live_data=self.settings.use_live_data)
         self.trader = Trader(self.api, self.settings, self.params)
         self.risk = RiskManager(self.params)
 
-        # ── 모니터 관리 ──
-        self._monitors: list[TargetMonitor] = []
-        self._active_monitor: Optional[TargetMonitor] = None  # 현재 매매 중인 모니터
-        self._subscribed_code: Optional[str] = None  # 현재 WebSocket 구독 중인 종목코드
+        # ── Coordinator (W-05b/c 결과물) ──
+        self._coordinator: WatcherCoordinator = WatcherCoordinator(
+            params=self.params,
+            trader=self.trader,
+        )
+        self._subscribed_codes: list[str] = []  # 현재 WebSocket 구독 중인 종목코드들
         self._realtime_callback_registered: bool = False  # 실시간 콜백 등록 여부
-
-        # ── 멀티 트레이드 ──
-        self._candidate_pool: list[TradeTarget] = []   # 스크리닝 후보 풀
-        self._candidate_index: int = 0                  # 현재 후보 인덱스
-        self._completed_codes: set[str] = set()         # 이미 매매 완료된 종목코드
 
         # ── 수동 종목 입력 ──
         self._manual_codes: list[str] = []
@@ -93,6 +93,7 @@ class AutoTrader:
         self.notifier = Notifier(
             bot_token=self.settings.telegram_bot_token,
             chat_id=self.settings.telegram_chat_id,
+            stock_master=self._stock_master,
         )
 
         # ── DB ──
@@ -120,13 +121,12 @@ class AutoTrader:
     def _get_status(self) -> dict:
         """현재 매매 상태 반환 (텔레그램 /status용)."""
         monitors = []
-        for mon in self._monitors:
-            t = mon.target
+        for watcher in self._coordinator.watchers:
             monitors.append({
-                "code": t.stock.code,
-                "name": t.stock.name,
-                "state": mon.state.value,
-                "intraday_high": t.intraday_high,
+                "code": watcher.code,
+                "name": watcher.name,
+                "state": watcher.state.value,
+                "intraday_high": watcher.intraday_high,
             })
         return {
             "trade_mode": self.settings.trade_mode,
@@ -176,6 +176,9 @@ class AutoTrader:
                 self.api.add_realtime_callback(WS_TR_FUTURES, self._on_futures_price)
                 self._realtime_callback_registered = True
 
+            # Coordinator 청산 콜백 등록 (W-06b1)
+            self._coordinator.set_exit_callback(self._on_exit_done)
+
             # WebSocket 끊김 콜백 등록 (1차 방어: 즉시 미체결 매수 취소)
             self.api.set_ws_disconnect_callback(self._on_ws_disconnect)
 
@@ -193,6 +196,7 @@ class AutoTrader:
                 balance = await self.api.get_balance()
                 self._initial_cash = balance.get("available_cash", 0)
             self._available_cash = self.risk.calculate_available_cash(self._initial_cash)
+            self._coordinator.set_available_cash(self._available_cash)  # W-06b1
             logger.info(f"예수금: {self._initial_cash:,}원 → 매매가용: {self._available_cash:,}원")
 
             # 대시보드 서버 시작 (API 연결 + 잔고 확인 후 → attach_autotrader 가능)
@@ -215,9 +219,9 @@ class AutoTrader:
             tasks = [
                 dashboard_task,
                 asyncio.create_task(self._schedule_screening(), name="screening"),
+                asyncio.create_task(self._schedule_buy_deadline(), name="buy_deadline"),
                 asyncio.create_task(self._schedule_force_liquidate(), name="force_liquidate"),
                 asyncio.create_task(self._schedule_market_close(), name="market_close"),
-                asyncio.create_task(self._monitor_loop_runner(), name="monitor_loop"),
                 asyncio.create_task(self._network_health_check(), name="health_check"),
             ]
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
@@ -264,7 +268,7 @@ class AutoTrader:
         await self._on_screening()
 
     async def _on_screening(self):
-        """스크리닝 실행 → 후보 풀 선정 → 1번 종목으로 실시간 감시 시작."""
+        """스크리닝 실행 → Coordinator 에 watchers 주입 → 3종목 KIS 구독."""
         if not self.risk.can_open_position(0):
             logger.warning("매매 불가 상태")
             return
@@ -291,11 +295,6 @@ class AutoTrader:
             await self._fire_state_update()
             return
 
-        # 후보 풀 저장
-        self._candidate_pool = targets
-        self._candidate_index = 0
-        self._completed_codes = set()
-
         mt = self.params.multi_trade
         if mt.enabled:
             logger.info(f"후보 풀 {len(targets)}종목 선정 (멀티 트레이드: 최대 {mt.max_daily_trades}회)")
@@ -305,131 +304,36 @@ class AutoTrader:
         else:
             logger.info(f"타겟 {len(targets)}종목 선정")
 
-        # 1번 종목으로 감시 시작
-        await self._start_monitoring_candidate(0)
+        # Coordinator 에 watchers 주입 (W-06b2)
+        self._coordinator.start_screening(targets)
 
-    async def _start_monitoring_candidate(self, index: int) -> bool:
-        """후보 풀에서 index번째 종목으로 감시 시작. 성공 시 True."""
-        # 이미 매매 완료된 종목은 루프로 건너뛰기 (재귀 방지)
-        while index < len(self._candidate_pool):
-            target = self._candidate_pool[index]
-            if target.stock.code not in self._completed_codes:
-                break
-            logger.info(f"[{target.stock.name}] 이미 매매 완료 → 다음 후보")
-            index += 1
-        else:
-            logger.info("후보 풀 소진 — 추가 매매 불가")
-            return False
-
-        self._candidate_index = index
-
-        # 이전 종목 WebSocket 구독 해제
-        if self._subscribed_code:
+        # 3종목 KIS WebSocket 구독
+        codes = [w.code for w in self._coordinator.watchers]
+        if codes:
             try:
-                await self.api.unsubscribe_realtime([self._subscribed_code])
-                logger.debug(f"이전 종목 구독 해제: {self._subscribed_code}")
+                await self.api.subscribe_realtime(codes)
+                self._subscribed_codes = codes
+                logger.info(f"실시간 감시 시작: {len(codes)}종목 {codes}")
             except Exception as e:
-                logger.warning(f"이전 종목 구독 해제 실패: {e}")
-            self._subscribed_code = None
+                logger.error(f"실시간 구독 실패: {e}")
 
-        # 새 모니터 생성
-        monitor = TargetMonitor(target, self.params)
-        self._active_monitor = monitor
-        self._monitors.append(monitor)
-
-        code = target.stock.code
-
-        # WebSocket 실시간 구독
-        try:
-            await self.api.subscribe_realtime([code])
-            self._subscribed_code = code
-            logger.info(f"[{target.stock.name}({code})] 실시간 감시 시작 (후보 #{index+1})")
-        except Exception as e:
-            logger.error(f"실시간 구독 실패: {e}")
-
-        # 대시보드 상태 동기화
         await self._fire_state_update()
-
-        return True
-
-    # ── 멀티 트레이드: 수익 청산 후 다음 종목 ─────────────
-
-    async def _try_next_candidate(self, exit_reason: str) -> None:
-        """
-        청산 후 다음 후보 진입 가능 여부 판단.
-        - 멀티 트레이드 비활성화 → 패스
-        - 손실 청산 & profit_only → 당일 중단
-        - 최대 횟수 도달 → 중단
-        - 시간 범위 밖 → 중단
-        """
-        mt = self.params.multi_trade
-        if not mt.enabled:
-            return
-
-        # 수익 청산 여부 판단
-        profit_reasons = {"target"}
-        is_profit_exit = exit_reason in profit_reasons
-
-        if mt.profit_only and not is_profit_exit:
-            logger.info(f"손실/비수익 청산({exit_reason}) → 멀티 트레이드 중단 (당일 매매 종료)")
-            return
-
-        # 일일 최대 횟수 체크
-        if self.risk.daily_trades >= mt.max_daily_trades:
-            logger.info(f"일일 최대 매매 횟수 도달 ({self.risk.daily_trades}/{mt.max_daily_trades}) → 중단")
-            return
-
-        # 시간 범위 체크
-        now = now_kst().time()
-        repeat_start = time.fromisoformat(mt.repeat_start)
-        repeat_end = time.fromisoformat(mt.repeat_end)
-
-        if now < repeat_start or now > repeat_end:
-            logger.info(f"멀티 트레이드 시간 범위 밖 ({mt.repeat_start}~{mt.repeat_end}) → 중단")
-            return
-
-        # Trader 초기화
-        self.trader.reset()
-
-        # 잔고 재확인
-        try:
-            if self.settings.is_dry_run and self.settings.dry_run_cash > 0:
-                self._available_cash = self.risk.calculate_available_cash(self.settings.dry_run_cash)
-                logger.info(f"[DRY_RUN] 가상 예수금 재설정: {self._available_cash:,}원")
-            else:
-                balance = await self.api.get_balance()
-                self._available_cash = self.risk.calculate_available_cash(
-                    balance.get("available_cash", 0)
-                )
-            logger.info(f"다음 매매 가용 예수금: {self._available_cash:,}원")
-        except Exception as e:
-            logger.error(f"잔고 조회 실패: {e}")
-            return
-
-        # 다음 후보 찾기
-        next_index = self._candidate_index + 1
-        logger.info(f"다음 후보 탐색 (#{next_index + 1}/{len(self._candidate_pool)})")
-
-        if await self._start_monitoring_candidate(next_index):
-            logger.info(f"멀티 트레이드 #{self.risk.daily_trades + 1}: "
-                        f"{self._candidate_pool[self._candidate_index].stock.name} 감시 시작")
-        else:
-            logger.info("추가 후보 없음 — 당일 매매 종료")
 
     # ── 스케줄: 15:20 강제 청산 ───────────────────────────
 
+    async def _schedule_buy_deadline(self):
+        """매수 마감 시각 도달 시 Coordinator 에 통지 (10:55)."""
+        deadline = time.fromisoformat(self.params.entry.entry_deadline)
+        await self._wait_until(deadline)
+        await self._coordinator.on_buy_deadline(now_kst())
+        logger.info(f"매수 마감 ({self.params.entry.entry_deadline}) — Coordinator 통지 완료")
+
     async def _schedule_force_liquidate(self):
+        """강제 청산 시각 도달 시 Coordinator 에 통지."""
         force_time = time.fromisoformat(self.params.exit.force_liquidate_time)
         await self._wait_until(force_time)
-
-        for mon in self._monitors:
-            if mon.state == MonitorState.ENTERED:
-                mon.force_exit(now_kst())
-            elif mon.state in (MonitorState.HIGH_CONFIRMED, MonitorState.TRACKING_HIGH):
-                # 미매수 상태 → 주문 취소
-                await self.trader.cancel_buy_orders(mon.target)
-                mon.state = MonitorState.SKIPPED
-                logger.info(f"[{mon.target.stock.name}] 15:20 미매수 → 주문 취소")
+        await self._coordinator.on_force_liquidate(now_kst())
+        logger.info(f"강제 청산 ({self.params.exit.force_liquidate_time}) — Coordinator 통지 완료")
 
     # ── 스케줄: 15:30 장 마감 + 일일 리포트 ─────────────────
 
@@ -443,18 +347,17 @@ class AutoTrader:
 
         today = now_kst().date()
 
-        # ── 1. 미진입 모니터의 NO_ENTRY 레코드 추가 + 이미 저장된 레코드 합산 ──
+        # ── 1. 미진입 watcher 의 NO_ENTRY 레코드 추가 + 이미 저장된 레코드 합산 ──
         recorded_codes = {r.code for r in self._trade_records}
-        for mon in self._monitors:
-            t = mon.target
-            if t.stock.code not in recorded_codes:
-                # 미진입 또는 아직 기록되지 않은 모니터
-                record = self._build_trade_record(mon, today)
+        for watcher in self._coordinator.watchers:
+            if watcher.code not in recorded_codes:
+                # 미진입 또는 아직 기록되지 않은 watcher
+                record = self._build_trade_record(watcher, today)
                 self._trade_records.append(record)
                 try:
                     self._db.save_trade(record)
                 except Exception as e:
-                    logger.error(f"거래 DB 저장 실패 ({t.stock.name}): {e}")
+                    logger.error(f"거래 DB 저장 실패 ({watcher.name}): {e}")
 
         trade_records = self._trade_records
 
@@ -462,8 +365,8 @@ class AutoTrader:
         summary = DailySummary(
             summary_date=today,
             trade_mode=self.settings.trade_mode,
-            candidates_count=len(self._candidate_pool),
-            targets_count=len(self._monitors),
+            candidates_count=len(self._coordinator.watchers),
+            targets_count=len(self._coordinator.watchers),
         )
         for record in trade_records:
             summary.add_trade(record)
@@ -506,25 +409,27 @@ class AutoTrader:
         logger.info("일일 리포트 텔레그램 발송 완료")
         await self._fire_state_update()
 
-    def _build_trade_record(self, mon: TargetMonitor, today) -> TradeRecord:
-        """모니터에서 TradeRecord 생성."""
-        t = mon.target
+    def _build_trade_record(self, watcher: Watcher, today) -> TradeRecord:
+        """Watcher에서 TradeRecord 생성."""
         pos = self.trader.position
 
         # 미진입
-        if t.total_buy_qty <= 0:
+        if watcher.total_buy_qty <= 0:
             return TradeRecord(
                 trade_date=today,
-                code=t.stock.code,
-                name=t.stock.name,
-                market=t.stock.market.value,
+                code=watcher.code,
+                name=watcher.name,
+                market=watcher.market.value,
                 exit_reason=ExitReason.NO_ENTRY,
-                rolling_high=t.intraday_high,
+                rolling_high=watcher.intraday_high,
                 trade_mode=self.settings.trade_mode,
             )
 
         # 매수/매도 데이터
-        avg_buy = t.avg_price
+        avg_buy = (
+            watcher.total_buy_amount / watcher.total_buy_qty
+            if watcher.total_buy_qty > 0 else 0
+        )
         pnl = 0.0
         pnl_pct = 0.0
         avg_sell = 0.0
@@ -535,16 +440,16 @@ class AutoTrader:
         # 포지션에서 매도 데이터 추출
         if pos and pos.sell_orders:
             sell_amount = pos.total_sell_amount
-            avg_sell = sell_amount / t.total_buy_qty if t.total_buy_qty > 0 else 0
+            avg_sell = sell_amount / watcher.total_buy_qty if watcher.total_buy_qty > 0 else 0
             last_sell = pos.sell_orders[-1]
             sell_time = last_sell.filled_at
-            pnl = sell_amount - t.total_buy_amount
-            pnl_pct = (pnl / t.total_buy_amount * 100) if t.total_buy_amount > 0 else 0
+            pnl = sell_amount - watcher.total_buy_amount
+            pnl_pct = (pnl / watcher.total_buy_amount * 100) if watcher.total_buy_amount > 0 else 0
         elif pos:
             # 미청산 (현재가 기준)
-            pnl = pos.pnl(t.stock.current_price)
-            pnl_pct = pos.pnl_pct(t.stock.current_price)
-            avg_sell = t.stock.current_price
+            pnl = pos.pnl(watcher.current_price)
+            pnl_pct = pos.pnl_pct(watcher.current_price)
+            avg_sell = watcher.current_price
 
         # 보유 시간
         if pos and pos.opened_at and sell_time:
@@ -561,17 +466,17 @@ class AutoTrader:
             "force": ExitReason.FORCE_LIQUIDATE,
             "manual": ExitReason.MANUAL,
         }
-        exit_reason = reason_map.get(t.exit_reason, ExitReason.NO_ENTRY)
+        exit_reason = reason_map.get(watcher.exit_reason, ExitReason.NO_ENTRY)
 
         return TradeRecord(
             trade_date=today,
-            code=t.stock.code,
-            name=t.stock.name,
-            market=t.stock.market.value,
+            code=watcher.code,
+            name=watcher.name,
+            market=watcher.market.value,
             avg_buy_price=avg_buy,
-            total_buy_qty=t.total_buy_qty,
-            total_buy_amount=t.total_buy_amount,
-            buy_count=int(t.buy1_filled) + int(t.buy2_filled),
+            total_buy_qty=watcher.total_buy_qty,
+            total_buy_amount=watcher.total_buy_amount,
+            buy_count=int(watcher.buy1_filled) + int(watcher.buy2_filled),
             first_buy_time=pos.opened_at if pos else None,
             avg_sell_price=avg_sell,
             total_sell_amount=sell_amount,
@@ -580,9 +485,9 @@ class AutoTrader:
             pnl=pnl,
             pnl_pct=pnl_pct,
             holding_minutes=holding_min,
-            rolling_high=t.intraday_high,
-            entry_trigger_price=t.buy1_price(self.params),
-            target_price=t.target_price,
+            rolling_high=watcher.intraday_high,
+            entry_trigger_price=watcher.target_buy1_price,
+            target_price=watcher.target_price,
             trade_mode=self.settings.trade_mode,
         )
 
@@ -747,102 +652,25 @@ class AutoTrader:
     # ── 실시간 가격 콜백 ──────────────────────────────────
 
     def _on_realtime_price(self, data: dict) -> None:
-        """WebSocket 실시간 체결가 수신 콜백."""
+        """WebSocket 실시간 체결가 수신 콜백. Coordinator 로 위임."""
         code = data.get("code", "")
         price = data.get("current_price", 0)
-        change_pct = data.get("change_pct", 0.0)
         ts = now_kst()
 
-        # 활성 모니터만 가격 업데이트 (멀티 트레이드 시 현재 매매 중인 종목만)
-        if self._active_monitor and self._active_monitor.target.stock.code == code:
-            mon = self._active_monitor
-            mon.target.stock.current_price = price
-            mon.target.stock.price_change_pct = change_pct
-            mon.on_price(price, ts)
-            logger.debug(f"[실시간] {mon.target.stock.name} {price:,}원 ({change_pct:+.2f}%)")
+        # Coordinator 가 모든 watcher 라우팅 (async fire-and-forget)
+        asyncio.create_task(self._coordinator.on_realtime_price(code, price, ts))
 
     def _on_futures_price(self, data: dict) -> None:
-        """KOSPI200 선물 실시간 체결가 수신 콜백."""
+        """KOSPI200 선물 실시간 체결가 수신 콜백. Coordinator 로 위임."""
         price = data.get("current_price", 0.0)
         if price <= 0:
             return
         self._futures_price = price
 
-        # 활성 모니터에 선물 가격 전달
-        if self._active_monitor:
-            self._active_monitor.on_futures_price(price)
-            logger.debug(f"[선물] {price:.2f}")
+        # Coordinator 에 선물 가격 전달
+        self._coordinator.on_realtime_futures(price)
 
     # ── 모니터 루프 (시그널 폴링) ─────────────────────────
-
-    async def _monitor_loop_runner(self):
-        """1초 간격으로 모니터 시그널 체크."""
-        while self._running:
-            await asyncio.sleep(1)
-            await self._process_signals()
-
-    async def _process_signals(self):
-        """활성 모니터의 시그널 처리."""
-        mon = self._active_monitor
-        if mon is None:
-            return
-
-        ts = now_kst()
-        target = mon.target
-
-        # DRY_RUN 체결 시뮬레이션
-        if self.settings.is_dry_run and mon.state == MonitorState.HIGH_CONFIRMED:
-            filled = self.trader.simulate_fills(target, target.stock.current_price, ts)
-            for label in filled:
-                mon.on_buy_filled(label, target.stock.current_price, 0, ts)
-
-        # 매수 주문 배치 시그널
-        if mon.signal_place_orders:
-            mon.signal_place_orders = False
-            await self.trader.place_buy_orders(target, self._available_cash)
-
-        # 매수 주문 취소 시그널 (고가 갱신)
-        if mon.signal_cancel_orders:
-            mon.signal_cancel_orders = False
-            await self.trader.cancel_buy_orders(target)
-            logger.info(f"[{target.stock.name}] 고가 갱신 → 주문 취소 완료. 새 고가 추적 중")
-
-        # 청산 시그널
-        if mon.signal_exit:
-            mon.signal_exit = False
-            exit_reason = mon.signal_exit_reason
-
-            await self.trader.execute_exit(
-                target, exit_reason, mon.signal_exit_price
-            )
-
-            # 매매 완료 기록
-            self._completed_codes.add(target.stock.code)
-
-            # 일일 P&L 기록
-            pnl = self.trader.get_pnl(target.stock.current_price)
-            self.risk.record_trade_result(pnl)
-
-            # ── TradeRecord 즉시 생성 (trader.reset() 전에 position 데이터 캡처) ──
-            record = self._build_trade_record(mon, now_kst().date())
-            self._trade_records.append(record)
-            try:
-                self._db.save_trade(record)
-            except Exception as e:
-                logger.error(f"거래 DB 저장 실패 ({target.stock.name}): {e}")
-
-            # 일일 손실 한도 체크
-            try:
-                balance = await self.api.get_balance()
-                self.risk.check_daily_loss_limit(balance.get("available_cash", 0))
-            except Exception as e:
-                logger.error(f"잔고 조회 실패: {e}")
-
-            # 대시보드 상태 동기화
-            await self._fire_state_update()
-
-            # ── 멀티 트레이드: 다음 후보 진입 시도 ──
-            await self._try_next_candidate(exit_reason)
 
     # ── 네트워크 안전 장치 ─────────────────────────────────
 
@@ -877,25 +705,23 @@ class AutoTrader:
             return
         self._emergency_cancel_done = True
 
-        mon = self._active_monitor
-        if mon is None:
+        watcher = self._coordinator.active
+        if not watcher:
             return
-
-        target = mon.target
 
         # 미체결 매수 주문이 있으면 취소 시도
         if self.trader.pending_buy_orders:
-            logger.critical(f"[{target.stock.name}] 미체결 매수 {len(self.trader.pending_buy_orders)}건 긴급 취소")
+            logger.critical(f"[{watcher.name}] 미체결 매수 {len(self.trader.pending_buy_orders)}건 긴급 취소")
             try:
-                await self.trader.cancel_buy_orders(target)
-                logger.info(f"[{target.stock.name}] 미체결 매수 긴급 취소 완료")
+                await self.trader.cancel_buy_orders(watcher)
+                logger.info(f"[{watcher.name}] 미체결 매수 긴급 취소 완료")
                 self.notifier.notify_error(
-                    f"미체결 매수 취소 성공: {target.stock.name}"
+                    f"미체결 매수 취소 성공: {watcher.name}"
                 )
             except Exception as e:
                 logger.critical(f"긴급 취소 실패: {e}")
                 self.notifier.notify_error(
-                    f"⚠️ 미체결 매수 취소 실패!\n{target.stock.name}\n수동 확인 필요"
+                    f"⚠️ 미체결 매수 취소 실패!\n{watcher.name}\n수동 확인 필요"
                 )
 
         # 이미 포지션이 잡힌 경우 → 수동 청산 안내
@@ -903,14 +729,88 @@ class AutoTrader:
             pos = self.trader.position
             logger.critical(
                 f"⚠️ 포지션 보유 중 네트워크 끊김! "
-                f"{target.stock.name} {pos.total_qty}주 (평단 {pos.avg_price:,.0f}원)"
+                f"{watcher.name} {pos.total_qty}주 (평단 {pos.avg_price:,.0f}원)"
             )
             self.notifier.notify_error(
                 f"⚠️ 포지션 보유 중 네트워크 단절!\n"
-                f"{target.stock.name} {pos.total_qty}주\n"
+                f"{watcher.name} {pos.total_qty}주\n"
                 f"평단 {pos.avg_price:,.0f}원\n"
                 f"HTS에서 수동 청산 필요!"
             )
+
+    async def _on_exit_done(self, watcher: Watcher) -> None:
+        """청산 완료 콜백. Coordinator._execute_exit 가 호출.
+
+        책임:
+        1. P&L 기록
+        2. TradeRecord 생성 + DB 저장
+        3. 손실 한도 체크
+        4. 멀티 트레이드 가드
+        5. 잔고 재조회 + Coordinator 갱신
+        6. trader.reset
+        7. 대시보드 동기화
+        """
+        # 1. P&L 기록
+        pnl = self.trader.get_pnl(watcher.current_price)
+        self.risk.record_trade_result(pnl)
+
+        # 2. TradeRecord 생성 + DB 저장
+        record = self._build_trade_record(watcher, now_kst().date())
+        self._trade_records.append(record)
+        try:
+            self._db.save_trade(record)
+        except Exception as e:
+            logger.error(f"거래 DB 저장 실패 ({watcher.name}): {e}")
+
+        # 3. 손실 한도 체크
+        try:
+            balance = await self.api.get_balance()
+            self.risk.check_daily_loss_limit(balance.get("available_cash", 0))
+        except Exception as e:
+            logger.error(f"잔고 조회 실패 (손실 한도 체크): {e}")
+
+        # 4. 멀티 트레이드 가드
+        mt = self.params.multi_trade
+        if not mt.enabled:
+            await self._fire_state_update()
+            return
+
+        profit_reasons = {"target"}
+        is_profit_exit = watcher.exit_reason in profit_reasons
+
+        if mt.profit_only and not is_profit_exit:
+            logger.info(f"손실/비수익 청산({watcher.exit_reason}) → 멀티 트레이드 중단 (당일 매매 종료)")
+            self._coordinator.set_available_cash(0)
+            await self._fire_state_update()
+            return
+
+        if self.risk.daily_trades >= mt.max_daily_trades:
+            logger.info(f"일일 최대 매매 횟수 도달 ({self.risk.daily_trades}/{mt.max_daily_trades}) → 중단")
+            self._coordinator.set_available_cash(0)
+            await self._fire_state_update()
+            return
+
+        # 5. 잔고 재조회 + Coordinator 갱신
+        try:
+            if self.settings.is_dry_run and self.settings.dry_run_cash > 0:
+                new_cash = self.risk.calculate_available_cash(self.settings.dry_run_cash)
+                logger.info(f"[DRY_RUN] 가상 예수금 재설정: {new_cash:,}원")
+            else:
+                balance = await self.api.get_balance()
+                new_cash = self.risk.calculate_available_cash(
+                    balance.get("available_cash", 0)
+                )
+            self._available_cash = new_cash
+            self._coordinator.set_available_cash(new_cash)
+            logger.info(f"다음 매매 가용 예수금: {new_cash:,}원")
+        except Exception as e:
+            logger.error(f"잔고 조회 실패 (다음 매매 준비): {e}")
+
+        # 6. trader.reset (다음 종목 매수 준비)
+        self.trader.reset()
+
+        # 7. 대시보드 동기화
+        await self._fire_state_update()
 
     async def _network_health_check(self) -> None:
         """
@@ -934,7 +834,7 @@ class AutoTrader:
             if age > infra.ws_timeout_sec and self.api.ws_connected:
                 logger.warning(f"WebSocket 무응답 {age:.0f}초 — 연결 상태 의심")
 
-            if not self.api.ws_connected and self._active_monitor and not self._emergency_cancel_done:
+            if not self.api.ws_connected and self._coordinator.has_active and not self._emergency_cancel_done:
                 # WebSocket 끊김 + 활성 모니터 있음 → 긴급 조치
                 logger.critical("헬스체크: WebSocket 미연결 감지")
                 await self._emergency_cancel_orders()
