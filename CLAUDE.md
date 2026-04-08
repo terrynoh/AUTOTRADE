@@ -5,79 +5,118 @@ KOSPI/KOSDAQ 장중 단타 자동매매. 한국투자증권(KIS) Open API 기반
 
 ---
 
-## 1. 전략 로직
+## 1. 전략 로직 (redesign phase 동결본, 2026-04-08)
 
 > **모든 수치는 `config/strategy_params.yaml`에서 로드.** 코드에 매직넘버 직접 사용 금지.
 
-### 핵심 가설
+### 입력 채널 (택 1)
 
-장 초반 프로그램 순매수 비중이 높은 상승 종목이 9:55 이후 당일 신고가를 달성한 뒤,
-눌림(2.5~4.25%)이 발생하면 고가-저가 50%까지 반등할 확률이 높다.
-
-### 1단계: 종목 입력 + 자동 검증 (09:30~09:50)
-
-> **KIS API에 프로그램 순매수 순위 엔드포인트가 없음** (종목별 조회만 가능).
-> 따라서 1단계는 **수동 입력 + 자동 검증** 방식.
-
-#### 입력 채널 (택 1)
-- **대시보드 UI**: 텍스트 입력 → "종목 설정" → "수동 스크리닝" (관리자 토큰 필요)
+- **대시보드 UI**: 종목 입력 → "종목 설정" → "수동 스크리닝" (관리자 토큰 필요)
 - **텔레그램 봇**: `/target 006400,247540,020150` 또는 `/target 삼성SDI,에코프로비엠` (인가된 chat_id만)
+- 양 채널 모두 종목코드/종목명 입력 지원 (종목 마스터 변환)
 
-#### 자동 검증 필터 (순서대로)
+### 자동 검증 필터 (순서대로)
 
 | 순서 | 조건 | yaml 키 |
 |------|------|---------|
-| 1 | 상승률 > 0% (하락/보합 제외) | — |
-| 2 | 거래대금 ≥ 500억 원 | `screening.volume_min` |
-| 3 | 상한가 미도달 (등락률 < 20%) | `infra.upper_limit_check_pct` |
+| 1 | 상승률 > 0% | — |
+| 2 | 거래대금 ≥ 500억 | `screening.volume_min` |
+| 3 | 등락률 < 20% (상한가 미도달) | `infra.upper_limit_check_pct` |
 | 4 | 프로그램순매수비중 ≥ 5% | `screening.program_net_buy_ratio_min` |
-| 5 | 상승률 최고 1종목 | `screening.top_n_gainers` |
+| 5 | 상승률 상위 3종목 트래킹 | `screening.top_n_gainers` (= 3) |
 
 ```
 프로그램순매수비중(%) = (프로그램 순매수금액 / 누적 거래대금) × 100
 ```
 
-#### 자동 스크리닝 (폴백)
-수동 종목 미설정 시 기존 자동 스크리닝(거래량순위 API 기반) 실행.
+### 자동 스크리닝 (폴백)
 
-### 2단계: 신고가 감시 (09:55~)
+**삭제.** 더 이상 사용하지 않음.
 
-- 스크리닝 통과 종목의 실시간 체결가를 WebSocket으로 구독
-- **9:55 이후** 당일 신고가 달성 여부 감시
-- 신고가 달성 → 고가(intraday high) 실시간 추적 시작
+### 신고가 감시 (09:50~)
 
-### 3단계: 매수 — 고가 확정 트리거 + 지정가 2건
+- 스크리닝 통과 3종목의 실시간 체결가를 WebSocket **동시** 구독
+- 09:50 이후 종목별 신고가 추적
+- 신고가 달성 → intraday high 추적
 
-**고가 확정 트리거**: 고가에서 **1% 하락** 시 고가가 확정된 것으로 간주하고 매수 주문 진입.
+### 매수 — 고가 확정 트리거 + 지정가 2건
+
+**고가 확정 트리거**: 고가에서 **1% 하락** → 고가 확정 → 매수 주문 진입.
 
 | 시장 | 1차 매수 (예수금 50%) | 2차 매수 (예수금 50%) | yaml 키 |
 |------|----------------------|----------------------|---------|
-| KOSPI | 고가 대비 -2.5% | 고가 대비 -3.5% | `entry.kospi_buy1_pct`, `entry.kospi_buy2_pct` |
-| KOSDAQ | 고가 대비 -3.75% | 고가 대비 -5.25% | `entry.kosdaq_buy1_pct`, `entry.kosdaq_buy2_pct` |
+| KOSPI | 고가 대비 -2.7% | 고가 대비 -3.3% | `entry.kospi_buy1_pct`, `entry.kospi_buy2_pct` |
+| KOSDAQ | 고가 대비 -4% | 고가 대비 -5% | `entry.kosdaq_buy1_pct`, `entry.kosdaq_buy2_pct` |
 
-**고가 갱신 시 주문 재조정:**
-1. 현재가가 기존 고가를 갱신하면 → 미체결 매수 주문 전량 취소
-2. 새 고가에서 1% 하락할 때까지 대기
-3. 1% 하락 확인 → 새 고가 기준으로 매수 지정가 2건 재주문
+**고가 갱신 시 주문 재조정** (watcher 상태에만 적용):
+1. 현재가가 기존 고가 갱신 → 미체결 매수 주문 전량 취소
+2. 새 고가에서 1% 하락까지 대기
+3. 1% 하락 확인 → 새 고가 기준 매수 지정가 2건 재주문
+4. YES/NO 플래그 재평가
 
-### 4단계: 청산 — 먼저 도달하는 조건이 실행
+**매수 마감**: 10:55 KST (이후 신규 매수 발주 금지)
 
-```
-① 하드 손절   : 고가 대비 KOSPI -4.1% / KOSDAQ -6.2% → 즉시 시장가
-② 타임아웃    : 눌림 최저가 시점부터 20분, 최저가 갱신 시 리셋
-③ 목표가      : (고가 + 눌림 최저가) / 2 → 전량 매도
-④ 선물 급락   : 종목 고점 시각의 선물가 대비 1% 하락 → 전량 청산
-⑤ 강제 청산   : 15:20 KST
-```
+### 매매 동시성 규칙 — single active rotation
 
-### 눌림 미발생 시
+**5단계 흐름**:
+1. 09:50 스크리닝 → A/B/C 결정 + 각자 watcher 가동
+2. 신고가 갱신 시 갱신 로직 ABC 모두 적용 (목표진입가격 재계산)
+   ※ 단, active 진입한 종목은 1차 체결 순간부터 갱신 로직 제외
+3. ABC 중 조건 충족 종목이 1차 매수 → active position 진입
+4. 나머지 2종목은 매수대기 YES/NO 매 틱 평가
+5. 신고가 갱신 시 목표진입가격 + YES/NO 함께 재계산
 
-눌림이 오지 않으면 매매 안 함. 15:20까지 미매수 시 당일 종료.
+**watcher 상태**:
+- `WATCHING`: 1% 하락 트리거 미발동, 목표진입가격 없음
+- `READY` (YES): 목표진입가격 결정됨, 현재가가 (1차 ~ 손절선) 사이
+- `PASSED` (NO): 현재가가 1차 매수가 위로 올라감 (자리 지나감)
+  → 신고가 추적 계속, 새 신고가 갱신 시 READY 복귀 가능
+- `DROPPED` (terminal): 현재가가 손절선 아래로 떨어짐
+  → 그날 그 종목 매매 안 함. 영구 폐기.
+  → 시세 수신/신고가 추적 중단. 슬롯은 비어있는 채로.
+
+**active position (잠금 상태)**:
+- 1차 체결 순간부터 매매 시나리오 동결
+  - 신고가, 목표진입가격, 손절가 모두 1차 체결 시점 값으로 고정
+  - 신고가 갱신 로직 적용 안 함
+- 청산은 동결된 시나리오 위에서 5조건 평가
+
+**active 청산 시점 T의 동작**:
+- 나머지 watcher 중 YES인 종목 평가
+- YES 1개 → 즉시 진입
+- YES 2개 → 자기 1차 매수가에 더 가까운 종목 진입
+  (정확히 같은 거리는 코드 결정성에 위임, 명세 미정의)
+- 모두 NO → 대기 (이후 YES가 되는 종목 자동 진입)
+
+### 청산 — 먼저 도달하는 조건이 실행
+
+| 조건 | 기준 | 실행 |
+|------|------|------|
+| ① 하드 손절 | KOSPI -4.1% / KOSDAQ -6.15% | 즉시 시장가 |
+| ② 타임아웃 | 눌림 최저가 시점부터 20분, 갱신 시 리셋 | 전량 |
+| ③ 목표가 | (고가 + 눌림 최저가) / 2 | 전량 |
+| ④ 선물 급락 | 종목 고점 시각 선물가 대비 -1% | 전량 청산 |
+| ⑤ 강제 청산 | 11:20 KST | 전량 |
+
+### 매매 윈도우
+
+| 시각 | 이벤트 |
+|------|--------|
+| 09:50 | 신고가 감시 시작 (3종목 watcher 가동) |
+| 10:55 | 신규 매수 마감 |
+| 11:20 | 일괄 강제 청산 (⑤), 모든 watcher 종료 |
 
 ### 포지션 관리
 
-- 최대 동시 포지션: 1종목 (안정화 후 확대 가능)
 - 투자금: 예수금 기준 (`config/strategy_params.yaml`)
+- 매수: 항상 예수금 풀 (1차 50% + 2차 50%)
+- 다른 종목에 자본 분할 없음
+
+### 데이터 저장 정책
+
+- 모든 틱 저장 (백테스트 가능 설계)
+- 자동 삭제: 시간 기반 1주일 보관
+- 의사결정/주문/체결/청산 로그: 영구 보관 (자동 삭제 대상 아님)
 
 ---
 
@@ -165,12 +204,13 @@ C:\Users\terryn\AUTOTRADE\
 │   │   ├── api_handlers.py       # API 응답 파싱
 │   │   └── constants.py          # 엔드포인트, TR ID
 │   ├── core/
-│   │   ├── screener.py           # 스크리닝 (수동입력 검증 + 자동 폴백)
-│   │   ├── monitor.py            # 실시간 조정/반등 감시
+│   │   ├── screener.py           # 스크리닝 (수동입력 검증)
+│   │   ├── watcher.py            # Watcher (종목별 상태머신) + WatcherCoordinator (3종목 관리)
+│   │   ├── stock_master.py       # 종목 마스터 (코드↔종목명 변환)
 │   │   ├── trader.py             # 주문 실행
 │   │   └── risk_manager.py       # 손절, 포지션 관리, 강제 청산
 │   ├── models/
-│   │   ├── stock.py              # StockCandidate, TradeTarget
+│   │   ├── stock.py              # StockCandidate, MarketType
 │   │   ├── order.py              # Order, Position
 │   │   └── trade.py              # TradeRecord, DailySummary
 │   ├── storage/
@@ -192,18 +232,18 @@ C:\Users\terryn\AUTOTRADE\
 
 ```
 09:00  장 시작 → KIS 토큰 발급, 계좌 확인
-09:30  사용자가 후보 종목 5~10개 입력 (대시보드 UI 또는 텔레그램 /target)
-09:50  수동 스크리닝 실행 → 자동 검증(상승률/거래대금/상한가/프로그램순매수비중) → 타겟 선정
-       (수동 종목 미설정 시 자동 스크리닝 폴백)
-09:55~ 타겟 종목 WebSocket 구독 + KOSPI200 선물 구독
-       → 당일 신고가 달성 감시
-       → 신고가 달성 → 고가 실시간 추적
-       → 고가에서 1% 하락 → 매수 지정가 2건 진입
-       → 고가 갱신 → 기존 주문 취소, 새 고가에서 1% 하락 대기 후 재주문
-매수 후 → 5개 청산 조건 동시 모니터링 (하드손절/20분타임아웃/목표가/선물급락/강제)
-       → 눌림 미발생 시: 매매 안 함
-15:20  미체결 포지션 강제 청산
-15:30  장 마감 → 일일 리포트, 텔레그램 발송
+09:30  사용자가 후보 종목 입력 (대시보드 UI 또는 텔레그램 /target)
+09:50  수동 스크리닝 실행 → 자동 검증(상승률/거래대금/상한가/프로그램순매수비중)
+       → 상위 3종목 A/B/C 선정 (자동 스크리닝 폴백 없음)
+09:50~ A/B/C 3종목 WebSocket 동시 구독 + KOSPI200 선물 구독
+       → 각 종목 watcher 가동 (WATCHING 상태)
+       → 신고가 달성 → 고가 추적, 1% 하락 트리거 대기
+       → 트리거 → READY(YES) 전환, 목표진입가격 결정
+       → 최초 체결 종목 → active position 진입 (나머지 2개는 watcher 유지)
+매수 후 → active 종목: 5개 청산 조건 모니터링 (동결 시나리오)
+        → watcher 종목: YES/NO 매 틱 평가, 신고가 갱신 시 재계산
+10:55  신규 매수 마감 (이후 watcher 신규 발주 금지)
+11:20  강제 청산 (active position) + 모든 watcher 종료 → 일일 리포트, 텔레그램 발송
 ```
 
 ---
@@ -221,6 +261,8 @@ C:\Users\terryn\AUTOTRADE\
 | **Phase α-0** | **매매 로직 누락 부분 보강 (10시 가드 + 선물 급락)** | **✅ 완료 (2026-04-07)** |
 | **Phase α-1a** | **클라우드 lift and shift (Oracle E2.1.Micro, systemd, Quick Tunnel)** | **✅ 완료 (2026-04-08 02:00 KST) — 134.185.115.229, commit ac6acd2** |
 | **Phase α-1b** | **Named Tunnel 전환 + 고정 URL** | **🟡 진행 예정 (도메인 결정 후)** |
+| **R-07 redesign** | **3종목 Watcher 아키텍처 전환 (monitor.py→watcher.py, TradeTarget 폐기)** | **✅ 완료 (2026-04-08) — W-08 검증 통과** |
+| **R-08** | **baseline day DRY_RUN 가동 검증** | **📅 다음 거래일** |
 | Phase α-1 (잔여) | 다중 사용자 UI (인증/권한 분리) | 📅 α-1b 후 |
 | Phase α-2 | Strategy plug-in 구조 + Account Executor 구조 | 📅 α-1 안정 후 |
 | Phase β | KIS 계좌 분리 + 매매 로직 B/C/D 추가 | 📅 α-2 후 |
@@ -239,6 +281,44 @@ Phase α 진입 전 코드 base 정리. feature/dashboard-fix-v1 브랜치.
 **브랜치 상태**: feature/dashboard-fix-v1 — main 머지 안 됨 (Phase α-1 작업 끝난 후 머지 결정)
 
 **카테고리 C(보안), D(UX, 모니터 폐기 등)**: 폐기. Phase α/β에서 다중 사용자 관점으로 재설계.
+
+### R-07 Redesign — 3종목 Watcher 아키텍처 (2026-04-08 완료)
+
+명세 §1의 single active rotation 모델을 코드에 구현. 기존 1종목 TargetMonitor 아키텍처 → 3종목 동시 감시 Watcher/WatcherCoordinator 아키텍처로 전환.
+
+**핵심 변경**:
+
+| 이전 | 이후 |
+|------|------|
+| `TargetMonitor` (1종목 감시) | `Watcher` (종목별 상태머신, 12 state) |
+| `TradeTarget` (종목+가격 래퍼) | 폐기 — `Watcher`가 직접 보유 |
+| `monitor.py` (360줄) | 폐기 → `watcher.py` (768줄) |
+| `_monitors` list + `_active_monitor` 단일 폴링 | `WatcherCoordinator` (3종목 라우팅 + active lock) |
+| main.py `_monitor_loop_runner` (polling loop) | Coordinator callback 패턴 (이벤트 기반) |
+
+**WatcherState 상태머신**:
+```
+WATCHING → TRIGGERED → READY ↔ PASSED → DROPPED (terminal)
+                                      → ENTERED → EXITED (terminal)
+                                                → SKIPPED (terminal)
+```
+
+**W-series 작업 이력**:
+
+| W | 대상 | 내용 |
+|---|------|------|
+| W-01 | strategy_params.yaml | 명세 v.2 반영 (8 키 변경) |
+| W-02 | stock_master.py (신규) | 종목코드↔종목명 변환 클래스 |
+| W-03 | screener.py | StockCandidate 반환 (TradeTarget 제거) |
+| W-04 | notifier.py | stock_master DI, /screen 명령 StockCandidate 호환 |
+| W-05a/b/c | watcher.py (신규) + trader.py | Watcher + Coordinator + Trader 시그니처 Watcher 호환 |
+| W-06a/b1/b2 | main.py | Coordinator DI, callback 연결, 4함수 삭제, 스케줄 재배선 |
+| W-07a/b/c/d | screener + dashboard + tests + models | 잔존 참조 정리 + 폐기 |
+| W-08 | (검증만) | 통합 검증 17항목 전부 PASS |
+
+**해결된 이슈**: ISSUE-036 (청산 경로 단절), ISSUE-037 (can_open_position 하드코딩), ISSUE-024 (미등록 종목 잔존)
+
+**R-08 계획**: 다음 거래일 DRY_RUN baseline day 가동. Watcher 상태 전이, 매수/청산 시뮬레이션 실전 데이터로 검증.
 
 ---
 
@@ -390,7 +470,7 @@ Phase α 진입 전 코드 base 정리. feature/dashboard-fix-v1 브랜치.
    - audit_log 테이블 신규 (누가 언제 무엇을 변경했는지)
 
 3. **코드 변경 최소화**
-   - AutoTrader, Trader, Monitor 등 매매 로직 코드는 **건드리지 않음** (Phase α-0에서 확정된 로직 그대로)
+   - AutoTrader, Trader, Watcher/Coordinator 등 매매 로직 코드는 **건드리지 않음** (R-07에서 확정된 로직 그대로)
    - SQLite 그대로
    - 텔레그램 봇 그대로 (옵션 Y 같은 변경 없음)
    - 변경되는 파일: dashboard/app.py (인증 + 권한), config/settings.py (시크릿 복호화), launcher.py (systemd 호환)
@@ -608,11 +688,9 @@ await self.api.connect()  # 토큰 자동 발급/갱신 (24시간 유효)
 - 본격 정리는 별도 sprint
 - 백테스트 코드 의존성 분리 필요
 
-### ISSUE-024 — 모니터에 미등록 종목 잔존 (삼천당제약 사고)
+### ~~ISSUE-024~~ — 모니터에 미등록 종목 잔존 (✅ R-07에서 구조적 해결)
 - 2026-04-07 오전 발견
-- 5원칙 3번 위반 (시스템이 종목을 자동 추가)
-- 가능 원인: (a) 카테고리 A 후속 보정 전의 자동 폴백, (b) 세션 간 상태 잔존
-- 조사 + 해결 필요
+- **해결**: R-07에서 자동 스크리닝 폴백 경로 완전 폐기. WatcherCoordinator.start_screening()은 수동 입력 검증 결과만 수신. 시스템이 종목을 자동 추가하는 경로 자체가 없음.
 
 ### ISSUE-026 — Ampere A1 인스턴스 확보 후 재생성 검토
 - 현재: Oracle E2.1.Micro (AMD, 956Mi RAM + 4GB swap, 1 OCPU) — 134.185.115.229
@@ -646,6 +724,16 @@ await self.api.connect()  # 토큰 자동 발급/갱신 (24시간 유효)
 - 운영 우회: 수동 종목 입력 기능 사용 안 함. 텔레그램 `/target` 명령 또는 09:50 자동 스크리닝 사용.
 - 수정 시기: α-1b 또는 α-2 (dashboard 인증 분리 작업과 함께)
 - 수정 방향: (B) 선호 — FastAPI endpoint → asyncio queue 패턴으로 AutoTrader event loop에 위임
+
+### ~~ISSUE-036~~ — _monitors 리스트 stale + 청산 경로 단절 (✅ R-07에서 근본 해결)
+- 발견: 2026-04-08. 진단 완료.
+- **해결**: R-07 redesign에서 `_monitors` / `_active_monitor` 단일 폴링 아키텍처 자체를 폐기. WatcherCoordinator가 3종목 전체를 `on_realtime_price`로 라우팅 → 청산 경로 단절 구조적 불가능.
+- 해결 commit: R-07 W-06a (main.py 재배선)
+
+### ~~ISSUE-037~~ — can_open_position(0) 하드코딩 인수 (✅ R-07에서 근본 해결)
+- 발견: 2026-04-08. ISSUE-036 진단 중 발견.
+- **해결**: R-07에서 `_active_monitor` 기반 가드 자체 폐기. WatcherCoordinator가 `_active_code`로 active lock 관리 → 하드코딩 인수 문제 구조적 제거.
+- 해결 commit: R-07 W-06a (main.py 재배선)
 
 ### ~~ISSUE-030~~ — Dashboard 예수금 / 평가금액 카드 표시 버그 (✅ 수정 완료 commit fcc5a6a)
 - 발견: 2026-04-08 01:30 KST 새벽 첫 dashboard 접속 시
