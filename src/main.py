@@ -24,7 +24,6 @@ import asyncio
 import json
 import os
 import sys
-import threading
 from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Optional
@@ -197,7 +196,7 @@ class AutoTrader:
             logger.info(f"예수금: {self._initial_cash:,}원 → 매매가용: {self._available_cash:,}원")
 
             # 대시보드 서버 시작 (API 연결 + 잔고 확인 후 → attach_autotrader 가능)
-            self._start_dashboard_server()
+            dashboard_task = self._start_dashboard_server()
             await self._build_stock_name_cache()
 
             # Cloudflare Tunnel 시작 → URL 텔레그램 발송 (관리자 토큰 포함)
@@ -214,6 +213,7 @@ class AutoTrader:
 
             # 스케줄 태스크 실행 — 하나라도 실패하면 나머지 취소
             tasks = [
+                dashboard_task,
                 asyncio.create_task(self._schedule_screening(), name="screening"),
                 asyncio.create_task(self._schedule_force_liquidate(), name="force_liquidate"),
                 asyncio.create_task(self._schedule_market_close(), name="market_close"),
@@ -241,6 +241,9 @@ class AutoTrader:
             self.notifier.notify_error(f"치명적 에러 발생!\n{e}")
         finally:
             self._running = False
+            # dashboard server 는 should_exit 로 graceful shutdown 시도 후 cancel
+            if hasattr(self, "_dashboard_server") and self._dashboard_server is not None:
+                self._dashboard_server.should_exit = True
             # 아직 남아있는 태스크 정리
             for t in tasks:
                 if not t.done():
@@ -945,22 +948,33 @@ class AutoTrader:
 
     # ── 대시보드 서버 ────────────────────────────────────
 
-    def _start_dashboard_server(self) -> None:
-        """대시보드(uvicorn) 서버를 데몬 스레드로 시작 + AutoTrader 연결."""
+    def _start_dashboard_server(self) -> "asyncio.Task":
+        """대시보드(uvicorn) 서버를 같은 event loop 의 task 로 시작 + AutoTrader 연결.
+
+        ISSUE-035: 별도 스레드의 uvicorn loop 와 AutoTrader loop 의 cross-loop
+        호출 문제 해결. 같은 loop 에서 task 로 띄워 dashboard handler 가
+        AutoTrader 와 동일한 Task 컨텍스트에서 실행되도록 한다.
+        """
         import uvicorn
         from src.dashboard.app import app as dashboard_app, attach_autotrader
 
         port = self.settings.dashboard_port
 
-        def _run():
-            uvicorn.run(dashboard_app, host="0.0.0.0", port=port, log_level="warning")
-
-        t = threading.Thread(target=_run, daemon=True, name="dashboard")
-        t.start()
-
-        # 대시보드에 AutoTrader 연결 (sync: state + callback만 설정)
+        # AutoTrader 먼저 attach (race window 최소화)
         attach_autotrader(self)
-        logger.info(f"대시보드 서버 시작 (port={port})")
+
+        config = uvicorn.Config(
+            dashboard_app,
+            host="0.0.0.0",
+            port=port,
+            log_level="warning",
+            loop="asyncio",
+        )
+        server = uvicorn.Server(config)
+        self._dashboard_server = server  # shutdown 시 should_exit 접근용
+        task = asyncio.create_task(server.serve(), name="dashboard_server")
+        logger.info(f"대시보드 서버 시작 (port={port}, in-loop task)")
+        return task
 
     async def _build_stock_name_cache(self) -> None:
         """종목명 캐시 구축. stock_master.json만 사용.
