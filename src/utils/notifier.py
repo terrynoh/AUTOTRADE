@@ -26,10 +26,11 @@ except ImportError:
 class Notifier:
     """텔레그램 알림 발송."""
 
-    def __init__(self, bot_token: str = "", chat_id: str = ""):
+    def __init__(self, bot_token: str = "", chat_id: str = "", stock_master=None):
         self.bot_token = bot_token
         # 쉼표로 구분된 복수 ID 지원: "111111,222222,333333"
         self._chat_ids: list[str] = [c.strip() for c in chat_id.split(",") if c.strip()]
+        self._stock_master = stock_master
         self._bot: Optional[Bot] = None
 
         if TELEGRAM_AVAILABLE and bot_token and self._chat_ids:
@@ -223,6 +224,10 @@ class Notifier:
         /target → 현재 설정된 종목코드 조회
         """
         if not update.message or not self._is_authorized(update.message.chat_id):
+            if update.message:
+                logger.warning(
+                    f"비인가 텔레그램 명령 시도: chat_id={update.message.chat_id}"
+                )
             return
 
         args_text = update.message.text.replace("/target", "").strip()
@@ -248,11 +253,31 @@ class Notifier:
             await update.message.reply_text("사용법: /target 006400,삼성SDI,에코프로비엠")
             return
 
-        # 콜백 호출 (종목코드+종목명 혼합 전달 → main.py에서 resolve)
-        if hasattr(self, '_on_target') and self._on_target:
-            self._on_target(inputs)
+        # 종목명/종목코드 변환 (StockMaster whitelist 패턴)
+        resolved = []
+        invalid = []
+        if self._stock_master is not None:
+            for inp in inputs:
+                code = self._stock_master.lookup_code(inp)
+                if code:
+                    resolved.append(code)
+                else:
+                    invalid.append(inp)
+        else:
+            resolved = inputs
+
+        if invalid:
             await update.message.reply_text(
-                f"✅ 타겟 종목 설정: {', '.join(inputs)} ({len(inputs)}종목)"
+                f"인식 불가 종목: {', '.join(invalid)}"
+            )
+            if not resolved:
+                return
+
+        # 콜백 호출
+        if hasattr(self, '_on_target') and self._on_target:
+            self._on_target(resolved)
+            await update.message.reply_text(
+                f"✅ 타겟 종목 설정: {', '.join(resolved)} ({len(resolved)}종목)"
             )
         else:
             await update.message.reply_text("명령 처리 불가 (핸들러 미설정)")
@@ -260,6 +285,10 @@ class Notifier:
     async def _cmd_clear(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """/clear 명령 처리 — 수동 종목코드 초기화."""
         if not update.message or not self._is_authorized(update.message.chat_id):
+            if update.message:
+                logger.warning(
+                    f"비인가 텔레그램 명령 시도: chat_id={update.message.chat_id}"
+                )
             return
 
         if hasattr(self, '_on_clear') and self._on_clear:
@@ -271,6 +300,10 @@ class Notifier:
     async def _cmd_screen(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """/screen 명령 — 수동 스크리닝 실행."""
         if not update.message or not self._is_authorized(update.message.chat_id):
+            if update.message:
+                logger.warning(
+                    f"비인가 텔레그램 명령 시도: chat_id={update.message.chat_id}"
+                )
             return
 
         if hasattr(self, '_on_screen') and self._on_screen:
@@ -300,6 +333,10 @@ class Notifier:
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """/status 명령 — 현재 매매 상태 조회."""
         if not update.message or not self._is_authorized(update.message.chat_id):
+            if update.message:
+                logger.warning(
+                    f"비인가 텔레그램 명령 시도: chat_id={update.message.chat_id}"
+                )
             return
 
         if hasattr(self, '_on_status') and self._on_status:
@@ -333,6 +370,10 @@ class Notifier:
     async def _cmd_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """/stop 명령 — 당일 매매 중단."""
         if not update.message or not self._is_authorized(update.message.chat_id):
+            if update.message:
+                logger.warning(
+                    f"비인가 텔레그램 명령 시도: chat_id={update.message.chat_id}"
+                )
             return
 
         if hasattr(self, '_on_stop') and self._on_stop:
@@ -344,6 +385,10 @@ class Notifier:
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """/help 명령 — 사용 가능한 명령어 안내."""
         if not update.message or not self._is_authorized(update.message.chat_id):
+            if update.message:
+                logger.warning(
+                    f"비인가 텔레그램 명령 시도: chat_id={update.message.chat_id}"
+                )
             return
 
         msg = (
