@@ -595,6 +595,14 @@ await self.api.connect()  # 토큰 자동 발급/갱신 (24시간 유효)
 
 다음은 Phase α 작업과 무관하게 별도 추적되는 이슈들. Obsidian 이슈 트래커와 동기화 필요.
 
+### ISSUE-035 — Dashboard set-targets aiohttp TimerContext RuntimeError (🔴 Critical)
+- 발견: 2026-04-08 09:30 KST. EXCEPTION-03 임시 logger로 원인 확정.
+- 에러: `RuntimeError: Timeout context manager should be used inside a task`
+- 원인: `state.autotrader.api`(aiohttp ClientSession)를 FastAPI endpoint에서 직접 await → Task 컨텍스트 불일치
+- 영향: Dashboard 수동 종목 입력 100% 실패. 자동 스크리닝/매매/텔레그램 정상.
+- 운영 우회: 텔레그램 `/target` 명령 사용. Dashboard 종목 입력 기능 사용 안 함.
+- 수정 시기: α-1b 또는 α-2 (B 방향: asyncio queue 패턴으로 AutoTrader event loop 위임)
+
 ### ISSUE-020 — screener.run() 자동 스크리닝 메서드 정리 (다음 sprint)
 - Cat A 후속 보정에서 임시 차단됨 (deprecated 마킹 + warning)
 - 본격 정리는 별도 sprint
@@ -625,9 +633,19 @@ await self.api.connect()  # 토큰 자동 발급/갱신 (24시간 유효)
 - 코드 선결: `src/utils/tunnel.py` CloudflareTunnel 클래스가 Named 모드를 지원하는지 분석 필요
 - 예상 작업: cloudflared config 파일 작성, 코드 호환성 분석, 무중단 마이그레이션 (16:00 이후)
 
-### ISSUE-029 — Dashboard 수동 종목 입력 "검증 중..." 버튼 휴장 시간 동작 확인
+### ~~ISSUE-029~~ — Dashboard 수동 종목 입력 버튼 응답 없음 (✅ 원인 확정: ISSUE-035로 흡수)
 - 발견: 2026-04-08 01:01 KST 새벽 휴장 시간에 "에코프로" 검증 클릭 시 응답 없음
-- 검증: 09:00 KST 장 시작 후 재시도. 작동하면 휴장 한정 → close. 작동 안 하면 dashboard 코드 분석.
+- 원인: 장 시간 관계없이 항상 실패. ISSUE-035 (aiohttp TimerContext RuntimeError)가 진짜 원인. 흡수 종료.
+
+### ISSUE-035 — Dashboard set-targets aiohttp TimerContext RuntimeError
+- 발견: 2026-04-08 09:30 KST. EXCEPTION-03 임시 logger로 진단 확정.
+- 에러: `RuntimeError: Timeout context manager should be used inside a task`
+- 호출 경로: `app.py api_set_targets()` → `state.autotrader.api.get_current_price()` → `KISAPI._request()` → `aiohttp.ClientSession.get()` → `TimerContext.__enter__()` → `asyncio.current_task() == None` → RuntimeError
+- 구조적 원인: AutoTrader event loop에서 생성한 aiohttp ClientSession을 FastAPI endpoint의 다른 Task 컨텍스트에서 직접 await. aiohttp timeout이 Task 컨텍스트 검증에서 거부.
+- 영향: Dashboard 수동 종목 입력 100% 실패. 자동 스크리닝(AutoTrader 내부 호출) + 매매 로직 정상.
+- 운영 우회: 수동 종목 입력 기능 사용 안 함. 텔레그램 `/target` 명령 또는 09:50 자동 스크리닝 사용.
+- 수정 시기: α-1b 또는 α-2 (dashboard 인증 분리 작업과 함께)
+- 수정 방향: (B) 선호 — FastAPI endpoint → asyncio queue 패턴으로 AutoTrader event loop에 위임
 
 ### ~~ISSUE-030~~ — Dashboard 예수금 / 평가금액 카드 표시 버그 (✅ 수정 완료 commit fcc5a6a)
 - 발견: 2026-04-08 01:30 KST 새벽 첫 dashboard 접속 시
