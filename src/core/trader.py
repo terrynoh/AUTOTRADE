@@ -17,7 +17,7 @@ from loguru import logger
 from config.settings import Settings, StrategyParams
 from src.kis_api.kis import KISAPI
 from src.kis_api.constants import ORDER_TYPE_LIMIT, ORDER_TYPE_MARKET
-from src.models.stock import TradeTarget
+from src.core.watcher import Watcher
 from src.models.order import Order, OrderSide, OrderStatus, Position
 
 
@@ -33,11 +33,11 @@ class Trader:
 
     # ── 매수 주문 배치 (지정가 2건) ────────────────────────
 
-    async def place_buy_orders(self, target: TradeTarget, available_cash: int) -> None:
+    async def place_buy_orders(self, watcher: Watcher, available_cash: int) -> None:
         """고가 확정 후 매수 지정가 2건 배치."""
         ep = self.params.entry
-        buy1_price = target.buy1_price(self.params)
-        buy2_price = target.buy2_price(self.params)
+        buy1_price = watcher.target_buy1_price
+        buy2_price = watcher.target_buy2_price
 
         buy1_amount = int(available_cash * ep.buy1_ratio / 100)
         buy2_amount = int(available_cash * ep.buy2_ratio / 100)
@@ -50,28 +50,28 @@ class Trader:
 
         # 1차 매수
         order1 = await self._send_buy_order(
-            target.stock.code, buy1_qty, buy1_price, "buy1", now
+            watcher.code, buy1_qty, buy1_price, "buy1", now
         )
         if order1:
-            target.buy1_order_id = order1.order_id
-            target.buy1_placed = True
+            watcher.buy1_order_id = order1.order_id
+            watcher.buy1_placed = True
             self.pending_buy_orders.append(order1)
             logger.info(
-                f"[{target.stock.name}] 1차 매수 주문: {buy1_price:,}원 × {buy1_qty}주 "
-                f"(고가 {target.intraday_high:,}원 대비 -{ep.kospi_buy1_pct if target.stock.market.value == 'KOSPI' else ep.kosdaq_buy1_pct}%)"
+                f"[{watcher.name}] 1차 매수 주문: {buy1_price:,}원 × {buy1_qty}주 "
+                f"(고가 {watcher.intraday_high:,}원 대비 -{ep.kospi_buy1_pct if watcher.market.value == 'KOSPI' else ep.kosdaq_buy1_pct}%)"
             )
 
         # 2차 매수
         order2 = await self._send_buy_order(
-            target.stock.code, buy2_qty, buy2_price, "buy2", now
+            watcher.code, buy2_qty, buy2_price, "buy2", now
         )
         if order2:
-            target.buy2_order_id = order2.order_id
-            target.buy2_placed = True
+            watcher.buy2_order_id = order2.order_id
+            watcher.buy2_placed = True
             self.pending_buy_orders.append(order2)
             logger.info(
-                f"[{target.stock.name}] 2차 매수 주문: {buy2_price:,}원 × {buy2_qty}주 "
-                f"(고가 {target.intraday_high:,}원 대비 -{ep.kospi_buy2_pct if target.stock.market.value == 'KOSPI' else ep.kosdaq_buy2_pct}%)"
+                f"[{watcher.name}] 2차 매수 주문: {buy2_price:,}원 × {buy2_qty}주 "
+                f"(고가 {watcher.intraday_high:,}원 대비 -{ep.kospi_buy2_pct if watcher.market.value == 'KOSPI' else ep.kosdaq_buy2_pct}%)"
             )
 
     async def _send_buy_order(
@@ -110,7 +110,7 @@ class Trader:
 
     # ── 매수 주문 취소 (고가 갱신 시) ──────────────────────
 
-    async def cancel_buy_orders(self, target: TradeTarget) -> None:
+    async def cancel_buy_orders(self, watcher: Watcher) -> None:
         """미체결 매수 주문 전량 취소."""
         for order in self.pending_buy_orders:
             if not order.is_active:
@@ -127,10 +127,10 @@ class Trader:
                 except Exception as e:
                     logger.error(f"주문 취소 실패 [{order.label}]: {e}")
 
-        target.buy1_placed = False
-        target.buy2_placed = False
-        target.buy1_order_id = ""
-        target.buy2_order_id = ""
+        watcher.buy1_placed = False
+        watcher.buy2_placed = False
+        watcher.buy1_order_id = ""
+        watcher.buy2_order_id = ""
         self.pending_buy_orders = []
 
     # ── 매수 체결 처리 ────────────────────────────────────
@@ -162,17 +162,17 @@ class Trader:
     # ── 청산 주문 ─────────────────────────────────────────
 
     async def execute_exit(
-        self, target: TradeTarget, reason: str, price: int = 0
+        self, watcher: Watcher, reason: str, price: int = 0
     ) -> Optional[Order]:
         """전량 청산. reason에 따라 시장가/지정가 결정."""
         if self.position is None or self.position.total_qty <= 0:
             return None
 
         # 먼저 미체결 매수 주문 취소
-        await self.cancel_buy_orders(target)
+        await self.cancel_buy_orders(watcher)
 
         qty = self.position.total_qty
-        code = target.stock.code
+        code = watcher.code
         now = now_kst()
 
         # 시장가: hard_stop, futures_stop, force
@@ -188,7 +188,7 @@ class Trader:
         )
 
         if self.settings.is_dry_run:
-            sell_price = self._current_price(target) if use_market else price
+            sell_price = self._current_price(watcher) if use_market else price
             order.order_id = f"DRY_{reason}_{now.strftime('%H%M%S')}"
             order.filled_price = sell_price
             order.filled_qty = qty
@@ -227,13 +227,13 @@ class Trader:
 
         return order
 
-    def _current_price(self, target: TradeTarget) -> int:
+    def _current_price(self, watcher: Watcher) -> int:
         """현재가 (dry_run 시뮬레이션용)."""
-        return target.stock.current_price
+        return watcher.current_price
 
     # ── DRY_RUN 체결 시뮬레이션 ───────────────────────────
 
-    def simulate_fills(self, target: TradeTarget, current_price: int, ts: datetime) -> list[str]:
+    def simulate_fills(self, watcher: Watcher, current_price: int, ts: datetime) -> list[str]:
         """
         DRY_RUN 모드: 현재가가 지정가에 도달하면 가상 체결.
         체결된 label 리스트 반환.
