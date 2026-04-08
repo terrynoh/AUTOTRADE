@@ -13,8 +13,9 @@ import re
 from loguru import logger
 
 from config.settings import StrategyParams
+from src.core.stock_master import StockMaster
 from src.kis_api.kis import KISAPI
-from src.models.stock import StockCandidate, TradeTarget, MarketType
+from src.models.stock import StockCandidate, MarketType
 
 
 # ── 호가 단위 (상한가 계산용) ──
@@ -79,13 +80,14 @@ def _is_etf_or_excluded(code: str, name: str) -> bool:
 class Screener:
     """09:50 스크리닝 엔진."""
 
-    def __init__(self, api: KISAPI, params: StrategyParams, is_live: bool = False, use_live_data: bool = False):
+    def __init__(self, api: KISAPI, params: StrategyParams, stock_master: StockMaster, is_live: bool = False, use_live_data: bool = False):
         self.api = api
         self.params = params
+        self._stock_master = stock_master
         self.is_live = is_live
         self.use_live_data = use_live_data or is_live
 
-    async def run_manual(self, codes: list[str]) -> list[TradeTarget]:
+    async def run_manual(self, codes: list[str]) -> list[StockCandidate]:
         """
         수동 입력 종목 스크리닝.
 
@@ -112,7 +114,8 @@ class Screener:
                 continue
             try:
                 price_info = await self.api.get_current_price(code)
-                name = price_info.get("name", code)
+                api_name = price_info.get("name", "").strip()
+                name = api_name if api_name else self._stock_master.lookup_name(code, default=code)
                 current_price = price_info.get("current_price", 0)
                 change_pct = price_info.get("change_pct", 0.0)
                 trading_val = price_info.get("trading_value", 0)
@@ -217,8 +220,7 @@ class Screener:
 
         targets = []
         for cand in top:
-            target = TradeTarget(stock=cand, intraday_high=cand.current_price)
-            targets.append(target)
+            targets.append(cand)
             logger.info(
                 f"타겟 선정: {cand.name}({cand.code}) {cand.market.value} "
                 f"등락={cand.price_change_pct:+.2f}% 거래대금={cand.trading_volume_krw/1e8:.0f}억"
@@ -226,183 +228,3 @@ class Screener:
 
         return targets
 
-    async def run(self) -> list[TradeTarget]:
-        """⚠ DEPRECATED (ISSUE-010): 수동 입력 방식으로 전환됨.
-
-        프로덕션 호출 금지. run_manual(codes)를 사용하세요.
-
-        이 메서드는 KIS API의 get_volume_rank를 호출하지만, market="Q" 미지원
-        (ISSUE-007 3-2)으로 KOSDAQ 종목이 누락됩니다. 백테스트 호환성을 위해
-        메서드는 보존되며, 다음 sprint에서 정리 예정입니다.
-        """
-        logger.warning(
-            "screener.run() 호출됨 — 이 메서드는 DEPRECATED입니다 (ISSUE-010). "
-            "run_manual(codes)를 사용하세요. 백테스트 외 호출 금지."
-        )
-        sp = self.params.screening
-        logger.info(f"스크리닝 시작: 거래대금≥{sp.volume_min/1e8:.0f}억, 프로그램비중≥{sp.program_net_buy_ratio_min}%, 상승률 상위{sp.top_n_gainers}종목")
-
-        # ── 1) 거래대금 상위 종목 수집 ──
-        # KIS 모의투자: market="J"로 KOSPI+KOSDAQ 통합 조회 (market="Q" 미지원)
-        candidates: list[StockCandidate] = []
-
-        try:
-            vol_list = await self.api.get_volume_rank(market="J", min_volume=0)
-            logger.info(f"거래량순위(통합): {len(vol_list)}종목 수신")
-        except Exception as e:
-            logger.error(f"거래량순위 조회 실패: {e}")
-            vol_list = []
-
-        if not vol_list:
-            logger.error("거래량순위 조회 실패: 빈 결과")
-            return []
-
-        if vol_list:
-            for item in vol_list[:5]:
-                logger.debug(f"  {item.get('name','')}({item.get('code','')}) 거래대금={item.get('trading_volume_krw',0)/1e8:.0f}억 등락={item.get('change_pct',0):+.2f}%")
-
-        excluded_count = 0
-        for item in vol_list:
-            trading_val = item.get("trading_volume_krw", 0)
-            if trading_val < sp.volume_min:
-                continue
-
-            code = item.get("code", "")
-            name = item.get("name", "")
-
-            # ── 2) ETF/ETN/스팩/우선주 제외 ──
-            if _is_etf_or_excluded(code, name):
-                excluded_count += 1
-                logger.debug(f"  제외(ETF/ETN/스팩/우선주): {name}({code})")
-                continue
-
-            # ── 상한가 제외 ──
-            change_pct = item.get("change_pct", 0.0)
-            if change_pct >= sp.max_change_pct:
-                excluded_count += 1
-                logger.debug(f"  제외(상한가): {name}({code}) {change_pct:+.2f}%")
-                continue
-
-            # KOSDAQ 종목코드: 1,2,3으로 시작
-            is_kosdaq = code[0] in ("1", "2", "3") if code else False
-
-            candidates.append(StockCandidate(
-                code=code,
-                name=name,
-                market=MarketType.KOSDAQ if is_kosdaq else MarketType.KOSPI,
-                trading_volume_krw=trading_val,
-                program_net_buy=0,
-                price_change_pct=item.get("change_pct", 0.0),
-                current_price=item.get("current_price", 0),
-            ))
-
-        logger.info(f"거래대금 {sp.volume_min/1e8:.0f}억 이상: {len(candidates) + excluded_count}종목 (ETF등 {excluded_count}종목 제외 → {len(candidates)}종목)")
-
-        if not candidates:
-            logger.warning("거래대금 조건 통과 종목 없음")
-            return []
-
-        # ── 3) 프로그램매매 순매수 비중 필터 ──
-        if not self.use_live_data:
-            # 모의투자 API는 프로그램매매 데이터 미제공
-            # use_live_api=True 또는 live 모드 시 자동으로 필터 적용됨
-            logger.warning("모의투자 API: 프로그램매매 데이터 미제공 → 필터 건너뜀 (상승률 기준만 적용)")
-            filtered = candidates
-        else:
-            # 실매매: 프로그램매매 데이터 정상 조회 가능
-            filtered = []
-            for cand in candidates:
-                try:
-                    prog = await self.api.get_program_trade(cand.code)
-                    cand.program_net_buy = prog.get("program_net_buy", 0)
-                    ratio = cand.program_net_buy_ratio
-                    passed = ratio >= sp.program_net_buy_ratio_min
-                    logger.info(f"  {cand.name}({cand.code}) 프로그램순매수={cand.program_net_buy:,} 비중={ratio:.2f}% {'✓' if passed else '✗'}")
-                except Exception as e:
-                    logger.warning(f"{cand.name}({cand.code}) 프로그램매매 조회 실패: {e}")
-                    continue
-
-                if passed:
-                    filtered.append(cand)
-
-            logger.info(f"프로그램순매수비중 {sp.program_net_buy_ratio_min}% 이상: {len(filtered)}종목")
-
-            if not filtered:
-                logger.warning("프로그램순매수비중 조건 통과 종목 없음")
-                return []
-
-        # ── 4) 상한가 도달 종목 제외 (장중 고가 == 상한가) ──
-        # 상한가에 도달한 종목은 더 이상 오를 수 없으므로 눌림 전략 무효
-        infra = self.params.infra
-        limit_check_threshold = infra.upper_limit_check_pct
-        safe_filtered = []
-        limit_excluded = 0
-
-        for cand in filtered:
-            if cand.price_change_pct >= limit_check_threshold:
-                try:
-                    price_info = await self.api.get_current_price(cand.code)
-                    intraday_high = price_info.get("high", 0)
-                    prev_close = price_info.get("open", 0)  # 시가 대용 (근사치)
-
-                    # 전일종가 정확 계산: 현재가 / (1 + 등락률/100)
-                    if cand.price_change_pct != 0:
-                        prev_close_calc = int(cand.current_price / (1 + cand.price_change_pct / 100))
-                    else:
-                        prev_close_calc = cand.current_price
-
-                    upper_limit = _upper_limit_price(prev_close_calc, infra.upper_limit_multiplier)
-
-                    if intraday_high >= upper_limit:
-                        limit_excluded += 1
-                        logger.info(
-                            f"  제외(상한가 도달): {cand.name}({cand.code}) "
-                            f"고가={intraday_high:,} ≥ 상한가={upper_limit:,} "
-                            f"(전일종가≈{prev_close_calc:,})"
-                        )
-                        continue
-                    else:
-                        # 고가 정보 업데이트
-                        cand.current_price = price_info.get("current_price", cand.current_price)
-                        logger.debug(
-                            f"  상한가 체크 통과: {cand.name}({cand.code}) "
-                            f"고가={intraday_high:,} < 상한가={upper_limit:,}"
-                        )
-                except Exception as e:
-                    logger.warning(f"{cand.name}({cand.code}) 상한가 체크 실패: {e}")
-
-            safe_filtered.append(cand)
-
-        if limit_excluded > 0:
-            logger.info(f"상한가 도달 제외: {limit_excluded}종목 → {len(safe_filtered)}종목 남음")
-
-        # ── 5) 상승률 상위 N종목 ──
-        safe_filtered.sort(key=lambda c: c.price_change_pct, reverse=True)
-        # 멀티 트레이드 활성화 시 후보 풀 크기(top_n_candidates) 사용
-        pool_size = getattr(sp, 'top_n_candidates', sp.top_n_gainers)
-        if pool_size > sp.top_n_gainers:
-            pick_count = pool_size
-        else:
-            pick_count = sp.top_n_gainers
-        top = safe_filtered[:pick_count]
-
-        targets = []
-        for cand in top:
-            # 시장 구분 정확 확인 (종목코드만으로는 KOSPI/KOSDAQ 구분 불가)
-            try:
-                price_info = await self.api.get_current_price(cand.code)
-                market_name = price_info.get("market_name", "")
-                if any(k in market_name.upper() for k in ("KOSDAQ", "KSQ")):
-                    cand.market = MarketType.KOSDAQ
-                else:
-                    cand.market = MarketType.KOSPI
-                # 최신 고가도 함께 업데이트
-                cand.current_price = price_info.get("current_price", cand.current_price)
-            except Exception as e:
-                logger.warning(f"{cand.name}({cand.code}) 시장 구분 조회 실패: {e}")
-
-            target = TradeTarget(stock=cand, intraday_high=cand.current_price)
-            targets.append(target)
-            logger.info(f"타겟 선정: {cand.name}({cand.code}) {cand.market.value} 등락={cand.price_change_pct:+.2f}% 거래대금={cand.trading_volume_krw/1e8:.0f}억")
-
-        return targets
