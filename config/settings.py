@@ -95,32 +95,31 @@ class ScreeningParams(BaseModel):
     screening_time: str = "09:50"
     volume_min: int = Field(default=50_000_000_000, ge=0, le=1_000_000_000_000)  # 500억
     program_net_buy_ratio_min: float = Field(default=5.0, ge=0.0, le=100.0)  # 프로그램순매수비중 ≥ 5%
-    top_n_gainers: int = Field(default=1, ge=1, le=50)  # 상승률 최고 1종목 (단일 매매 시)
-    top_n_candidates: int = Field(default=5, ge=1, le=50)  # 후보 풀 크기 (멀티 트레이드용)
     max_change_pct: float = Field(default=29.5, ge=1.0, le=30.0)  # 상한가(+30%) 제외 임계값
 
 
 class MultiTradeParams(BaseModel):
     enabled: bool = True                          # 멀티 트레이드 활성화
-    max_daily_trades: int = Field(default=3, ge=1, le=20)  # 일일 최대 매매 횟수
     repeat_start: str = "10:00"                   # 다음 종목 진입 가능 시작 시각
-    repeat_end: str = "11:00"                     # 다음 종목 진입 가능 마감 시각
-    profit_only: bool = True                      # 수익 청산 시에만 다음 종목 (손절 시 중단)
+    repeat_end: str = "11:00"                     # 다음 종목 진입 가능 마감 시각 (last-line defense)
+    profit_only: bool = False                     # 청산 사유 무관 다음 종목 진입 허용 (R-08)
+    kospi_next_entry_max_pct: float = Field(default=3.8, ge=0.1, le=30.0)   # KOSPI 다음 종목 tiebreaker 필터
+    kosdaq_next_entry_max_pct: float = Field(default=5.6, ge=0.1, le=30.0)  # KOSDAQ 다음 종목 tiebreaker 필터
 
 
 class EntryParams(BaseModel):
     new_high_watch_start: str = "09:55"           # 신고가 감시 시작
-    entry_deadline: str = "11:00"                 # 매수 진입 마감 시각 (이후 신규 매수 불가)
+    entry_deadline: str = "10:55"                 # 매수 진입 마감 시각 (W-15 2026-04-10: '11:00'→'10:55', yaml 동기화)
     high_confirm_drop_pct: float = Field(default=1.0, ge=0.1, le=10.0)  # 고가 확정 트리거: 1% 하락
-    high_confirm_timeout_min: int = Field(default=10, ge=1, le=120)  # 고가 확정 후 N분 내 미체결 시 주문 취소
+    high_confirm_timeout_min: int = Field(default=20, ge=1, le=120)  # 고가 확정 후 N분 내 미체결 시 주문 취소 (W-15 2026-04-10: 10→20, W-13 yaml 동기화)
 
     # KOSPI 분할매수 (고가 대비 %)
     kospi_buy1_pct: float = Field(default=2.5, ge=0.1, le=15.0)
     kospi_buy2_pct: float = Field(default=3.5, ge=0.1, le=15.0)
 
     # KOSDAQ 분할매수
-    kosdaq_buy1_pct: float = Field(default=3.75, ge=0.1, le=15.0)
-    kosdaq_buy2_pct: float = Field(default=5.25, ge=0.1, le=15.0)
+    kosdaq_buy1_pct: float = Field(default=3.5, ge=0.1, le=15.0)   # W-15 2026-04-10: 3.75→3.5, W-14 yaml 동기화
+    kosdaq_buy2_pct: float = Field(default=5.5, ge=0.1, le=15.0)   # W-15 2026-04-10: 5.25→5.5, W-14 yaml 동기화
 
     # 매수 비중 (예수금 대비 %)
     buy1_ratio: float = Field(default=50.0, ge=1.0, le=100.0)
@@ -132,13 +131,13 @@ class ExitParams(BaseModel):
     timeout_from_low_min: int = Field(default=20, ge=1, le=120)  # 최저가 후 20분
 
     kospi_hard_stop_pct: float = Field(default=4.1, ge=0.1, le=30.0)  # KOSPI 하드 손절 (고가 대비 %)
-    kosdaq_hard_stop_pct: float = Field(default=6.2, ge=0.1, le=30.0)  # KOSDAQ 하드 손절
+    kosdaq_hard_stop_pct: float = Field(default=6.15, ge=0.1, le=30.0)  # KOSDAQ 하드 손절 (W-15 2026-04-10: 6.2→6.15, yaml 동기화)
 
     futures_drop_pct: float = Field(default=1.0, ge=0.1, le=20.0)  # 선물 급락 손절 (%)
 
     timeout_start_after_kst: str = "10:00"  # 타임아웃 가드: 이 시각 이전 최저가는 타이머 시작 안 함
 
-    force_liquidate_time: str = "15:20"
+    force_liquidate_time: str = "11:20"                              # 강제 청산 시각 (W-15 2026-04-10: '15:20'→'11:20', 매매 철학 동기화)
 
 
 class OrderParams(BaseModel):

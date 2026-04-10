@@ -19,11 +19,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 from enum import Enum
-from typing import Optional
+from typing import Callable, Optional
 
 from loguru import logger
 
 from config.settings import StrategyParams
+from src.utils.price_utils import floor_to_tick, ceil_to_tick
 from src.models.stock import MarketType
 
 
@@ -55,6 +56,42 @@ TERMINAL_STATES = frozenset({
     WatcherState.EXITED,
     WatcherState.SKIPPED,
 })
+
+
+# ── ReservationSnapshot dataclass ────────────────────────
+
+
+@dataclass
+class ReservationSnapshot:
+    """T2 시점 (첫 종목 buy2 체결) 에 두 번째 매매 후보로 예약된 종목의 스냅샷.
+
+    T3 시점 (첫 종목 EXITED) 에 이 스냅샷을 기준으로 예약 재확인을 수행:
+      - 종목이 여전히 watchers 목록에 존재
+      - state 가 여전히 READY (is_yes = True)
+      - target_buy1_price 가 변경되지 않음 (신고가 갱신 없음)
+      - tiebreaker 조건 (3.8%/5.6% 이하 낙폭) 여전히 유지
+
+    Fields:
+        code: 종목 코드
+        name: 종목명 (로그용)
+        market: KOSPI / KOSDAQ (MarketType)
+        reserved_at: T2 시점
+        confirmed_high_at_t2: T2 시점의 confirmed_high (신고가 갱신 검증용)
+        current_price_at_t2: T2 시점의 현재가
+        pullback_pct_at_t2: T2 시점의 눌림폭 (get_pullback_pct 기준)
+        target_buy1_price_at_t2: T2 시점의 1차 매수가 (재계산 검증용)
+        target_buy2_price_at_t2: T2 시점의 2차 매수가
+    """
+
+    code: str
+    name: str
+    market: MarketType
+    reserved_at: datetime
+    confirmed_high_at_t2: int
+    current_price_at_t2: int
+    pullback_pct_at_t2: float
+    target_buy1_price_at_t2: int
+    target_buy2_price_at_t2: int
 
 
 # ── Watcher dataclass ────────────────────────────────────
@@ -129,6 +166,7 @@ class Watcher:
 
     # === 시그널 ===
     _exit_signal_pending: bool = False
+    _t2_callback: Optional[Callable[[str, datetime], None]] = field(default=None, repr=False)
 
     # === 캐시된 시각 ===
     _watch_start: Optional[time] = None
@@ -150,7 +188,9 @@ class Watcher:
         """
         if self.post_entry_low <= 0 or self.confirmed_high <= 0:
             return 0
-        return int((self.confirmed_high + self.post_entry_low) / 2)
+        # 호가 단위 보정 (W-12-rev2): 목표가 floor — 더 일찍 익절 (수익 확정)
+        raw = int((self.confirmed_high + self.post_entry_low) / 2)
+        return floor_to_tick(raw)
 
     @property
     def is_yes(self) -> bool:
@@ -274,9 +314,12 @@ class Watcher:
             buy2_pct = self.params.entry.kosdaq_buy2_pct
             stop_pct = self.params.exit.kosdaq_hard_stop_pct
 
-        self.target_buy1_price = int(self.confirmed_high * (1 - buy1_pct / 100))
-        self.target_buy2_price = int(self.confirmed_high * (1 - buy2_pct / 100))
-        self.hard_stop_price_value = int(self.confirmed_high * (1 - stop_pct / 100))
+        # 호가 단위 보정 (W-12-rev2)
+        # 매수가: floor — 더 낮은 가격에 매수 (안전 마진)
+        # 손절가: ceil  — 더 일찍 손절 (손실 최소화)
+        self.target_buy1_price = floor_to_tick(int(self.confirmed_high * (1 - buy1_pct / 100)))
+        self.target_buy2_price = floor_to_tick(int(self.confirmed_high * (1 - buy2_pct / 100)))
+        self.hard_stop_price_value = ceil_to_tick(int(self.confirmed_high * (1 - stop_pct / 100)))
 
         self.state = WatcherState.TRIGGERED
         logger.info(
@@ -449,9 +492,17 @@ class Watcher:
             self.buy1_pending = False
             self.buy1_price = filled_price
         elif label == "buy2":
+            was_buy2_filled = self.buy2_filled
             self.buy2_filled = True
             self.buy2_pending = False
             self.buy2_price = filled_price
+
+            # T2 이벤트: buy2 최초 체결 시 Coordinator 에 알림 (중복 호출 방지)
+            if not was_buy2_filled and self._t2_callback:
+                try:
+                    self._t2_callback(self.code, ts)
+                except Exception as e:
+                    logger.error(f"[Watcher {self.code}] _t2_callback 호출 실패: {e}")
 
         if self.state != WatcherState.ENTERED:
             self.state = WatcherState.ENTERED
@@ -463,6 +514,29 @@ class Watcher:
         logger.info(
             f"[{self.name}] {label} 체결: {filled_price:,}원 × {filled_qty}주 (평단 {avg:,.0f}원)"
         )
+
+    # (5-15) get_pullback_pct
+
+    def get_pullback_pct(self) -> float:
+        """현재가의 고가 대비 눌림폭 (0.0 ~ 1.0).
+
+        TRIGGERED 이후: confirmed_high 기준.
+        TRIGGERED 이전: intraday_high 기준.
+
+        W-11d tiebreaker 에서 사용:
+          KOSPI  kospi_next_entry_max_pct (3.8%) 이하 필터
+          KOSDAQ kosdaq_next_entry_max_pct (5.6%) 이하 필터
+          동일 조건 내 pullback 최대값 종목 선정.
+
+        반환값 예시:
+          0.0   → 현재가 = 고가 (눌림 없음)
+          0.038 → 고가 대비 3.8% 하락 (KOSPI tiebreaker 경계)
+          0.041 → 고가 대비 4.1% 하락 (KOSPI 하드 손절선)
+        """
+        high = self.confirmed_high if self.confirmed_high > 0 else self.intraday_high
+        if high <= 0 or self.current_price <= 0:
+            return 0.0
+        return 1.0 - (self.current_price / high)
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -507,6 +581,13 @@ class WatcherCoordinator:
         # 일별 상태 (start_screening 시 리셋)
         self._screening_done: bool = False
 
+        # === W-11d: 두 번째 매매 예약 ===
+        self._reserved_snapshot: Optional[ReservationSnapshot] = None
+
+        # === W-11d: 진입 윈도우 캐시 (multi_trade.repeat_start ~ entry_deadline) ===
+        self._repeat_start = time.fromisoformat(params.multi_trade.repeat_start)
+        self._repeat_end = time.fromisoformat(params.multi_trade.repeat_end)
+
     def set_available_cash(self, amount: int) -> None:
         """매수 가능 현금 갱신. main.py 가 호출."""
         self._available_cash = amount
@@ -533,22 +614,37 @@ class WatcherCoordinator:
 
     # ── 3-1. start_screening ─────────────────────────────
 
-    def start_screening(self, candidates: list) -> None:
-        """09:50 스크리닝 결과 받아 watcher 3개 가동.
+    def start_screening(self, candidates: list, *, is_final: bool = False) -> None:
+        """스크리닝 결과로 Watcher 생성.
 
         Args:
             candidates: list[StockCandidate] — screener.run_manual 결과
+            is_final: True 이면 09:50 정규 스크리닝 (이후 추가 호출 차단).
+                      False 이면 수동 스크리닝 (여러 번 덮어쓰기 허용).
+
+        W-11d 변경:
+        - is_final 파라미터 추가 (keyword-only)
+        - active 상태에서는 재스크리닝 차단 (포지션 방치 방지)
+        - Watcher 생성 시 _t2_callback 주입 (T2 이벤트 → _on_t2 핸들러)
+        - _screening_done 설정 조건: is_final=True 일 때만
+        - _reserved_snapshot 초기화 (재스크리닝 시 기존 예약 폐기)
         """
+        # === A. 가드: 09:50 정규 스크리닝 이후 추가 호출 차단 ===
         if self._screening_done:
-            logger.warning("스크리닝 이미 완료됨. 중복 호출 무시.")
+            logger.warning("스크리닝 이미 확정됨 (09:50 정규). 추가 호출 무시.")
             return
 
-        # watcher 생성 (top_n_gainers 만큼)
-        top_n = self.params.screening.top_n_gainers
-        selected = candidates[:top_n]
+        # === B. 가드: active 상태에서 재스크리닝 차단 (포지션 방치 방지) ===
+        if self._active_code is not None:
+            logger.warning(
+                f"active 상태에서 재스크리닝 차단 (active={self._active_code}). "
+                f"기존 포지션 보호."
+            )
+            return
 
+        # === C. Watcher 생성 (기존 watchers 폐기 후 새로 생성) ===
         self.watchers = []
-        for cand in selected:
+        for cand in candidates:
             w = Watcher(
                 code=cand.code,
                 name=cand.name,
@@ -559,14 +655,31 @@ class WatcherCoordinator:
             w.intraday_high = cand.current_price
             w.pre_955_high = cand.current_price
             w.current_price = cand.current_price
+
+            # W-11d: T2 이벤트 콜백 주입
+            w._t2_callback = self._on_t2
+
             self.watchers.append(w)
             logger.info(
                 f"[Coordinator] Watcher 가동: {cand.name}({cand.code}) {cand.market.value}"
             )
 
-        self._screening_done = True
+        # === D. 상태 초기화 ===
         self._active_code = None
-        logger.info(f"[Coordinator] {len(self.watchers)}개 watcher 시작")
+        self._reserved_snapshot = None  # W-11d: 재스크리닝 시 기존 예약 폐기
+
+        # === E. 09:50 정규 스크리닝일 경우 가드 활성화 ===
+        if is_final:
+            self._screening_done = True
+            logger.info(
+                f"[Coordinator] {len(self.watchers)}개 watcher 시작 "
+                f"(is_final=True, 추가 스크리닝 차단)"
+            )
+        else:
+            logger.info(
+                f"[Coordinator] {len(self.watchers)}개 watcher 시작 "
+                f"(is_final=False, 09:50 까지 재호출 가능)"
+            )
 
     # ── 3-2. on_realtime_price / on_realtime_futures ──────
 
@@ -617,8 +730,10 @@ class WatcherCoordinator:
         if self._active_code is not None:
             return  # active 잠금 (체결 대기 또는 청산 대기)
 
-        # 매수 마감 시각 체크
-        if self._is_after_buy_deadline(ts):
+        # W-11e: 진입 윈도우 체크 (10:00 ~ 10:55)
+        # 첫 매매와 두 번째 매매 모두 동일 윈도우 적용 (수석님 확정).
+        # _is_after_buy_deadline 대체 (결정 3=A, 결정 4=A).
+        if not self._is_in_entry_window(ts):
             return
 
         # YES watcher 모두 수집
@@ -748,19 +863,322 @@ class WatcherCoordinator:
         # 즉시 한 번 더 신호 처리
         await self._process_signals(ts)
 
-    # ── 3-8. _is_after_buy_deadline ──────────────────────
+    # ── 3-9. W-11d: T2/T3 두 번째 매매 예약 로직 ────────
 
-    def _is_after_buy_deadline(self, ts: datetime) -> bool:
-        """현재 시각이 매수 마감 시각 (10:55) 이후인가."""
-        return ts.time() >= self._entry_deadline
+    def _is_in_entry_window(self, ts: datetime) -> bool:
+        """현재 시각이 신규 진입 발주 가능 윈도우 안인지 확인.
 
-    # ── 3-9. shutdown / reset ────────────────────────────
+        매매 명세 (R-08):
+        - 시작: 10:00 (multi_trade.repeat_start)
+        - 종료: 10:55 (entry.entry_deadline, 포함)
+        - 첫 매매와 두 번째 매매에 동일 적용.
+
+        Args:
+            ts: 검증할 시각
+
+        Returns:
+            True: 윈도우 안 (진입 발주 가능)
+            False: 윈도우 밖 (진입 차단)
+        """
+        current = ts.time()
+        return self._repeat_start <= current <= self._entry_deadline
+
+    def _on_t2(self, code: str, ts: datetime) -> None:
+        """T2 이벤트 핸들러: 첫 종목의 buy2 가 체결된 시점.
+
+        Watcher.on_buy_filled 의 buy2 분기에서 _t2_callback 으로 호출됨.
+        동기 함수 (async 아님, Watcher 가 동기 콜백을 호출하기 때문).
+
+        역할:
+        - active 가 호출 종목과 일치하는지 확인 (잘못된 콜백 방어)
+        - 진입 윈도우 (10:00~10:55) 안인지 확인
+        - 두 번째 매매 후보 (YES 종목) 중 tiebreaker 통과 종목을 _reserved_snapshot 에 저장
+        - 후보 0개면 예약 없이 종료 (T3 시점에 재판정)
+
+        Args:
+            code: T2 가 발생한 종목 코드
+            ts: T2 시점
+        """
+        # 1. active 일치 확인 (방어)
+        if self._active_code != code:
+            logger.warning(
+                f"[Coordinator] T2 콜백 방어: code={code} 가 active={self._active_code} 와 불일치. 무시."
+            )
+            return
+
+        # 2. 진입 윈도우 체크
+        if not self._is_in_entry_window(ts):
+            logger.info(
+                f"[Coordinator] T2 시점이 진입 윈도우 밖 ({ts.time()}), 예약 시도 안 함"
+            )
+            return
+
+        # 3. 중복 호출 방어 (T2 가 두 번 호출되는 일 없어야 하지만)
+        if self._reserved_snapshot is not None:
+            logger.warning(
+                f"[Coordinator] T2 중복 호출 감지: 기존 예약 {self._reserved_snapshot.code} 유지"
+            )
+            return
+
+        # 4. 예약 시도
+        snapshot = self._try_reserve_at_t2(ts)
+        if snapshot is None:
+            logger.info(
+                f"[Coordinator] T2 ({code}) 시점 YES 후보 0개 또는 tiebreaker 미통과 → 예약 없음"
+            )
+            return
+
+        self._reserved_snapshot = snapshot
+        logger.info(
+            f"[Coordinator] T2 예약 완료: {snapshot.name} ({snapshot.code}) "
+            f"눌림 {snapshot.pullback_pct_at_t2:.2%}, "
+            f"1차 매수가 {snapshot.target_buy1_price_at_t2:,}"
+        )
+
+    def _try_reserve_at_t2(self, ts: datetime) -> Optional[ReservationSnapshot]:
+        """T2 시점에 두 번째 매매 후보 종목을 선정하고 ReservationSnapshot 으로 반환.
+
+        흐름:
+        1. active 가 아닌 watchers 중 is_yes (state == READY) 종목 수집
+        2. tiebreaker 적용: KOSPI 3.8% 이상 / KOSDAQ 5.6% 이상 눌림폭 + 최대 선정
+        3. 선정 종목의 스냅샷 생성
+
+        Returns:
+            ReservationSnapshot: 선정된 종목의 스냅샷
+            None: YES 후보 0개 또는 tiebreaker 통과 0개
+        """
+        yes_watchers = [
+            w for w in self.watchers
+            if w.is_yes and not w.is_terminal and w.code != self._active_code
+        ]
+        if not yes_watchers:
+            return None
+
+        chosen = self._tiebreaker_for_next(yes_watchers)
+        if chosen is None:
+            return None
+
+        snapshot = ReservationSnapshot(
+            code=chosen.code,
+            name=chosen.name,
+            market=chosen.market,
+            reserved_at=ts,
+            confirmed_high_at_t2=chosen.confirmed_high,
+            current_price_at_t2=chosen.current_price,
+            pullback_pct_at_t2=chosen.get_pullback_pct(),
+            target_buy1_price_at_t2=chosen.target_buy1_price,
+            target_buy2_price_at_t2=chosen.target_buy2_price,
+        )
+        return snapshot
+
+    def _tiebreaker_for_next(self, candidates: list) -> Optional[Watcher]:
+        """두 번째 매매 후보 중 tiebreaker 통과 + 눌림폭 최대 종목 선정.
+
+        매매 명세 (R-08, 2026-04-09 수석님 확정):
+        - KOSPI: 눌림폭 (1 - current/high) >= 3.8%
+        - KOSDAQ: 눌림폭 >= 5.6%
+        - 필터 통과 종목 중 눌림폭이 가장 큰 종목 선정
+
+        매매 의도: 더 깊은 진입 = R:R 비대칭 확보 (손절선 근처 진입)
+
+        Args:
+            candidates: YES 종목 리스트 (is_yes + not is_terminal 필터 완료)
+
+        Returns:
+            tiebreaker 통과 + 눌림폭 최대 Watcher
+            None: 필터 통과 종목 0개
+        """
+        kospi_threshold = self.params.multi_trade.kospi_next_entry_max_pct / 100.0
+        kosdaq_threshold = self.params.multi_trade.kosdaq_next_entry_max_pct / 100.0
+
+        passed = []
+        for w in candidates:
+            pullback = w.get_pullback_pct()
+
+            if w.market == MarketType.KOSPI:
+                threshold = kospi_threshold
+            elif w.market == MarketType.KOSDAQ:
+                threshold = kosdaq_threshold
+            else:
+                logger.warning(
+                    f"[Coordinator] tiebreaker: 알 수 없는 시장 {w.market} ({w.code}), 제외"
+                )
+                continue
+
+            if pullback >= threshold:
+                passed.append((pullback, w))
+
+        if not passed:
+            return None
+
+        # 눌림폭 최대 선정
+        passed.sort(key=lambda x: x[0], reverse=True)
+        return passed[0][1]
+
+    def _verify_reservation_at_t3(self, ts: datetime) -> bool:
+        """T3 시점에 _reserved_snapshot 의 예약 종목이 여전히 진입 가능한지 엄격 재확인.
+
+        재확인 항목 (수석님 결정):
+        1. watchers 에 존재
+        2. is_yes (state == READY)
+        3. not is_terminal
+        4. target_buy1_price 가 T2 시점과 동일 (재계산되지 않음)
+        5. tiebreaker 조건 여전히 충족
+
+        Args:
+            ts: T3 시점 (로그용)
+
+        Returns:
+            True: 모든 재확인 통과
+            False: 하나라도 실패 → 호출자가 예약 폐기 + 재판정
+        """
+        snapshot = self._reserved_snapshot
+        if snapshot is None:
+            logger.warning("[Coordinator] _verify_reservation_at_t3: 예약 없음")
+            return False
+
+        # 1. watchers 에서 종목 찾기
+        reserved_watcher = next(
+            (w for w in self.watchers if w.code == snapshot.code),
+            None,
+        )
+        if reserved_watcher is None:
+            logger.warning(
+                f"[Coordinator] T3 재확인 실패: 예약 종목 {snapshot.code} 가 watchers 에 없음"
+            )
+            return False
+
+        # 2. is_yes 재확인
+        if not reserved_watcher.is_yes:
+            logger.info(
+                f"[Coordinator] T3 재확인 실패: {snapshot.name} state={reserved_watcher.state} (READY 아님)"
+            )
+            return False
+
+        # 3. is_terminal 재확인
+        if reserved_watcher.is_terminal:
+            logger.info(
+                f"[Coordinator] T3 재확인 실패: {snapshot.name} terminal 상태"
+            )
+            return False
+
+        # 4. target_buy1_price 변경 검증
+        if reserved_watcher.target_buy1_price != snapshot.target_buy1_price_at_t2:
+            logger.info(
+                f"[Coordinator] T3 재확인 실패: {snapshot.name} 매수가 변경됨 "
+                f"(T2: {snapshot.target_buy1_price_at_t2:,}, T3: {reserved_watcher.target_buy1_price:,})"
+            )
+            return False
+
+        # 5. tiebreaker 조건 재확인
+        kospi_threshold = self.params.multi_trade.kospi_next_entry_max_pct / 100.0
+        kosdaq_threshold = self.params.multi_trade.kosdaq_next_entry_max_pct / 100.0
+
+        if reserved_watcher.market == MarketType.KOSPI:
+            threshold = kospi_threshold
+        elif reserved_watcher.market == MarketType.KOSDAQ:
+            threshold = kosdaq_threshold
+        else:
+            logger.warning(
+                f"[Coordinator] T3 재확인: 알 수 없는 시장 {reserved_watcher.market}"
+            )
+            return False
+
+        current_pullback = reserved_watcher.get_pullback_pct()
+        if current_pullback < threshold:
+            logger.info(
+                f"[Coordinator] T3 재확인 실패: {snapshot.name} 눌림폭 부족 "
+                f"({current_pullback:.2%} < {threshold:.2%})"
+            )
+            return False
+
+        logger.info(
+            f"[Coordinator] T3 재확인 통과: {snapshot.name} "
+            f"눌림 {current_pullback:.2%}, 1차 매수가 {reserved_watcher.target_buy1_price:,}"
+        )
+        return True
+
+    async def handle_t3(self, ts: datetime) -> None:
+        """T3 (첫 종목 EXITED) 시점 호출. main.py._on_exit_done 에서 위임받음.
+
+        흐름:
+        1. 진입 윈도우 (10:00~10:55) 체크 — 벗어나면 예약 폐기 후 return
+        2. 예약 존재 시 → _verify_reservation_at_t3 → 통과 시 진입, 실패 시 fallthrough
+        3. 재판정 (예약 없거나 fallthrough): YES 종목 → tiebreaker → 진입 또는 포기
+
+        Args:
+            ts: T3 시점 (호출 시각)
+        """
+        # === 1. 진입 윈도우 체크 ===
+        if not self._is_in_entry_window(ts):
+            if self._reserved_snapshot is not None:
+                logger.info(
+                    f"[Coordinator] T3: 진입 윈도우 밖 ({ts.time()}), "
+                    f"예약 {self._reserved_snapshot.code} 폐기"
+                )
+                self._reserved_snapshot = None
+            else:
+                logger.info(
+                    f"[Coordinator] T3: 진입 윈도우 밖 ({ts.time()}), 다음 매매 없음"
+                )
+            return
+
+        # === 2. 예약 존재 시 재확인 ===
+        if self._reserved_snapshot is not None:
+            if self._verify_reservation_at_t3(ts):
+                # 재확인 통과 → 예약된 종목으로 진입
+                snapshot = self._reserved_snapshot
+                reserved_watcher = next(
+                    (w for w in self.watchers if w.code == snapshot.code),
+                    None,
+                )
+                if reserved_watcher is not None:
+                    logger.info(
+                        f"[Coordinator] T3: 예약 진입 → {reserved_watcher.name}"
+                    )
+                    self._reserved_snapshot = None
+                    await self._execute_buy(reserved_watcher, ts)
+                    self._active_code = reserved_watcher.code
+                    return
+                else:
+                    # 이론상 도달 불가능 (_verify 가 잡았어야 함). 방어.
+                    logger.error(
+                        f"[Coordinator] T3 예약 진입 방어: {snapshot.code} watchers 에 없음 (이론상 불가능)"
+                    )
+                    self._reserved_snapshot = None
+                    # fallthrough 재판정
+            else:
+                # 재확인 실패 → 예약 폐기 후 재판정
+                logger.info("[Coordinator] T3: 예약 재확인 실패, 예약 폐기 후 재판정")
+                self._reserved_snapshot = None
+                # fallthrough 재판정
+
+        # === 3. 재판정 (예약 없거나 재확인 실패) ===
+        yes_watchers = [
+            w for w in self.watchers
+            if w.is_yes and not w.is_terminal
+        ]
+        if not yes_watchers:
+            logger.info("[Coordinator] T3: 재판정 시 YES 종목 0개, 다음 매매 포기")
+            return
+
+        chosen = self._tiebreaker_for_next(yes_watchers)
+        if chosen is None:
+            logger.info("[Coordinator] T3: tiebreaker 통과 종목 0개, 다음 매매 포기")
+            return
+
+        logger.info(f"[Coordinator] T3: 재판정 진입 → {chosen.name}")
+        await self._execute_buy(chosen, ts)
+        self._active_code = chosen.code
+
+    # ── 3-10. shutdown / reset ────────────────────────────
 
     def shutdown(self) -> None:
         """서비스 종료 시 호출. watchers 비우기."""
         self.watchers = []
         self._active_code = None
         self._screening_done = False
+        self._reserved_snapshot = None  # W-11d
         logger.info("[Coordinator] shutdown")
 
     def reset_for_next_day(self) -> None:

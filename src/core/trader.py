@@ -7,7 +7,7 @@ live: 실매매 주문
 """
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, time as dtime
 from typing import Optional
 
 from src.utils.market_calendar import now_kst
@@ -35,6 +35,20 @@ class Trader:
 
     async def place_buy_orders(self, watcher: Watcher, available_cash: int) -> None:
         """고가 확정 후 매수 지정가 2건 배치."""
+        # === W-11e: Last-line defense (repeat_end 시한 위반 방어) ===
+        # 매매 철학상 11:00 이후는 반등 조건 소멸. 어떤 경로로도 이 시각 이후
+        # 매수 발주가 일어나면 안 됨. 정상 흐름에서는 _is_in_entry_window (10:55)
+        # 가 차단하지만, 비정상 호출 경로에 대한 최후 방어선.
+        _repeat_end_time = dtime.fromisoformat(self.params.multi_trade.repeat_end)
+        _now = now_kst()
+        if _now.time() >= _repeat_end_time:
+            logger.error(
+                f"[Trader] CRITICAL: 매매 철학 시한 위반 시도 "
+                f"({_now.time()} >= repeat_end {_repeat_end_time}). 발주 거부. "
+                f"종목: {watcher.code} ({watcher.name})"
+            )
+            return
+
         ep = self.params.entry
         buy1_price = watcher.target_buy1_price
         buy2_price = watcher.target_buy2_price

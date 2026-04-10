@@ -42,6 +42,7 @@ from src.models.trade import TradeRecord, DailySummary, ExitReason
 from src.storage.database import Database
 from src.utils.notifier import Notifier
 from src.utils.tunnel import CloudflareTunnel
+from src.utils.logger import setup_logger
 from src.utils.market_calendar import now_kst
 
 
@@ -88,6 +89,7 @@ class AutoTrader:
         self._network_ok: bool = True       # 네트워크 정상 여부
         self._emergency_cancel_done: bool = False  # 긴급 취소 실행 여부 (중복 방지)
         self.on_state_update = None  # 대시보드 동기화 콜백 (run.py에서 설정)
+        self._loop = None  # run() 시작 시 설정 (dashboard 가 사용)
 
         # ── 텔레그램 알림 ──
         self.notifier = Notifier(
@@ -147,11 +149,14 @@ class AutoTrader:
 
     async def run(self):
         """전체 매매 프로세스 실행."""
+        # 현재 loop 보관 (dashboard 가 run_coroutine_threadsafe 로 사용)
+        self._loop = asyncio.get_running_loop()
+
         logger.info("=" * 50)
         logger.info(f"AUTOTRADE 시작 (모드: {self.settings.trade_mode})")
         mt = self.params.multi_trade
         if mt.enabled:
-            logger.info(f"멀티 트레이드: 최대 {mt.max_daily_trades}회, {mt.repeat_start}~{mt.repeat_end}")
+            logger.info(f"멀티 트레이드: {mt.repeat_start}~{mt.repeat_end}")
         logger.info("=" * 50)
         self.notifier.notify_system(f"AUTOTRADE 시작 (모드: {self.settings.trade_mode})")
 
@@ -209,7 +214,8 @@ class AutoTrader:
                 admin_token = os.getenv("DASHBOARD_ADMIN_TOKEN", "")
                 admin_url = f"{tunnel_url}?token={admin_token}" if admin_token else tunnel_url
                 self.notifier.notify_system(
-                    f"대시보드 접속 URL (관리자)\n\n{admin_url}"
+                    f"대시보드 접속 URL (관리자)\n\n{admin_url}\n\n"
+                    f"📌 종목 입력: 직접 입력 박스만 사용 (검색 박스 미지원)"
                 )
 
             self._running = True
@@ -295,14 +301,10 @@ class AutoTrader:
             await self._fire_state_update()
             return
 
-        mt = self.params.multi_trade
-        if mt.enabled:
-            logger.info(f"후보 풀 {len(targets)}종목 선정 (멀티 트레이드: 최대 {mt.max_daily_trades}회)")
-            for i, t in enumerate(targets):
-                logger.info(f"  #{i+1} {t.stock.name}({t.stock.code}) {t.stock.market.value} "
-                            f"등락={t.stock.price_change_pct:+.2f}% 거래대금={t.stock.trading_volume_krw/1e8:.0f}억")
-        else:
-            logger.info(f"타겟 {len(targets)}종목 선정")
+        logger.info(f"후보 풀 {len(targets)}종목 선정")
+        for i, t in enumerate(targets):
+            logger.info(f"  #{i+1} {t.name}({t.code}) {t.market.value} "
+                        f"등락={t.price_change_pct:+.2f}% 거래대금={t.trading_volume_krw/1e8:.0f}억")
 
         # Coordinator 에 watchers 주입 (W-06b2)
         self._coordinator.start_screening(targets)
@@ -775,21 +777,6 @@ class AutoTrader:
             await self._fire_state_update()
             return
 
-        profit_reasons = {"target"}
-        is_profit_exit = watcher.exit_reason in profit_reasons
-
-        if mt.profit_only and not is_profit_exit:
-            logger.info(f"손실/비수익 청산({watcher.exit_reason}) → 멀티 트레이드 중단 (당일 매매 종료)")
-            self._coordinator.set_available_cash(0)
-            await self._fire_state_update()
-            return
-
-        if self.risk.daily_trades >= mt.max_daily_trades:
-            logger.info(f"일일 최대 매매 횟수 도달 ({self.risk.daily_trades}/{mt.max_daily_trades}) → 중단")
-            self._coordinator.set_available_cash(0)
-            await self._fire_state_update()
-            return
-
         # 5. 잔고 재조회 + Coordinator 갱신
         try:
             if self.settings.is_dry_run and self.settings.dry_run_cash > 0:
@@ -808,6 +795,13 @@ class AutoTrader:
 
         # 6. trader.reset (다음 종목 매수 준비)
         self.trader.reset()
+
+        # === 6.5. T3 위임 (W-11e: 두 번째 매매 트리거) ===
+        # _on_exit_done 진입 시점에 _active_code 는 여전히 청산된 종목 코드.
+        # handle_t3 가 _execute_buy 를 호출하기 전에 _active_code 를 None 으로 명시 처리.
+        # 이렇게 하면 handle_t3 안에서 새 chosen.code 로 _active_code 가 atomic 하게 교체됨.
+        self._coordinator._active_code = None
+        await self._coordinator.handle_t3(now_kst())
 
         # 7. 대시보드 동기화
         await self._fire_state_update()
@@ -928,6 +922,11 @@ class AutoTrader:
 
 def main():
     import signal as _signal
+
+    # 로거 초기화 — loguru 파일 sink 활성화 (M-08-L-1 에서 누락 확정)
+    _settings = Settings()
+    _params = StrategyParams.load()
+    setup_logger(log_level=_settings.log_level, infra_params=_params.infra)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)

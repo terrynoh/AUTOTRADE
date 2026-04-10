@@ -247,31 +247,29 @@ async def api_set_targets(request: Request, token: str = Header(None, alias="X-A
         if not cleaned:
             return {"ok": False, "msg": "유효한 입력 없음"}
 
-        api = state.autotrader.api
-
-        # 종목코드/종목명 → 코드 변환 + KIS API 검증
+        # StockMaster 로컬 캐시로 종목 검증 (KIS API 호출 X)
+        sm = state.autotrader._stock_master
         resolved: list[dict] = []
         errors: list[str] = []
 
         for raw in cleaned:
-            code = state.resolve_input(raw)
-            if not code:
-                errors.append(f"'{raw}' → 종목 못 찾음")
-                continue
-
-            # KIS API로 유효성 검증 + 종목명 확인
-            try:
-                info = await api.get_current_price(code)
-                price = info.get("current_price", 0)
-                if price <= 0:
-                    errors.append(f"'{raw}'({code}) → 유효하지 않은 종목")
+            if raw.isdigit():
+                # 종목코드 입력
+                name = sm.lookup_name(raw)
+                if name is None:
+                    errors.append(f"'{raw}' → 종목 못 찾음")
                     continue
-                # 종목명: API 응답 → 캐시 → 코드 그대로
-                name = info.get("name", "") or state._stock_name_cache.get(code, "") or code
+                state.cache_stock(raw, name)
+                resolved.append({"code": raw, "name": name})
+            else:
+                # 종목명 입력 → 코드 변환
+                code = sm.lookup_code(raw)
+                if code is None:
+                    errors.append(f"'{raw}' → 종목 못 찾음")
+                    continue
+                name = sm.lookup_name(code) or raw
                 state.cache_stock(code, name)
                 resolved.append({"code": code, "name": name})
-            except Exception:
-                errors.append(f"'{raw}'({code}) → KIS API 조회 실패")
 
         if not resolved:
             msg = "유효한 종목 없음"
@@ -329,16 +327,40 @@ async def api_run_manual_screening(token: str = Header(None, alias="X-Admin-Toke
     if not state.autotrader._manual_codes:
         return {"ok": False, "msg": "수동 타겟 종목 미설정 (/api/set-targets 먼저 호출)"}
 
-    try:
-        await state.autotrader._on_screening()
-        count = len(state.autotrader._monitors)
-        state.add_log("INFO", f"수동 스크리닝 완료: {count}종목 선정")
-        return {"ok": True, "msg": f"{count}종목 선정"}
+    autotrader = state.autotrader
 
+    # AutoTrader 의 loop 가 살아있는지 확인
+    if autotrader._loop is None or not autotrader._loop.is_running():
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            {"ok": False, "error": "AutoTrader loop 가 가동 중이 아님"},
+            status_code=503
+        )
+
+    # AutoTrader loop 에 위임 (KIS API 의 aiohttp 컨텍스트 정상)
+    future = asyncio.run_coroutine_threadsafe(
+        autotrader._on_screening(),
+        autotrader._loop
+    )
+
+    # 결과 대기 (max 60초)
+    try:
+        await asyncio.wrap_future(future)
+    except asyncio.TimeoutError:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(
+            {"ok": False, "error": "수동 스크리닝 timeout (60초)"},
+            status_code=504
+        )
     except Exception as e:
         logger.error(f"수동 스크리닝 실패: {e}")
         state.add_log("ERROR", "수동 스크리닝 실패")
         return {"ok": False, "msg": "수동 스크리닝 중 오류 발생"}
+
+    # R-07: _monitors → _coordinator.watchers
+    count = len(autotrader._coordinator.watchers)
+    state.add_log("INFO", f"수동 스크리닝 완료: {count}종목 선정")
+    return {"ok": True, "msg": f"{count}종목 선정"}
 
 
 

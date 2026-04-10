@@ -16,32 +16,13 @@ from config.settings import StrategyParams
 from src.core.stock_master import StockMaster
 from src.kis_api.kis import KISAPI
 from src.models.stock import StockCandidate, MarketType
-
-
-# ── 호가 단위 (상한가 계산용) ──
-# KRX 주식 호가 단위: 가격대별 틱 사이즈
-def _tick_size(price: int) -> int:
-    """가격대에 따른 호가 단위 반환."""
-    if price < 2_000:
-        return 1
-    elif price < 5_000:
-        return 5
-    elif price < 20_000:
-        return 10
-    elif price < 50_000:
-        return 50
-    elif price < 200_000:
-        return 100
-    elif price < 500_000:
-        return 500
-    else:
-        return 1_000
+from src.utils.price_utils import get_tick_size
 
 
 def _upper_limit_price(prev_close: int, multiplier: float = 1.30) -> int:
     """전일종가 기준 상한가 계산 (호가단위 내림)."""
     raw = prev_close * multiplier
-    tick = _tick_size(int(raw))
+    tick = get_tick_size(int(raw))
     return int(raw // tick) * tick
 
 
@@ -209,17 +190,11 @@ class Screener:
                 logger.warning("프로그램순매수비중 조건 통과 종목 없음")
                 return []
 
-        # ── 6) 상승률 상위 1종목 선택 ──
+        # ── 6) 상승률 내림차순 정렬 후 전체 반환 (top_n 제한 없음, R-08)
         filtered.sort(key=lambda c: c.price_change_pct, reverse=True)
-        pool_size = getattr(sp, 'top_n_candidates', sp.top_n_gainers)
-        if pool_size > sp.top_n_gainers:
-            pick_count = pool_size
-        else:
-            pick_count = sp.top_n_gainers
-        top = filtered[:pick_count]
 
         targets = []
-        for cand in top:
+        for cand in filtered:
             targets.append(cand)
             logger.info(
                 f"타겟 선정: {cand.name}({cand.code}) {cand.market.value} "
