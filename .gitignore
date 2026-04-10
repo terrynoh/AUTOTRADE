@@ -62,3 +62,10 @@ Obsidian/*.zip
 
 # Agents
 .agents/
+
+# B-N 백테스트 디렉토리는 data/ 패턴 예외
+!backtest/
+!backtest/**/
+!backtest/**/*.json
+!backtest/**/*.md
+!backtest/**/*.py
