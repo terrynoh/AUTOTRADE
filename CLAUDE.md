@@ -1426,7 +1426,7 @@ R-08 (R-07 빈틈 정리 + 두 번째 매매 + 호가 단위 + 위생)
 - _is_after_buy_deadline 삭제 ✅
 - _is_in_entry_window 사용 ✅
 - settings W-13/W-14/W-15 8 값 ✅
-- price_utils 18 함수 ✅
+- price_utils 4 함수 ✅ (ISSUE-032: 초기 기록 18 은 오류)
 
 **가동 상태**: active (running), PID 60305, DRY_RUN 모드, 16:05 KST 기동
 
