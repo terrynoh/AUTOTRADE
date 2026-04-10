@@ -1,0 +1,29 @@
+[Unit]
+Description=AUTOTRADE - KOSPI/KOSDAQ automated trading (alpha-1a dry-run)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/AUTOTRADE
+Environment="PATH=/home/ubuntu/AUTOTRADE/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/home/ubuntu/AUTOTRADE/venv/bin/python -m src.main
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/home/ubuntu/AUTOTRADE/logs/autotrade.log
+StandardError=append:/home/ubuntu/AUTOTRADE/logs/autotrade.err
+
+# 보안 강화
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/ubuntu/AUTOTRADE/data /home/ubuntu/AUTOTRADE/logs /home/ubuntu/AUTOTRADE
+
+[Install]
+WantedBy=multi-user.target

@@ -43,3 +43,22 @@ nul
 # Work backups (W-N / R-N 작업 백업)
 *.pre-W*
 *.pre-R*
+
+# Work backups
+*.pre-W*
+*.pre-R*
+*.bak
+*.bak.*
+
+# Temporary files
+*.patch
+_test_names.txt
+setup.zip
+skills-lock.json
+
+# Vault backups (대용량)
+Obsidian/*.tar.gz
+Obsidian/*.zip
+
+# Agents
+.agents/
