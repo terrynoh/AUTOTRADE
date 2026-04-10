@@ -78,11 +78,6 @@ def make_fake_watchers(at: AutoTrader) -> None:
     at._coordinator.watchers = [w1, w2, w3]
     at._coordinator._active_code = "035720"  # 종목 3 이 active
     at._coordinator._screening_done = True
-    at._coordinator.set_available_cash(10_000_000)
-
-    # 대시보드 동기화 트리거
-    at._available_cash = 10_000_000
-    at._initial_cash = 10_000_000
 
     logger.info(f"가짜 watchers 3개 주입 완료")
     logger.info(f"  1) 005930 삼성전자 — WATCHING (사전고가 71,500)")

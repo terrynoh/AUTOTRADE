@@ -1,5 +1,5 @@
 # Phase별 진행상황 체크리스트
-> 최종 업데이트: 2026-04-06
+> 최종 업데이트: 2026-04-08
 
 ---
 
@@ -110,3 +110,87 @@ KIS_ACCOUNT_NO_PAPER=모의투자계좌번호
 - [ ] 에러 복구 시나리오 테스트 (WebSocket 끊김, 긴급 취소 동작)
 - [ ] 일일 손실 한도 정상 작동
 - [ ] **`TRADE_MODE=live` 전환 후 소액 실매매 시작**
+
+---
+
+## Phase α-0 — 매매 로직 누락 보강 ✅ (2026-04-07 완료)
+
+**목표:** 클라우드 이전 전에 매매 로직 명세상 누락된 두 부분 구현 + 회귀 검증
+
+- [x] **항목 1** — 10시 이전 타임아웃 가드 추가 + 주석 "25분" → "20분" 정정
+  - `monitor.py`: 타임아웃 시작 시점이 10:00 이전이면 카운트 안 함
+  - `strategy_params.yaml`: `timeout_start_after` 변수화
+- [x] **항목 2** — 청산 조건 ④ 선물 급락 WebSocket 구독 구현
+  - `kis.py`: `subscribe_futures()` + `H0IFCNT0` TR ID
+  - `main.py`: `on_futures_price()` 콜백 연결
+- [x] DRY_RUN 회귀 검증 통과
+
+---
+
+## Phase α-1a — 클라우드 lift and shift ✅ (2026-04-08 완료)
+
+**목표:** 현재 코드 그대로 Oracle Cloud에 올리고 24/7 가동
+
+- [x] Oracle Cloud VM.Standard.E2.1.Micro (ap-chuncheon-1, AMD x86_64, 956Mi + 4GB swap)
+- [x] Python 3.11.15 + venv + 의존성 설치
+- [x] SQLite WAL 모드 활성화 (`database.py`)
+- [x] SIGTERM graceful shutdown 7단계 (`main.py`)
+- [x] .env 배포 (USE_LIVE_API=false, TRADE_MODE=dry_run)
+- [x] cloudflared v2026.3.0 설치 (PoP icn05 인천)
+- [x] systemd autotrade.service (active + enabled)
+- [x] Quick Tunnel 가동 + 텔레그램 URL 발송 확인
+- [x] KIS 토큰 발급 + 선물 WebSocket 구독 확인
+
+**서버:** ubuntu@134.185.115.229
+**가동 시작:** 2026-04-08 01:02 KST
+
+---
+
+## Phase α-1b — Named Tunnel 전환 🟡 (진행 예정)
+
+**목표:** Quick Tunnel → Cloudflare Named Tunnel 전환 → 고정 URL
+
+**사전 필요 (수석님):**
+- [ ] 도메인 결정 (기존 보유 or Cloudflare Registrar 신규 구매)
+- [ ] 서브도메인 결정 (예: autotrade.example.com)
+- [ ] Cloudflare 계정 + DNS 네임서버 이전 + 전파 대기
+
+**작업 (도메인 준비 후):**
+- [ ] Phase B: src/utils/tunnel.py Named 모드 지원 여부 코드 분석
+- [ ] Phase C: Cloudflare Zero Trust Named Tunnel 생성
+- [ ] Phase D: 서버 config 파일 + .env 환경변수 추가
+- [ ] Phase E: 16:00 이후 장중 회피 무중단 전환
+- [ ] 고정 URL 브라우저 접속 확인
+
+> ⚠️ ISSUE-028 참조
+
+---
+
+## Phase α-1 (잔여) — 다중 사용자 UI 📅 (α-1b 후)
+
+**목표:** A(운영자) / B(capital provider) 권한 분리 대시보드
+
+- [ ] DB user 테이블 (id, name, role: operator | capital_provider, password_hash)
+- [ ] 로그인 페이지 + HTTP-only Cookie + Session
+- [ ] operator: 종목 입력 활성 / capital_provider: 조회만
+- [ ] audit_log 테이블 (누가 언제 무엇을 변경)
+
+---
+
+## 미해결 이슈 (α-1b 이전 해결 필수)
+
+### 🔴 ISSUE-036 — _monitors 리스트 stale + 청산 경로 단절
+- 발견: 2026-04-08
+- 심각도: CRITICAL (실거래 전환 시 position 영구 잠김 → 자본 무한 손실)
+- 근본 원인: `_on_screening` 이 `_monitors` 초기화 없이 새 monitor append + `_active_monitor`만 교체. 청산 경로가 `_active_monitor` 전용 → evicted Mon_1 position 영구 잠김
+- 영향: 실시간 손절/타임아웃/목표가 평가 안 됨, 15:20 강제청산 신호 소비 안 됨, 대시보드 카드 중복
+- 트리거: dashboard "수동 스크리닝" 재클릭 (횟수 제한 없음)
+- 수정 시기: α-1b (실거래 전환 전 필수)
+- 수정 방향 후보: CLAUDE.md 섹션 11 참조
+
+### 🟠 ISSUE-037 — can_open_position(0) 하드코딩 인수
+- 발견: 2026-04-08 (ISSUE-036 진단 중)
+- 심각도: HIGH (포지션 가드 무효, max_simultaneous_positions 설정 무력화)
+- 증상: `main.py:268` 에서 실제 포지션 수 대신 0 하드코딩 → 포지션 가드 항상 통과
+- 수정 시기: ISSUE-036 수정과 함께 (α-1b)
+

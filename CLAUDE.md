@@ -1,810 +1,1370 @@
-# CLAUDE.md — AUTOTRADE 설계 + 코딩 규칙
+# CLAUDE.md — AUTOTRADE (v3, R-08 구현 완료 + 운영 배포 기준)
 
-KOSPI/KOSDAQ 장중 단타 자동매매. 한국투자증권(KIS) Open API 기반.
-프로그램이 직접 KIS 서버에 REST/WebSocket으로 주문을 전송하는 자동매매 시스템.
+> **목적**: 이 문서는 신규 Claude 세션이 AUTOTRADE 프로젝트의 *context 연결 없이* 프로그램 정체성, 매매 철학, 아키텍처, 협업 규칙, 운영 환경을 즉시 파악할 수 있도록 작성된 self-contained 명세서.
+>
+> **버전**: v3 (2026-04-10, R-08 매매 명세 구현 완료 + 운영 배포 후)
+> **이전 버전**: v2 (2026-04-09, R-07 종결 기준), v1 (프로젝트 시작 시점)
+> **현재 단계**: R-08 구현 완료, DRY_RUN 운영 중. 4/13 첫 거래일 검증 대기
 
 ---
 
-## 1. 전략 로직 (redesign phase 동결본, 2026-04-08)
+## 목차
 
-> **모든 수치는 `config/strategy_params.yaml`에서 로드.** 코드에 매직넘버 직접 사용 금지.
+1. 프로그램 정체성
+2. 매매 명세 (R-08, 동결본)
+3. 아키텍처
+4. 파일 구조 + 책임
+5. 자료구조
+6. 매매 흐름 (시각별)
+7. 개발 / 운영 환경
+8. 협업 규칙 (수석님 ↔ Claude)
+9. 4 페르소나
+10. W / M / R 워크플로우
+11. 이력 + 사고 이력
+12. R-08 빈틈 카탈로그 + 백로그
+13. 향후 확장 방향
+14. vault 참조 원칙
+15. 금지 사항
 
-### 입력 채널 (택 1)
+---
 
-- **대시보드 UI**: 종목 입력 → "종목 설정" → "수동 스크리닝" (관리자 토큰 필요)
-- **텔레그램 봇**: `/target 006400,247540,020150` 또는 `/target 삼성SDI,에코프로비엠` (인가된 chat_id만)
-- 양 채널 모두 종목코드/종목명 입력 지원 (종목 마스터 변환)
+## 1. 프로그램 정체성
 
-### 자동 검증 필터 (순서대로)
+### 이름
+**AUTOTRADE** — 한국 주식 자동 매매 시스템 (단타)
 
-| 순서 | 조건 | yaml 키 |
-|------|------|---------|
-| 1 | 상승률 > 0% | — |
-| 2 | 거래대금 ≥ 500억 | `screening.volume_min` |
-| 3 | 등락률 < 20% (상한가 미도달) | `infra.upper_limit_check_pct` |
-| 4 | 프로그램순매수비중 ≥ 5% | `screening.program_net_buy_ratio_min` |
-| 5 | 상승률 상위 3종목 트래킹 | `screening.top_n_gainers` (= 3) |
+### 운영자
+수석님 (K수석). Bangkok 거주, 한국 시니어 소프트웨어 엔지니어. ~18~20년 대규모 온라인 서비스 인프라/API 통합/스케줄링/DB/배포 경험. 강점: 시스템 엔지니어링. 학습 중: 매매/금융 도메인. Korean capital markets 에 대한 깊은 이해 + 독립 분석력.
 
-```
-프로그램순매수비중(%) = (프로그램 순매수금액 / 누적 거래대금) × 100
-```
+### 목적
+KIS (한국투자증권) Open API 를 통해 KOSPI/KOSDAQ 종목을 *매일 장중 90분 윈도우* (09:50 ~ 11:20) 안에서 *자동 단타 매매*.
 
-### 자동 스크리닝 (폴백)
+### 매매 철학 (2026-04-09 수석님 확정)
 
-**삭제.** 더 이상 사용하지 않음.
+**상승 메커니즘**:
+- 외인/기관 지지 (바닥 방어) → 개인 주목 → 개인 매수 유입 → 상승
+- 외인/기관은 바닥만 만들고 *상승 주도 아님*
+- 개인 매수 유입이 진짜 상승의 동력
 
-### 신고가 감시 (09:50~)
+**시각별 의미**:
+- **09:00 ~ 09:50** = 지지 형성 구간 (노이즈, 매매 대상 아님)
+- **09:50** = 지지 구조 확인 시점 (스크리닝)
+- **09:55** = 신고가 감시 시작 ("신고가" 정의 = 09:50 스크리닝 통과 이후 당일 최고가, 09:50 이전 고가는 신호 아님)
+- **09:55 pre_955_high 5분 버퍼** = 급등 추세성 검증 윈도우 (의도된 설계)
+- **10:00 ~ 10:55** = 신규 진입 발주 윈도우 (반등 메커니즘 작동)
+- **10:55** = 매수 발주 마감 (entry_deadline, 11:00 - 5분 실행 버퍼)
+- **11:00** = 반등 메커니즘 소멸 (last-line defense)
+- **11:20** = 강제 청산 (당일 진입 + 당일 청산 원칙)
 
-- 스크리닝 통과 3종목의 실시간 체결가를 WebSocket **동시** 구독
-- 09:50 이후 종목별 신고가 추적
-- 신고가 달성 → intraday high 추적
+**보수적 방어**:
+- 신고가 + 1% 하락 + 매수가 도달 모두 충족되어야 매수
+- 조건 미충족 시 *매매 0건도 수용*
+- 자본 보호 우선 (손절가는 고가 대비 절대값)
 
-### 매수 — 고가 확정 트리거 + 지정가 2건
+### 운영 모드
+- **DRY_RUN (현재 기본)** — 실거래 KIS API + 가상 체결 (simulate_fills). 자본 위험 0
+- **LIVE (수석님 결정 시점)** — 실거래 KIS API + 실제 주문. 단계적 자본 증가 계획
 
-**고가 확정 트리거**: 고가에서 **1% 하락** → 고가 확정 → 매수 주문 진입.
+---
 
-| 시장 | 1차 매수 (예수금 50%) | 2차 매수 (예수금 50%) | yaml 키 |
-|------|----------------------|----------------------|---------|
-| KOSPI | 고가 대비 -2.7% | 고가 대비 -3.3% | `entry.kospi_buy1_pct`, `entry.kospi_buy2_pct` |
-| KOSDAQ | 고가 대비 -4% | 고가 대비 -5% | `entry.kosdaq_buy1_pct`, `entry.kosdaq_buy2_pct` |
+## 2. 매매 명세 (R-08 동결본)
 
-**고가 갱신 시 주문 재조정** (watcher 상태에만 적용):
-1. 현재가가 기존 고가 갱신 → 미체결 매수 주문 전량 취소
-2. 새 고가에서 1% 하락까지 대기
-3. 1% 하락 확인 → 새 고가 기준 매수 지정가 2건 재주문
-4. YES/NO 플래그 재평가
+> 이 명세는 `config/strategy_params.yaml` 에 인코딩되어 있으며, R-08 의 W-11~W-15 단계에서 큰 변경이 적용됨. 임의 변경 금지 — 변경 시 새 R-N redesign 필요.
 
-**매수 마감**: 10:55 KST (이후 신규 매수 발주 금지)
-
-### 매매 동시성 규칙 — single active rotation
-
-**5단계 흐름**:
-1. 09:50 스크리닝 → A/B/C 결정 + 각자 watcher 가동
-2. 신고가 갱신 시 갱신 로직 ABC 모두 적용 (목표진입가격 재계산)
-   ※ 단, active 진입한 종목은 1차 체결 순간부터 갱신 로직 제외
-3. ABC 중 조건 충족 종목이 1차 매수 → active position 진입
-4. 나머지 2종목은 매수대기 YES/NO 매 틱 평가
-5. 신고가 갱신 시 목표진입가격 + YES/NO 함께 재계산
-
-**watcher 상태**:
-- `WATCHING`: 1% 하락 트리거 미발동, 목표진입가격 없음
-- `READY` (YES): 목표진입가격 결정됨, 현재가가 (1차 ~ 손절선) 사이
-- `PASSED` (NO): 현재가가 1차 매수가 위로 올라감 (자리 지나감)
-  → 신고가 추적 계속, 새 신고가 갱신 시 READY 복귀 가능
-- `DROPPED` (terminal): 현재가가 손절선 아래로 떨어짐
-  → 그날 그 종목 매매 안 함. 영구 폐기.
-  → 시세 수신/신고가 추적 중단. 슬롯은 비어있는 채로.
-
-**active position (잠금 상태)**:
-- 1차 체결 순간부터 매매 시나리오 동결
-  - 신고가, 목표진입가격, 손절가 모두 1차 체결 시점 값으로 고정
-  - 신고가 갱신 로직 적용 안 함
-- 청산은 동결된 시나리오 위에서 5조건 평가
-
-**active 청산 시점 T의 동작**:
-- 나머지 watcher 중 YES인 종목 평가
-- YES 1개 → 즉시 진입
-- YES 2개 → 자기 1차 매수가에 더 가까운 종목 진입
-  (정확히 같은 거리는 코드 결정성에 위임, 명세 미정의)
-- 모두 NO → 대기 (이후 YES가 되는 종목 자동 진입)
-
-### 청산 — 먼저 도달하는 조건이 실행
-
-| 조건 | 기준 | 실행 |
-|------|------|------|
-| ① 하드 손절 | KOSPI -4.1% / KOSDAQ -6.15% | 즉시 시장가 |
-| ② 타임아웃 | 눌림 최저가 시점부터 20분, 갱신 시 리셋 | 전량 |
-| ③ 목표가 | (고가 + 눌림 최저가) / 2 | 전량 |
-| ④ 선물 급락 | 종목 고점 시각 선물가 대비 -1% | 전량 청산 |
-| ⑤ 강제 청산 | 11:20 KST | 전량 |
-
-### 매매 윈도우
+### 시각 트리거
 
 | 시각 | 이벤트 |
-|------|--------|
-| 09:50 | 신고가 감시 시작 (3종목 watcher 가동) |
-| 10:55 | 신규 매수 마감 |
-| 11:20 | 일괄 강제 청산 (⑤), 모든 watcher 종료 |
+|---|---|
+| 06:40 | cron + send_dashboard_url.py → autotrade.service 가동 |
+| 09:30 ~ 09:50 | 수석님 종목 입력 (대시보드, 개수 제한 없음) |
+| 09:50 | `_schedule_screening` 정규 트리거 → 종목 스크리닝 + Watcher N개 가동 (`is_final=True`) |
+| 09:55 | 신고가 감시 시작 (Watcher 의 `intraday_high` 추적) |
+| **10:00 ~ 10:55** | **신규 진입 발주 윈도우** (`_is_in_entry_window`) |
+| 10:55 | `entry_deadline` — 신규 진입 발주 마감 (`on_buy_deadline`, 미매수 Watcher → SKIPPED) |
+| **11:00** | **매매 철학 시한** (`repeat_end`, Trader last-line defense, 어떤 경로로도 신규 발주 거부) |
+| 11:20 | `force_liquidate_time` — 잔여 ENTERED 강제 청산 |
+| 장 마감 | `_schedule_market_close` → 일일 리포트 텔레그램 발송 |
 
-### 포지션 관리
+### 유니버스 + 스크리닝 (R-08 변경)
 
-- 투자금: 예수금 기준 (`config/strategy_params.yaml`)
-- 매수: 항상 예수금 풀 (1차 50% + 2차 50%)
-- 다른 종목에 자본 분할 없음
+- **수동 입력 개수 제한 없음** (R-07 의 `top_n_gainers=3`, `top_n_candidates` 모두 삭제)
+- **09:50 단일 정규 스크리닝** (`is_final=True` 가드 활성)
+- **09:50 이전 수동 스크리닝 여러 번 허용** (`is_final=False`, 덮어쓰기 가능)
+- **active 상태에서 재스크리닝 차단** (포지션 보호)
+- **Watcher 동적 편입 없음** (임시, R-09+ 검토 영역)
 
-### 데이터 저장 정책
+### 매수 조건 (단계별)
 
-- 모든 틱 저장 (백테스트 가능 설계)
-- 자동 삭제: 시간 기반 1주일 보관
-- 의사결정/주문/체결/청산 로그: 영구 보관 (자동 삭제 대상 아님)
+```
+[Watcher 상태 전이]
+
+WATCHING
+  ↓ 신고가 달성 + 고가 대비 1% 하락 확인
+TRIGGERED
+  ↓ 목표 매수가 계산 완료 (W-12-rev2: KRX 호가 단위 보정)
+  ↓ 현재가가 매수 범위 내 + 진입 윈도우 안 (10:00~10:55)
+READY
+  ↓ active 슬롯 확보 + 매수 발주 + 체결 (Trader)
+ENTERED
+  ↓ 5조건 중 하나 충족
+EXITED
+
+또는 TRIGGERED 후 20분 (high_confirm_timeout_min, W-13) 미체결 → SKIPPED
+또는 10:55 도달 → SKIPPED (entry_deadline)
+또는 현재가가 손절선 이하 → DROPPED (terminal)
+또는 신고가 갱신 시 → WATCHING 복귀 (재트리거 가능)
+```
+
+### 매수가 (W-14 변경 후 yaml 동결값)
+
+| 시장 | 1차 매수가 | 2차 매수가 | 분할 간격 |
+|---|---|---|---|
+| KOSPI | 고가 × (1 - 2.5/100) | 고가 × (1 - 3.5/100) | 1.0% |
+| KOSDAQ | 고가 × (1 - 3.5/100) | 고가 × (1 - 5.5/100) | 2.0% |
+
+**W-14 의도** (수석님 확정 2026-04-10): 1차 진입 빈도 ↑. 1차를 얕게 (덜 떨어진 시점에 매수), 2차를 깊게 (분할 간격 확대). 평균가는 동일 (KOSPI 3.0%, KOSDAQ 4.5%).
+
+**호가 단위 보정** (W-12-rev2): KRX 2023-01-25 개편 후 기준 (대신증권 공고 출처). KOSPI/KOSDAQ 동일.
+- < 2,000 = 1
+- < 5,000 = 5
+- < 20,000 = 10
+- < 50,000 = 50
+- < 200,000 = 100
+- < 500,000 = 500
+- ≥ 500,000 = 1,000
+
+매수가는 floor (안전 방향 = 더 깊은 진입), 손절가는 ceil (안전 방향 = 더 빨리 손절).
+
+### 5 청산 조건 (Watcher._handle_entered)
+
+| 조건 | 임계값 |
+|---|---|
+| 하드 손절 | 고가 대비 KOSPI -4.1% / KOSDAQ -6.15% (호가 단위 ceil) |
+| 타임아웃 | 매수 후 저점 갱신 후 20분 경과 (`exit.timeout_from_low_min = 20`) |
+| 목표가 도달 | 목표가 = (confirmed_high + post_entry_low) / 2 (호가 단위 floor) |
+| 선물 급락 | KOSPI200 선물 -1% (`exit.futures_drop_pct = 1.0`) |
+| 강제 청산 | 11:20 도달 (`exit.force_liquidate_time`) |
+
+### 다음 종목 매매 (R-08 신규, W-11d/e)
+
+R-08 의 핵심 변경 — 첫 종목 매매가 종료된 후 두 번째 종목으로 자동 이행:
+
+**T1 (첫 종목 ENTERED)**: `_active_code` 가 첫 종목 코드로 설정됨.
+
+**T2 (첫 종목 buy2 체결)**:
+- Watcher.on_buy_filled 의 buy2 분기에서 `_t2_callback` 호출
+- Coordinator._on_t2 진입
+- 진입 윈도우 (10:00~10:55) 안인지 확인
+- YES 후보 (state == READY) 수집
+- **두 번째 매매 tiebreaker**: KOSPI 눌림폭 ≥ 3.8% / KOSDAQ ≥ 5.6% 필터 + 눌림폭 최대
+- 통과 종목을 `_reserved_snapshot` 에 저장 (ReservationSnapshot dataclass)
+- 매매 의도: "손절 직전까지 떨어진 종목 = 더 깊은 진입 = R:R 비대칭 확보"
+
+**T3 (첫 종목 EXITED)**:
+- main.py._on_exit_done 에서 `await coordinator.handle_t3(now_kst())` 위임
+- 진입 윈도우 (10:00~10:55) 체크 — 벗어나면 예약 폐기
+- **예약 재확인 (엄격)**:
+  1. 종목이 watchers 에 존재
+  2. is_yes (state == READY)
+  3. not is_terminal
+  4. target_buy1_price 가 T2 시점 값과 동일 (재계산되지 않음)
+  5. tiebreaker 조건 여전히 충족
+- 재확인 통과 → 예약 종목 진입
+- 재확인 실패 → 예약 폐기 + 재판정 (yes_watchers 재수집 + tiebreaker)
+- 재판정 0개 → 즉시 포기
+
+**N차 매매 연쇄**: 두 번째 매매에서도 T2/T3 가 발생하면 세 번째, 네 번째 매매가 이어짐. 진입 윈도우 (10:00~10:55) 가 끝나면 자연스럽게 멈춤. `daily_loss_limit_pct = 3.0%` 가 누적 손실 안전망.
+
+**관련 yaml 키** (multi_trade 섹션):
+- `enabled: true` (R-08 활성화)
+- `repeat_start: "10:00"` (진입 윈도우 시작)
+- `repeat_end: "11:00"` (매매 철학 시한, last-line defense)
+- `profit_only: false` (손익 무관 다음 진입)
+- `kospi_next_entry_max_pct: 3.8` (두 번째 매매 tiebreaker 임계)
+- `kosdaq_next_entry_max_pct: 5.6`
+
+### 운영 파라미터 (W-11~W-15 후)
+
+- **high_confirm_drop_pct**: 1.0 (신고가 후 1% 하락 시 TRIGGERED)
+- **high_confirm_timeout_min**: 20 (W-13: 10→20, 매수 기회 확보)
+- **entry_deadline**: "10:55"
+- **repeat_start**: "10:00" (multi_trade)
+- **repeat_end**: "11:00" (multi_trade, last-line defense)
+- **force_liquidate_time**: "11:20"
+- **kospi_hard_stop_pct**: 4.1
+- **kosdaq_hard_stop_pct**: 6.15
+- **futures_drop_pct**: 1.0
+- **exit.timeout_start_after_kst**: "10:00"
+- **kospi_next_entry_max_pct**: 3.8 (두 번째 매매 tiebreaker)
+- **kosdaq_next_entry_max_pct**: 5.6
+- **daily_loss_limit_pct**: 3.0 (안전망)
+- **max_position_size_pct**: (yaml 참조)
+
+### yaml 전체 구조 (6개 섹션)
+
+| 섹션 | 주요 키 |
+|---|---|
+| `screening` | screening_time, volume_min, program_net_buy_ratio_min, max_change_pct |
+| `entry` | new_high_watch_start, entry_deadline, high_confirm_drop_pct, high_confirm_timeout_min, kospi/kosdaq_buy1/2_pct, buy1/2_ratio |
+| `exit` | profit_target_recovery_pct, timeout_from_low_min, kospi/kosdaq_hard_stop_pct, futures_drop_pct, timeout_start_after_kst, force_liquidate_time |
+| `order` | slippage_ticks, unfilled_timeout_sec, max_simultaneous_positions |
+| `risk` | daily_loss_limit_pct, max_position_size_pct |
+| `multi_trade` | enabled, repeat_start, repeat_end, profit_only, kospi/kosdaq_next_entry_max_pct |
+| `api` / `market` / `infra` | rate_limit, 시장 시간, HTTP/WS 타임아웃, 대시보드 버퍼, 로그 rotation 등 (별도 Pydantic 클래스 없음) |
+
+> R-07 의 `top_n_gainers`, `top_n_candidates`, `max_daily_trades` 는 R-08 에서 삭제됨.
 
 ---
 
-## 2. 기술 스택 & 아키텍처
+## 3. 아키텍처
 
-### KIS Open API
-
-| 용도 | 엔드포인트 | TR ID |
-|------|-----------|-------|
-| 주식현재가 | /uapi/domestic-stock/v1/quotations/inquire-price | FHKST01010100 |
-| 거래량순위 | /uapi/domestic-stock/v1/quotations/volume-rank | FHPST01710000 |
-| 프로그램매매(당일) | /uapi/domestic-stock/v1/quotations/comp-program-trade-today | FHPPG04600101 |
-| 분봉차트 | /uapi/domestic-stock/v1/quotations/inquire-time-itemchartprice | FHKST03010200 |
-| 현금매수 | /uapi/domestic-stock/v1/trading/order-cash | TTTC0012U (모의: VTTC0012U) |
-| 현금매도 | /uapi/domestic-stock/v1/trading/order-cash | TTTC0011U (모의: VTTC0011U) |
-| 잔고조회 | /uapi/domestic-stock/v1/trading/inquire-balance | TTTC8434R (모의: VTTC8434R) |
-| 실시간체결 | WebSocket H0STCNT0 | — |
-
-- **Rate Limit**: 조회 초당 20건 (모의투자 2건) — asyncio.Semaphore로 제한
-- **OAuth2**: app_key + app_secret → 24시간 토큰, 만료 1시간 전 자동 갱신
-- **모의투자 URL**: `https://openapivts.koreainvestment.com:29443`
-- **실거래 URL**: `https://openapi.koreainvestment.com:9443`
-
-### 기술 스택
-
-| 항목 | 선택 |
-|------|------|
-| 언어 | Python 3.11+, 64bit |
-| 이벤트 루프 | asyncio (`asyncio.run()`이 메인 루프) |
-| HTTP | aiohttp |
-| WebSocket | websockets |
-| 보조 데이터 | pykrx (거래일 확인 + 백테스트 과거 데이터만. 장중 호출 금지) |
-| 데이터 처리 | pandas |
-| DB | SQLite |
-| 로깅 | loguru |
-| 설정 | pydantic-settings + .env |
-| 알림 | python-telegram-bot |
-| 테스트 | pytest + pytest-asyncio |
-
-### asyncio 이벤트 루프 구조
+### 컴포넌트 다이어그램
 
 ```
-asyncio.run() → AutoTrader.run()
-  → asyncio.gather(스케줄 태스크들)
-  → KIS REST API (시세/주문)
-  → KIS WebSocket (실시간 체결가)
+┌─────────────────────────────────────────────────────────────┐
+│                      AutoTrader (main.py)                    │
+│  - run() : 전체 매매 루프                                    │
+│  - _schedule_screening : 09:50 트리거                        │
+│  - _schedule_buy_deadline : 10:55 트리거                     │
+│  - _schedule_force_liquidate : 11:20 트리거                  │
+│  - _schedule_market_close : 장 마감 트리거                   │
+│  - _on_screening() : 스크리닝 → Coordinator 위임             │
+│  - _on_exit_done() : 청산 체결 → P&L → DB → Telegram         │
+│                      → handle_t3 위임 (W-11e)                │
+│  - _loop : asyncio loop (필드, Dashboard 가 참조)            │
+└─────────────────────────────────────────────────────────────┘
+         │              │              │              │
+         ▼              ▼              ▼              ▼
+    ┌────────┐    ┌──────────┐   ┌────────┐    ┌──────────┐
+    │Screener│    │Coordinator│   │ Trader │    │ Notifier │
+    └────────┘    └──────────┘   └────────┘    └──────────┘
+                        │
+                        ├── Watcher (N instances, 09:50 가동)
+                        │     - state: WatcherState (8 상태)
+                        │     - intraday_high, target_buy1/2_price, hard_stop_price_value
+                        │     - on_tick, _handle_watching, _handle_triggered
+                        │     - _handle_entered, _check_timeout, _check_futures_drop
+                        │     - _t2_callback (W-11c, T2 콜백)
+                        │     - is_yes @property (W-11c-hotfix, READY only)
+                        │     - get_pullback_pct (W-11c)
+                        │
+                        ├── single active rotation
+                        │     on_buy_deadline, on_force_liquidate
+                        │
+                        └── 두 번째 매매 예약 (W-11d 신규)
+                              _reserved_snapshot: ReservationSnapshot
+                              _on_t2 → _try_reserve_at_t2 → _tiebreaker_for_next
+                              handle_t3 → _verify_reservation_at_t3
+                              _is_in_entry_window
+
+┌─────────────────────────────────────────────────────────────┐
+│                    Dashboard (app.py, FastAPI)               │
+│  - GET  /                     : HTML 렌더링                  │
+│  - GET  /api/status           : 현재 상태 JSON               │
+│  - GET  /api/search-stock     : 종목 검색 (StockMaster)      │
+│  - POST /api/set-targets      : 종목 입력 (StockMaster 검증) │
+│  - POST /api/run-manual-screening : 수동 스크리닝            │
+│    (run_coroutine_threadsafe 로 AutoTrader loop 위임)        │
+│  - WebSocket /ws              : 실시간 상태 push             │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│                     KIS API (kis_api/)                       │
+│  - aiohttp ClientSession (async)                             │
+│  - REST + WebSocket (실시세 / 체결)                          │
+│  - 토큰 자동 갱신 + 캐시                                     │
+└─────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────┐
+│                   외부 인프라                                 │
+│  - Oracle Cloud Seoul (Ubuntu 운영)                          │
+│  - Cloudflare Quick Tunnel (대시보드 외부 접속)              │
+│  - Telegram Bot (알림 + 봇 명령)                             │
+│  - cron (06:40 자동 가동)                                    │
+│  - systemd (autotrade.service)                               │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### 데이터 소스 분리
+### 핵심 컴포넌트
 
-| 시점 | 소스 | 용도 |
-|------|------|------|
-| 09:00 시작 시 | pykrx (1회) | 거래일 확인 |
-| 09:30 종목 입력 | 대시보드 UI / 텔레그램 | 사용자 수동 입력 (5~10종목) |
-| 09:50 스크리닝 | KIS REST API | 현재가, 거래대금, 프로그램매매 검증 |
-| 09:55~ 실시간 | KIS WebSocket | 신고가 감시, 체결가, 선물 |
-| 주문 | KIS REST API | 매수/매도/취소 |
+#### AutoTrader (src/main.py)
+- **책임**: 전체 매매 루프 + 외부 I/O 오케스트레이션
+- **주요 필드**: `_loop`, `_available_cash`, `_initial_cash`, `_coordinator`, `_stock_master`, `_manual_codes`, `api`, `trader`, `screener`, `notifier`, `_tunnel`
+- **주요 메서드**: `run`, `_schedule_screening`, `_schedule_buy_deadline`, `_schedule_force_liquidate`, `_schedule_market_close`, `_on_screening`, `_on_exit_done`, `_build_trade_record`, `_get_status`, `set_manual_codes`, `clear_manual_codes`, `get_manual_codes`, `_stop_trading`
+- **W-11e 변경**: `_on_exit_done` 의 6단계 (trader.reset) 와 7단계 (대시보드 동기화) 사이에 `self._coordinator._active_code = None` + `await self._coordinator.handle_t3(now_kst())` 추가
+- **라인 수**: 약 980행 (W-11e 후 +약 5)
 
-### 3단계 매매 모드
+#### WatcherCoordinator (src/core/watcher.py)
+- **책임**: N Watcher 병렬 관리 + 시세 라우팅 + single active rotation + 두 번째 매매 예약
+- **R-07 메서드**: `start_screening`, `on_realtime_price`, `on_realtime_futures`, `_process_signals`, `_execute_buy`, `_execute_exit`, `on_buy_filled`, `on_sell_filled`, `set_available_cash`, `set_exit_callback`, `on_buy_deadline`, `on_force_liquidate`
+- **R-08 신규 메서드 (W-11d, +387 라인)**:
+  - `_on_t2(code, ts)` — Watcher 의 T2 (buy2 체결) 콜백, 동기 함수
+  - `_try_reserve_at_t2(ts)` — YES 후보 수집 + tiebreaker → ReservationSnapshot 반환
+  - `_tiebreaker_for_next(candidates)` — KOSPI 3.8% / KOSDAQ 5.6% 필터 + 눌림폭 최대
+  - `_verify_reservation_at_t3(ts)` — 5항목 엄격 재확인
+  - `_is_in_entry_window(ts)` — 진입 윈도우 (10:00~10:55) 체크
+  - `handle_t3(ts)` — async, T3 진입 게이트 (예약 진입 또는 재판정)
+- **W-11d 변경**: `start_screening` 시그니처 추가 (`is_final: bool = False`, keyword-only), active 차단, `_t2_callback = self._on_t2` 주입
+- **W-11e 변경**: `_process_signals` 의 `_is_after_buy_deadline` → `not _is_in_entry_window` 로 통합 (`_is_after_buy_deadline` 메서드 제거)
+- **상태**: `watchers: list[Watcher]`, `_active_code`, `_screening_done`, `_reserved_snapshot`, `_repeat_start`, `_repeat_end`, `_entry_deadline`
 
-- `dry_run`: 주문 없이 시그널 로깅 + 가상 체결/P&L 추적 (완전한 페이퍼 트레이딩 엔진)
-- `paper`: KIS 모의투자 계좌로 실제 주문
-- `live`: 실매매 계좌 (충분한 검증 후)
+#### Watcher (src/core/watcher.py)
+- **책임**: 단일 종목의 매매 수명주기 관리 (WATCHING → ... → EXITED / SKIPPED / DROPPED)
+- **8 상태**: WATCHING, TRIGGERED, READY, PASSED, DROPPED, ENTERED, EXITED, SKIPPED
+- **주요 메서드**: `on_tick`, `_handle_watching`, `_fire_trigger`, `_handle_triggered`, `_evaluate_target`, `_check_high_confirm_timeout`, `_handle_entered`, `_check_timeout`, `_check_futures_drop`, `_emit_exit`, `force_exit`, `on_buy_filled`, `update_intraday_high`, `update_post_entry_low`
+- **R-08 신규 (W-11c)**:
+  - `_t2_callback: Optional[Callable[[str, datetime], None]]` 필드
+  - `is_yes` @property — `state == READY` 만 True (W-11c-hotfix)
+  - `get_pullback_pct()` — confirmed_high 우선, 없으면 intraday_high 기준 눌림폭 계산
+  - `on_buy_filled` 의 buy2 분기에서 `_t2_callback` 호출 (try/except 격리)
+- **W-12-rev2**: `_fire_trigger` 의 매수가 계산에 `floor_to_tick`/`ceil_to_tick` 적용
+- **라인 수**: 1190행 (R-07 시점 768행 → +422 행)
+
+#### Trader (src/core/trader.py)
+- **책임**: 주문 발주 + 체결 콜백 (Watcher 호환 시그니처)
+- **주요 메서드**: `place_buy_orders`, `_send_buy_order`, `cancel_buy_orders`, `execute_exit`, `on_buy_filled`, `simulate_fills`, `has_position`, `get_pnl`, `reset`
+- **W-11e 신규**: `place_buy_orders` 진입부에 last-line defense 추가:
+  ```python
+  _now = now_kst()
+  _repeat_end_time = dtime.fromisoformat(self.params.multi_trade.repeat_end)
+  if _now.time() >= _repeat_end_time:
+      logger.error(f"CRITICAL: 매매 철학 시한 위반 시도 ... 발주 거부")
+      return
+  ```
+- **DRY_RUN 모드**: `simulate_fills` 패턴으로 가상 체결
+
+#### Screener (src/core/screener.py)
+- **책임**: 수동 스크리닝 → `list[StockCandidate]` 반환
+- **주요 메서드**: `run_manual(codes)`
+- **R-08 변경**: `top_n_gainers` 슬라이싱 삭제, 통과 종목 전부 반환
+- **W-12-rev2**: `_tick_size` 헬퍼 제거 → `price_utils.py` 로 분리 + import
+
+#### StockMaster (src/core/stock_master.py)
+- **책임**: 종목 코드 ↔ 종목명 양방향 검증 (로컬 캐시, KIS API 호출 X)
+- **주요 메서드**: `lookup_name(code)`, `lookup_code(name_or_code)`, `__len__`
+- **데이터 source**: `config/stock_master.json` (약 2,773 종목, 수동 갱신)
+
+#### RiskManager (src/core/risk_manager.py)
+- **책임**: 손절가 계산, 일일 손실 한도, 포지션 가용 확인
+- **주요 메서드**: `calculate_available_cash`, `check_daily_loss_limit`, `can_open_position`, `record_trade_result`, `reset_daily`
+
+#### price_utils (src/utils/price_utils.py, W-12-rev2 신규)
+- **책임**: KRX 호가 단위 보정 헬퍼 (2023-01-25 개편 후 기준)
+- **주요 함수**: `tick_size(price)`, `floor_to_tick(price)`, `ceil_to_tick(price)`
+- **사용처**: screener.py (스크리닝 시 가격 표준화), watcher.py (`_fire_trigger` 의 매수가/손절가/목표가 계산)
+- **검증**: 삼성전기 583,000 → 1차 567,000 / 2차 563,000 / 손절 560,000 (1,000원 단위)
+
+#### Notifier (src/utils/notifier.py)
+- **책임**: Telegram 봇 + 시스템 알림
+- **주요 메서드**: `notify_system`, `notify_entry`, `notify_exit`, `notify_skip`, `notify_error`, `notify_screening_result`, `notify_daily_report`, `setup_commands`, `start_polling`, `stop_polling`
+- **봇 명령**: `/target`, `/clear`, `/screen`, `/status`, `/stop`, `/help`
+
+#### Dashboard (src/dashboard/app.py)
+- **책임**: FastAPI 기반 실시간 대시보드
+- **주요 endpoint**:
+  - `GET /` (HTML 렌더링)
+  - `GET /api/status` (현재 상태 JSON)
+  - `POST /api/set-targets` (W-09 정정 — StockMaster 로컬 검증)
+  - `GET /api/search-stock` (종목 검색, StockMaster)
+  - `POST /api/run-manual-screening` (W-09 정정 — run_coroutine_threadsafe 위임)
+  - `WebSocket /ws` (실시간 상태 push)
+- **R-08 백로그 #25**: screening broadcast 경로 `.stock` 잔존 참조 (StockCandidate 객체 처리 누락)
+
+### 모듈 의존성 그래프
+
+```
+main.py
+  ├── config.settings (Settings, StrategyParams)
+  ├── kis_api.kis (KISAPI)
+  ├── kis_api.constants (WS_TR_PRICE, WS_TR_FUTURES)
+  ├── core.screener (Screener)
+  ├── core.stock_master (StockMaster)
+  ├── core.trader (Trader)
+  ├── core.risk_manager (RiskManager)
+  ├── core.watcher (Watcher, WatcherCoordinator, ReservationSnapshot)
+  ├── models.trade (TradeRecord, DailySummary, ExitReason)
+  ├── storage.database (Database)
+  ├── utils.notifier (Notifier)
+  ├── utils.tunnel (CloudflareTunnel)
+  └── utils.market_calendar (now_kst)
+
+core/watcher.py
+  ├── config.settings (StrategyParams)
+  ├── models.stock (MarketType)
+  └── utils.price_utils (floor_to_tick, ceil_to_tick)  # W-12-rev2
+
+core/trader.py
+  ├── config.settings (Settings, StrategyParams)
+  ├── kis_api.kis (KISAPI)
+  ├── kis_api.constants (ORDER_TYPE_LIMIT, ORDER_TYPE_MARKET)
+  ├── core.watcher (Watcher)
+  ├── models.order (Order, OrderSide, OrderStatus, Position)
+  └── utils.market_calendar (now_kst)
+
+core/screener.py
+  ├── config.settings (StrategyParams)
+  ├── core.stock_master (StockMaster)
+  ├── kis_api.kis (KISAPI)
+  ├── models.stock (StockCandidate, MarketType)
+  └── utils.price_utils (floor_to_tick, ceil_to_tick)  # W-12-rev2
+
+dashboard/app.py
+  ├── utils.market_calendar (now_kst)
+  └── core.watcher (Watcher)
+
+utils/price_utils.py → 외부 의존성 없음 (self-contained)
+core/stock_master.py → 외부 의존성 없음 (self-contained)
+utils/notifier.py → 외부 의존성 없음 (self-contained)
+```
 
 ---
 
-## 3. 프로젝트 구조
+## 4. 파일 구조 + 책임
 
 ```
-C:\Users\terryn\AUTOTRADE\
-├── .env                          # API 키, 계좌번호 (커밋 금지)
-├── .env.example
-├── requirements.txt
-├── verify_phase1.py              # Phase 1 검증 스크립트
-├── launcher.py                   # 09:00 KST 자동 시작 + 텔레그램 URL 발송
-├── run_backtest.py               # KIS API 분봉 백테스트 실행
-├── config/
-│   ├── settings.py               # Pydantic Settings
-│   ├── strategy_params.yaml      # 전략 파라미터 (튜닝용)
-│   └── stock_master.json         # 전체 종목 마스터 (KOSPI+KOSDAQ ~2800종목)
+AUTOTRADE/
 ├── src/
-│   ├── main.py                   # 진입점 (asyncio + AutoTrader)
-│   ├── kis_api/
-│   │   ├── kis.py                # KIS REST + WebSocket 클라이언트
-│   │   ├── api_handlers.py       # API 응답 파싱
-│   │   └── constants.py          # 엔드포인트, TR ID
+│   ├── main.py                    # AutoTrader 엔진 (약 980행)
 │   ├── core/
-│   │   ├── screener.py           # 스크리닝 (수동입력 검증)
-│   │   ├── watcher.py            # Watcher (종목별 상태머신) + WatcherCoordinator (3종목 관리)
-│   │   ├── stock_master.py       # 종목 마스터 (코드↔종목명 변환)
-│   │   ├── trader.py             # 주문 실행
-│   │   └── risk_manager.py       # 손절, 포지션 관리, 강제 청산
+│   │   ├── watcher.py             # Watcher + WatcherCoordinator + ReservationSnapshot (1190행)
+│   │   ├── trader.py              # Trader (약 290행, +last-line defense)
+│   │   ├── screener.py            # Screener (약 230행)
+│   │   ├── stock_master.py        # StockMaster (70행)
+│   │   └── risk_manager.py        # RiskManager
+│   │
 │   ├── models/
-│   │   ├── stock.py              # StockCandidate, MarketType
-│   │   ├── order.py              # Order, Position
-│   │   └── trade.py              # TradeRecord, DailySummary
+│   │   ├── stock.py               # StockCandidate, MarketType (42행)
+│   │   ├── order.py               # Order, OrderSide, OrderStatus, Position (108행)
+│   │   └── trade.py               # TradeRecord, DailySummary, ExitReason (105행)
+│   │
+│   ├── kis_api/
+│   │   ├── kis.py                 # KIS REST + WebSocket 통합 (889행)
+│   │   ├── api_handlers.py        # API 응답 파싱 핸들러 (114행)
+│   │   └── constants.py           # 엔드포인트, TR ID, 상수 (92행)
+│   │
 │   ├── storage/
-│   │   └── database.py           # SQLite CRUD
+│   │   └── database.py            # SQLite CRUD (201행)
+│   │
+│   ├── dashboard/
+│   │   └── app.py                 # FastAPI 대시보드 (444행)
+│   │
 │   ├── backtest/
-│   │   ├── data_collector.py     # pykrx 과거 데이터 수집
-│   │   ├── simulator.py          # 전략 시뮬레이션 엔진
-│   │   └── report.py             # 백테스트 결과 리포트
+│   │   ├── simulator.py
+│   │   ├── data_collector.py
+│   │   └── report.py
+│   │
 │   └── utils/
-│       ├── notifier.py           # 텔레그램 알림 + 명령 수신 (/target, /clear)
-│       ├── market_calendar.py    # 거래일 확인
-│       └── logger.py             # loguru 설정
-└── tests/
+│       ├── price_utils.py         # KRX 호가 단위 보정 (W-12-rev2 신규)
+│       ├── notifier.py            # Telegram 봇 + 알림 (408행)
+│       ├── tunnel.py              # Cloudflare Quick Tunnel
+│       ├── market_calendar.py     # 거래일 확인 (now_kst, is_trading_day 등)
+│       └── logger.py              # loguru 설정
+│
+├── config/
+│   ├── settings.py                # Pydantic Settings — .env + StrategyParams (W-15: default 동기화)
+│   ├── strategy_params.yaml       # 매매 명세 (R-08 동결, W-11~W-15 변경 누적)
+│   └── stock_master.json          # 종목 캐시 (2,773 종목)
+│
+├── scripts/
+│   ├── send_dashboard_url.py      # cron 06:40 트리거
+│   └── dashboard_sim.py           # 로컬 시뮬
+│
+├── logs/                           # 런타임 로그 (loguru, 3-tier file sink)
+├── data/                           # SQLite DB
+├── docs/                           # W-N 명령서 아카이브
+├── backups/                        # 운영 백업
+├── .env                            # 환경 변수 (12개 키)
+├── venv/                           # Python 가상환경
+└── CLAUDE.md                       # 이 문서
 ```
 
----
-
-## 4. 핵심 데이터 흐름
-
-```
-09:00  장 시작 → KIS 토큰 발급, 계좌 확인
-09:30  사용자가 후보 종목 입력 (대시보드 UI 또는 텔레그램 /target)
-09:50  수동 스크리닝 실행 → 자동 검증(상승률/거래대금/상한가/프로그램순매수비중)
-       → 상위 3종목 A/B/C 선정 (자동 스크리닝 폴백 없음)
-09:50~ A/B/C 3종목 WebSocket 동시 구독 + KOSPI200 선물 구독
-       → 각 종목 watcher 가동 (WATCHING 상태)
-       → 신고가 달성 → 고가 추적, 1% 하락 트리거 대기
-       → 트리거 → READY(YES) 전환, 목표진입가격 결정
-       → 최초 체결 종목 → active position 진입 (나머지 2개는 watcher 유지)
-매수 후 → active 종목: 5개 청산 조건 모니터링 (동결 시나리오)
-        → watcher 종목: YES/NO 매 틱 평가, 신고가 갱신 시 재계산
-10:55  신규 매수 마감 (이후 watcher 신규 발주 금지)
-11:20  강제 청산 (active position) + 모든 watcher 종료 → 일일 리포트, 텔레그램 발송
-```
+### 폐기된 파일 (R-07 결과)
+- `src/core/monitor.py` — W-07d 폐기, Watcher 로 대체
+- `src/models/stock.py:TradeTarget` — W-07d 폐기, StockCandidate 직접 사용
+- `tests/test_*.py` 3 파일 — W-07c 폐기
 
 ---
 
-## 5. 구현 단계 & 현재 상태
+## 5. 자료구조
 
-| Phase | 내용 | 상태 |
-|-------|------|------|
-| Phase 0 | 백테스트 — 전략 승률 정량 검증 (≥80% 목표) | 코드 완료, 미실행 |
-| Phase 1 | KIS API 기반 구축 | ✅ 완료 |
-| Phase 2 | 스크리닝 로직 — 수동입력+자동검증, HTS 대조 | ✅ 코드 완료, API 테스트 통과 |
-| Phase 3 | 실시간 감시 + 분할매수 — DRY_RUN 풀가동 | 코드 완료, 미검증 |
-| Phase 4 | 주문 실행 — 모의투자 체결 확인 | 코드 완료, 미검증 |
-| Phase 5 | 운영 안정화 — 1~2주 모의투자 후 실매매 전환 | 코드 완료, 미검증 |
-| **Phase α-0** | **매매 로직 누락 부분 보강 (10시 가드 + 선물 급락)** | **✅ 완료 (2026-04-07)** |
-| **Phase α-1a** | **클라우드 lift and shift (Oracle E2.1.Micro, systemd, Quick Tunnel)** | **✅ 완료 (2026-04-08 02:00 KST) — 134.185.115.229, commit ac6acd2** |
-| **Phase α-1b** | **Named Tunnel 전환 + 고정 URL** | **🟡 진행 예정 (도메인 결정 후)** |
-| **R-07 redesign** | **3종목 Watcher 아키텍처 전환 (monitor.py→watcher.py, TradeTarget 폐기)** | **✅ 완료 (2026-04-08) — W-08 검증 통과** |
-| **R-08** | **baseline day DRY_RUN 가동 검증** | **📅 다음 거래일** |
-| Phase α-1 (잔여) | 다중 사용자 UI (인증/권한 분리) | 📅 α-1b 후 |
-| Phase α-2 | Strategy plug-in 구조 + Account Executor 구조 | 📅 α-1 안정 후 |
-| Phase β | KIS 계좌 분리 + 매매 로직 B/C/D 추가 | 📅 α-2 후 |
+### WatcherState (Enum)
 
-### 카테고리 A/B/E 코드 정리 작업 (2026-04-07 완료)
-
-Phase α 진입 전 코드 base 정리. feature/dashboard-fix-v1 브랜치.
-
-| Commit | 내용 |
-|---|---|
-| 0a40261 | Cat A: 그림자 상태 해소 — DashboardState가 자체 KIS API 보유하던 구조 제거, AutoTrader를 단일 owner로 |
-| 9501a69 | Cat A 후속: ISSUE-010 deprecated 경로 차단 (`_build_stock_name_cache`에서 get_volume_rank 호출 제거, `_on_screening` 자동 폴백 차단) |
-| 44e6c55 | Cat B: 데드 코드/UI 제거 (-52 lines) — "자동 스크리닝" / "API 연결" 버튼 등 |
-| be89ccc | Cat E: 코드 위생 (add_log deque hot path 최적화) |
-
-**브랜치 상태**: feature/dashboard-fix-v1 — main 머지 안 됨 (Phase α-1 작업 끝난 후 머지 결정)
-
-**카테고리 C(보안), D(UX, 모니터 폐기 등)**: 폐기. Phase α/β에서 다중 사용자 관점으로 재설계.
-
-### R-07 Redesign — 3종목 Watcher 아키텍처 (2026-04-08 완료)
-
-명세 §1의 single active rotation 모델을 코드에 구현. 기존 1종목 TargetMonitor 아키텍처 → 3종목 동시 감시 Watcher/WatcherCoordinator 아키텍처로 전환.
-
-**핵심 변경**:
-
-| 이전 | 이후 |
-|------|------|
-| `TargetMonitor` (1종목 감시) | `Watcher` (종목별 상태머신, 12 state) |
-| `TradeTarget` (종목+가격 래퍼) | 폐기 — `Watcher`가 직접 보유 |
-| `monitor.py` (360줄) | 폐기 → `watcher.py` (768줄) |
-| `_monitors` list + `_active_monitor` 단일 폴링 | `WatcherCoordinator` (3종목 라우팅 + active lock) |
-| main.py `_monitor_loop_runner` (polling loop) | Coordinator callback 패턴 (이벤트 기반) |
-
-**WatcherState 상태머신**:
-```
-WATCHING → TRIGGERED → READY ↔ PASSED → DROPPED (terminal)
-                                      → ENTERED → EXITED (terminal)
-                                                → SKIPPED (terminal)
-```
-
-**W-series 작업 이력**:
-
-| W | 대상 | 내용 |
-|---|------|------|
-| W-01 | strategy_params.yaml | 명세 v.2 반영 (8 키 변경) |
-| W-02 | stock_master.py (신규) | 종목코드↔종목명 변환 클래스 |
-| W-03 | screener.py | StockCandidate 반환 (TradeTarget 제거) |
-| W-04 | notifier.py | stock_master DI, /screen 명령 StockCandidate 호환 |
-| W-05a/b/c | watcher.py (신규) + trader.py | Watcher + Coordinator + Trader 시그니처 Watcher 호환 |
-| W-06a/b1/b2 | main.py | Coordinator DI, callback 연결, 4함수 삭제, 스케줄 재배선 |
-| W-07a/b/c/d | screener + dashboard + tests + models | 잔존 참조 정리 + 폐기 |
-| W-08 | (검증만) | 통합 검증 17항목 전부 PASS |
-
-**해결된 이슈**: ISSUE-036 (청산 경로 단절), ISSUE-037 (can_open_position 하드코딩), ISSUE-024 (미등록 종목 잔존)
-
-**R-08 계획**: 다음 거래일 DRY_RUN baseline day 가동. Watcher 상태 전이, 매수/청산 시뮬레이션 실전 데이터로 검증.
-
----
-
-## 5.5 Phase α 온라인화 — 작업 합의 (2026-04-07)
-
-### 미션
-**현재 PC에서 돌아가는 AUTOTRADE를 클라우드로 옮기되, 동시에 다중 사용자 UI를 도입한다. 단, 매매 의사결정은 운영자 1명(A)이 단독으로 수행하고, 다른 사용자들은 capital provider 역할이다.**
-
-### 핵심 모델 — capital provider 모델
-
-```
-                  ┌──────────────────────────┐
-                  │  AutoTrader (Singleton)   │
-                  │  - 종목 선정: A 운영자만   │
-                  │  - 매매 의사결정: 글로벌    │
-                  │  - 시그널 발행: 1번        │
-                  └────────────┬─────────────┘
-                               │
-                               ▼ (단순 broadcast)
-                  ┌──────────────────────────┐
-                  │  Signal Hub               │
-                  │  같은 시그널을 모든          │
-                  │  Account Executor에 전달  │
-                  └────┬──────────────┬──────┘
-                       │              │
-                       ▼              ▼
-                ┌─────────┐     ┌─────────┐
-                │ Account │     │ Account │
-                │ Executor│     │ Executor│
-                │   A     │     │   B     │
-                │         │     │         │
-                │ KIS API │     │ KIS API │
-                │ A       │     │ B       │
-                │         │     │         │
-                │ A 계좌  │     │ B 계좌  │
-                │ A 예수금│     │ B 예수금│
-                └─────────┘     └─────────┘
-                       │              │
-                       ▼              ▼
-                  ┌──────────────────────────┐
-                  │  SQLite (단일 파일)       │
-                  │  - 매매 결정: 1행          │
-                  │  - 체결 결과: 계좌별 2행   │
-                  │  - P&L: 계좌별            │
-                  └──────────────────────────┘
-```
-
-### 모델의 핵심 원칙 (8가지)
-
-1. **A는 단독 의사결정자**: 종목 선정, 매매 트리거, 매매 운영 모두 A.
-2. **B는 capital provider**: A의 매매를 자기 자본 규모로 그대로 복제. 의사결정 권한 없음.
-3. **같은 시간, 같은 종목, 같은 조건으로 매매**: A와 B는 동시에 같은 종목을 같은 매수가/매도가 룰로 거래.
-4. **다른 점은 자본 규모와 P&L뿐**: A의 예수금이 1000만원, B의 예수금이 5000만원이면 — 같은 매매여도 수량과 P&L이 다를 뿐.
-5. **B는 A의 매매를 거부할 수 없다**: manual approval 없음, follower 거부 권한 없음.
-6. **각자 본인 계좌의 EMERGENCY STOP만 가능**: 본인 자본 자율성. 다른 사람 매매 중단 불가.
-7. **StrategyParams는 글로벌**: user별 다른 전략 X. A의 전략이 곧 모두의 전략.
-8. **권한**: 운영자 admin 같은 추가 역할 없음. A는 운영자, 나머지는 capital provider. 그뿐.
-
-### 시스템 확장 한계 (의식적 결정)
-
-- **사용자 수**: A, B 2명 고정. 영원히 2명 이상으로 늘리지 않는다.
-- **매매 로직**: 현재 매매 로직 A가 base. 향후 B, C, D 등 추가 가능. 단, 사용자 수와 시스템 구조는 변경 안 함.
-
-이 두 가지 상한 때문에 다음 기술 결정이 정당화됨:
-
-| 결정 | 이유 |
-|---|---|
-| **DB는 SQLite** | 사용자 2명 고정 → 동시 쓰기 부하 무시 가능 → PostgreSQL 도입 부담 불필요 |
-| **매매 로직은 plug-in 구조** | B, C, D 추가 가능성 → Strategy 추상 클래스 도입 (Phase α-2) |
-| **권한 모델은 단순 user_id** | 사용자 2명 고정 → tenant_id, role 매트릭스 등 multi-tenant 추상화 불필요 |
-
-### Phase α의 세 단계
-
----
-
-**Phase α-0 (다음 작업)** — 매매 로직 누락 부분 보강
-
-목표: **클라우드 이전 전에 매매 로직 명세상 누락된 두 부분을 구현하고 회귀 검증한다.**
-
-근거: 매매 시스템에서 청산 조건과 시간 가드는 critical이다. 깨진 로직을 24/7 클라우드 환경으로 옮기면 위험이 커진다. 운영 환경 이전 전에 시스템이 명세대로 작동하는지 먼저 확인.
-
-작업 범위 (1~2일):
-
-**1. 항목 1 — 10시 이후 가드 + 주석 정정**
-
-- 명세: "10시 이후 최저가에서 20분 내 목표가 달성 못하면 매도"
-- 현재 상태:
-  - 코드 동작: 20분 (yaml 설정 그대로) ✅
-  - 주석: "25분" — 잘못 ⚠
-  - **10시 이전 최저가는 무시하는 가드 — 미구현 ❌**
-- 작업:
-  1. monitor.py 코드 검증: 현재 타임아웃 시작 시점에 10시 가드가 있는가
-  2. 가드 없으면 추가: "타임아웃 시작 시점이 10시 이전이면 시작 안 함, 10시 이후 최저가만 카운트"
-  3. 주석 "25분" → "20분" 정정
-  4. yaml에 가드 임계값 변수화 검토 (`monitor.timeout_start_after_kst = "10:00"`)
-  5. DRY_RUN 회귀 검증
-- 예상 시간: 1~2시간
-
-**2. 항목 2 — 선물 급락 데이터 수신 구현 (청산 조건 ④)**
-
-- 명세: "종목의 최고점 시각에서 현재까지 선물이 1% 하락 시 전량 청산"
-- 현재 상태:
-  - 청산 조건 ④ 로직: 구현됨 ✅ (monitor.py:228-234, 248-253)
-  - KOSPI200 선물 코드/TR ID: 정의됨 ✅ (constants.py:66, 69)
-  - **WebSocket 구독: 미구현 ❌**
-  - **선물 가격 업데이트 콜백: 미구현 (TODO 주석만 — main.py:754-755) ❌**
-  - **monitor.on_futures_price() 호출: 함수만 존재, 호출 없음 ❌**
-- 작업:
-  1. KIS WebSocket 선물 구독 코드 추가 (kis_api/kis.py 또는 main.py)
-  2. 선물 가격 수신 콜백 등록
-  3. monitor.on_futures_price() 호출 연결 (main.py:754-755 TODO 부분)
-  4. 종목 고점 시각의 선물 가격 저장 로직 검증 (monitor.py)
-  5. DRY_RUN 회귀 검증
-- 예상 시간: 3~5시간
-
-**3. Phase α-0 완료 게이트**
-
-- DRY_RUN 모드에서 시뮬레이션으로 두 로직 작동 확인
-- 가능하면 모의투자 환경에서 실제 데이터 흐름 확인
-- 백테스트 재실행 (회귀 없는지)
-- 모두 통과 → Phase α-1 진입
-
----
-
-**Phase α-1 (Phase α-0 후)** — 클라우드 lift and shift + 다중 사용자 UI
-
-목표: **현재 코드 그대로 클라우드에 올리고, A/B 두 사용자가 같은 대시보드를 권한 분리해서 본다.**
-
-작업 범위 (1.5~2일):
-
-1. **클라우드 인프라**
-   - 클라우드 호스트 결정 + 셋업 (Oracle Cloud Always Free 또는 K 수석님 결정)
-   - Python 3.11 + 의존성 설치
-   - SQLite 데이터 디렉토리 셋업
-   - Cloudflare Named Tunnel (Quick Tunnel 아님 — 고정 도메인)
-   - systemd unit (launcher.py를 service로)
-   - 시크릿 관리: Master Key + Fernet (KIS 키 .env 평문 → 암호화)
-   - 백업: sqlite3 dump cron (일 1회)
-   - SSH 보안 (key-based auth, fail2ban)
-
-2. **다중 사용자 UI**
-   - DB에 user 테이블 신규 (id, name, role: 'operator' | 'capital_provider', password_hash)
-   - 대시보드 인증: HTTP-only Cookie + Session
-   - 로그인 페이지 신규
-   - 사용자 2명 (A=operator, B=capital_provider) 등록
-   - 대시보드 view 권한 분리:
-     - operator: 종목 입력 영역 활성, 매매 트리거 활성
-     - capital_provider: 종목 입력 영역 비활성, 조회만
-   - audit_log 테이블 신규 (누가 언제 무엇을 변경했는지)
-
-3. **코드 변경 최소화**
-   - AutoTrader, Trader, Watcher/Coordinator 등 매매 로직 코드는 **건드리지 않음** (R-07에서 확정된 로직 그대로)
-   - SQLite 그대로
-   - 텔레그램 봇 그대로 (옵션 Y 같은 변경 없음)
-   - 변경되는 파일: dashboard/app.py (인증 + 권한), config/settings.py (시크릿 복호화), launcher.py (systemd 호환)
-
-**Phase α-1에 포함되지 않는 것 (의식적 제외)**:
-- ❌ Strategy plug-in 구조 (Phase α-2)
-- ❌ Account Executor 구조 (Phase α-2)
-- ❌ KIS 계좌 분리 (Phase β)
-- ❌ Signal Hub 활성화 (Phase β)
-- ❌ PostgreSQL 마이그레이션 (사용자 2명 고정 → 영영 X)
-- ❌ 텔레그램 옵션 Y (별도 결정)
-- ❌ 동적 파라미터 변경 UI (별도 결정)
-
-### α-1a 절대 원칙 예외 기록
-
-**DECISION-α1a-EXCEPTION-01** (2026-04-08 01:35 KST)
-
-α-1a 절대 원칙 "dashboard 코드 0줄 변경"에 대한 일시 예외.
-
-- **예외 범위**: `src/dashboard/app.py` + `src/dashboard/templates/index.html` 합쳐서 2줄 변경
-- **예외 사유**: ISSUE-030 두 버그가 09:00 가동 검증의 시각적 도구(예수금/평가금액 카드)를 무력화. 수정 범위가 작고 영향 격리 가능하다고 판단하여 즉시 수정 선택.
-- **수정 commit**: `fcc5a6a` (2026-04-08 01:50 KST)
-- **결과**: both-ok (수석님 시각 확인)
-- **이 예외가 정당화하지 않는 것**: 이후 dashboard 코드 변경에 대한 일반적 허용 없음. 인증 stripping 제거 같은 구조적 변경 없음.
-
----
-
-**Phase α-2 (α-1 안정 후)** — Strategy plug-in 구조 + Account Executor 구조
-
-목표: **매매 로직을 hardcoded class에서 plug-in 구조로 분리, KIS 계좌 분리를 위한 Account Executor 구조 도입. 단, 인스턴스는 1개로 시작.**
-
-작업 범위 (1~2일):
-
-1. **Strategy plug-in 구조**
-   - `src/strategies/base.py` 신규: `Strategy` 추상 클래스
-     - `on_screening(codes)`, `on_price_update(code, price)`, `evaluate_entry(monitor)`, `evaluate_exit(position)` 등
-   - `src/strategies/strategy_a.py` 신규: 현재 매매 로직 A를 `StrategyA` 클래스로 분리
-     - 9:55 신고가 → 1% 하락 트리거 → 분할매수 → 5조건 청산 (Phase α-0에서 확정된 그대로)
-   - `AutoTrader.__init__(strategy: Strategy)` 변경: strategy를 inject 받음
-   - 회귀 검증 필수: 변경 전후 매매 결과 동일해야 함
-   - 향후 `StrategyB`, `StrategyC` 추가는 단순 파일 추가만
-
-2. **Account Executor 구조 (Phase β 준비)**
-   - KIS API factory 패턴: user_id별 KIS API 인스턴스 생성
-   - 단, Phase α-2에서는 인스턴스 1개만 (DRY_RUN 단계)
-   - DB에 user별 KIS 키 저장 가능한 구조 (지금은 빈 컬럼)
-   - Trader/Monitor가 user 컨텍스트로 KIS API 받게
-
-**Phase α-2가 끝나면**:
-- 매매 로직 추가가 단순 파일 추가 작업
-- KIS 계좌 추가가 단순 설정 + 키 입력 작업
-
----
-
-**Phase β (α-2 후, K 수석님 결정 시)** — 두 번째 KIS 계좌 활성화
-
-작업 범위:
-- B의 KIS 키 입력
-- B의 Account Executor 활성화
-- Signal Hub broadcast 활성화 (현재 1개 → 2개 fan-out)
-- DRY_RUN 검증 → 모의투자 검증 → 실매매 전환
-
-매매 로직 B, C, D 추가도 이 시점에 같이 결정.
-
----
-
-## 5.6 Claude ↔ K 수석님 협업 규칙
-
-오늘(2026-04-07) 12시간 협업에서 학습된 규칙. Claude(여기 채팅의 어시스턴트, 그리고 Claude Code)는 다음을 따른다.
-
-### 미션 관리
-
-1. **미션 외 작업 만들지 않기**. K 수석님이 명시 안 한 작업은 안 함. 가이드 문서, 카테고리 작업, 부가 결정 사항 등을 임의로 만들지 않는다.
-2. **K 수석님이 정정하시면 그 자리에서 멈추기**. "그게 아니라 X야"라고 하시면 새 결정 사항 만들지 말고, 미션을 다시 본다. 정정은 새 작업 추가가 아니라 기존 작업 폐기 신호.
-
-### 추측 금지
-
-3. **추측으로 가이드/명세 작성 안 하기**. 코드/명세 base 없으면 안 작성. 불확실하면 K 수석님께 물어보거나 Claude Code에 분석 시킨다.
-4. **결정 항목을 임의로 늘리지 않기**. K 수석님이 답해주시는 만큼만 결정. "이것도 결정 필요" 라고 작업을 늘리지 않는다.
-
-### 도구 활용
-
-5. **Claude Code가 할 일을 K 수석님께 떠넘기지 않기**. grep, 명령 실행, 파일 분석은 Claude Code 영역. 어시스턴트(Claude)는 K 수석님과의 의사결정 + 명세 작성 + 게이트 검토만.
-6. **분석은 코드/파일 base로 하기**. 어시스턴트가 K 수석님 PC 파일에 직접 접근 못 하므로, 진단/grep/분석이 필요하면 Claude Code에 분석 메시지를 만들어서 K 수석님이 그것만 던지면 되도록 한다.
-
-### 페르소나
-
-7. **펀드매니저/시스템 엔지니어 모자는 K 수석님이 부르실 때만**. 자기 의견을 자주 끼워 넣지 않는다.
-
-### 게이트
-
-8. **Claude Code의 멈춤 종류를 명시 요구**: (a) 명세 외 변경 발견 (b) 명세 모호 결정 요청 (c) 카테고리 단위 작업 끝 확인 (d) 에러 디버깅. 어떤 종류인지 명시 없이는 K 수석님이 추측해야 함.
-
----
-
-## 5.7 텔레그램 명령어
-
-| 명령 | 기능 | 예시 |
-|------|------|------|
-| `/target 코드,종목명` | 타겟 종목 설정 (코드+종목명 혼합 가능) | `/target 006400,에코프로비엠` |
-| `/target` | 현재 설정된 종목 조회 | |
-| `/clear` | 종목 설정 초기화 | |
-| `/screen` | 설정된 종목으로 스크리닝 실행 | |
-| `/status` | 현재 매매 상태 조회 (모드/예수금/P&L/감시종목) | |
-| `/stop` | 당일 매매 중단 + 미체결 취소 | |
-| `/help` | 명령어 도움말 | |
-
-### 런처 (launcher.py)
-- `python launcher.py` — 즉시 대시보드 시작 + Tunnel URL 텔레그램 발송
-- `python launcher.py --schedule` — 매일 09:00 KST 자동 시작 (데몬)
-- 기존 포트 점유 프로세스 자동 정리 후 시작 (포트 충돌 방지)
-
----
-
-## 6. 절대 금지 규칙
-
-### pykrx 장중 실시간 호출 금지
-- 장중 호출 시 느리고(2~5초), 타임아웃/IP차단 위험
-- **허용**: 09:00 거래일 확인 1회, 시총 1회 캐시, 백테스트 과거 데이터
-- **금지**: 11시 스크리닝, 장중 모니터링에서 pykrx 호출
-- 장중 실시간 데이터는 전부 KIS REST API 또는 WebSocket
-
-### KIS API Rate Limit 준수
-- 조회 API: 초당 20건 (모의투자 2건)
-- asyncio.Semaphore로 동시 요청 수 제한
-
-### 전략 파라미터 하드코딩 금지
-- 모든 전략 수치는 `config/strategy_params.yaml`에서 로드
-- `2.0`, `3.0`, `4.1`, `5.1`, `25`, `50` 같은 매직넘버 코드에 직접 사용 금지
-- `self.params.entry.kospi_drop_pct` 형태로 참조
-
----
-
-## 7. KIS API 코딩 패턴
-
-### REST 조회
 ```python
-info = await self.api.get_current_price("005930")
-rank = await self.api.get_volume_rank(market="J")
+class WatcherState(str, Enum):
+    WATCHING = "watching"          # 신고가 대기
+    TRIGGERED = "triggered"        # 신고가 확정 (1% 하락) → 목표가 계산 완료
+    READY = "ready"                # 매수 범위 내 (YES — 현재가가 1차~손절선 사이)
+    PASSED = "passed"              # 자리 지나감 (NO — 현재가가 1차 매수가 위로 복귀)
+    DROPPED = "dropped"            # 손절선 이하 (terminal)
+    ENTERED = "entered"            # 매수 체결 (보유 중 — active position)
+    EXITED = "exited"              # 청산 완료 (terminal)
+    SKIPPED = "skipped"            # 포기 (terminal — 타임아웃 / 10:55 / 미매수)
+
+TERMINAL_STATES = frozenset({
+    WatcherState.DROPPED,
+    WatcherState.EXITED,
+    WatcherState.SKIPPED,
+})
 ```
 
-### 실시간 (WebSocket)
+### 상태 전이 다이어그램
+
+```
+WATCHING → TRIGGERED → READY ↔ PASSED
+   ↑          ↓          ↓        ↓
+   │ (신고가  ↓        ENTERED  DROPPED (terminal)
+   │  갱신)  ↓          ↓
+   └─────────┘       EXITED (terminal)
+
+또는 임의 상태 → SKIPPED (terminal, 10:55 / timeout 20분)
+```
+
+### Watcher 주요 필드
+
 ```python
-await self.api.subscribe_realtime(codes=["005930"])
-self.api.add_realtime_callback("H0STCNT0", self._on_price)
+@dataclass
+class Watcher:
+    # === 종목 정보 (불변) ===
+    code: str
+    name: str
+    market: MarketType
+    params: StrategyParams
+
+    # === 상태 ===
+    state: WatcherState
+
+    # === 시세 ===
+    current_price: int
+    pre_955_high: int             # 09:50~09:55 사전 고가
+    intraday_high: int            # 장중 최고가
+    intraday_high_time: datetime
+
+    # === TRIGGERED 시점 스냅샷 ===
+    confirmed_high: int
+    confirmed_high_time: datetime
+    futures_at_confirmed_high: float
+    target_buy1_price: int        # 1차 매수가 (W-12-rev2: floor_to_tick)
+    target_buy2_price: int        # 2차 매수가 (W-12-rev2: floor_to_tick)
+    hard_stop_price_value: int    # 하드 손절가 (W-12-rev2: ceil_to_tick)
+    high_confirmed_at: datetime   # timeout 카운트 시작 시각
+
+    # === 선물 가격 (외부 주입) ===
+    futures_price: float
+
+    # === 매수 발주 / 체결 추적 ===
+    buy1_placed: bool
+    buy2_placed: bool
+    buy1_filled: bool
+    buy2_filled: bool
+    buy1_price: int
+    buy2_price: int
+    total_buy_amount: int
+    total_buy_qty: int
+
+    # === ENTERED 정보 ===
+    entered_at: datetime
+    post_entry_low: int           # 매수 후 최저가
+    post_entry_low_time: datetime
+
+    # === 청산 정보 ===
+    exit_reason: str
+    exit_price: int
+    exited_at: datetime
+    avg_sell_price: int
+    total_sell_amount: int
+    sell_orders: list
+
+    # === 시그널 ===
+    _exit_signal_pending: bool
+
+    # === W-11c 신규 ===
+    _t2_callback: Optional[Callable[[str, datetime], None]] = None  # T2 콜백 (Coordinator 가 주입)
+
+    # === Properties (W-11c-hotfix, W-11d) ===
+    @property
+    def is_yes(self) -> bool:
+        """READY 상태만 YES (수석님 확정)."""
+        return self.state == WatcherState.READY
+
+    @property
+    def is_terminal(self) -> bool:
+        """terminal 상태 (DROPPED / EXITED / SKIPPED)."""
+        return self.state in TERMINAL_STATES
+
+    def get_pullback_pct(self) -> float:
+        """confirmed_high 우선, 없으면 intraday_high 기준 눌림폭."""
+        ...
 ```
 
-### 주문
+### ReservationSnapshot (W-11d 신규)
+
 ```python
-order = await self.api.buy_order(
-    code="005930", qty=100, price=70000,
-    price_type="00",  # 지정가
-)
+@dataclass
+class ReservationSnapshot:
+    """
+    T2 시점 (첫 종목 buy2 체결) 에 두 번째 매매 후보로 예약된 종목의 스냅샷.
+    T3 시점 (첫 종목 EXITED) 에 이 스냅샷을 기준으로 엄격 재확인.
+    """
+    code: str
+    name: str
+    market: MarketType
+    reserved_at: datetime
+    confirmed_high_at_t2: int
+    current_price_at_t2: int
+    pullback_pct_at_t2: float
+    target_buy1_price_at_t2: int    # T3 재확인 시 변경 검증용
+    target_buy2_price_at_t2: int
 ```
 
-### 인증
+### StockCandidate (src/models/stock.py)
+
 ```python
-await self.api.connect()  # 토큰 자동 발급/갱신 (24시간 유효)
+@dataclass
+class StockCandidate:
+    code: str
+    name: str
+    market: MarketType
+    current_price: int
+    price_change_pct: float
+    trading_volume_krw: int
+
+    @property
+    def program_net_buy_ratio(self) -> float: ...
+```
+
+### TradeRecord (src/models/trade.py)
+
+```python
+class ExitReason(str, Enum):
+    TARGET, HARD_STOP, TREND_BREAK, TIMEOUT,
+    FUTURES_STOP, FORCE_LIQUIDATE, MANUAL, NO_ENTRY
+
+@dataclass
+class TradeRecord:
+    # code, name, market
+    # entry_time, exit_time
+    # buy1_price, buy2_price, avg_buy_price
+    # exit_price, quantity
+    # pnl_krw, pnl_pct
+    # exit_reason
+
+@dataclass
+class DailySummary:
+    @property
+    def win_rate(self) -> float: ...
+    def add_trade(self, trade: TradeRecord) -> None: ...
 ```
 
 ---
 
-## 8. 코딩 스타일
+## 6. 매매 흐름 (시각별)
 
-- 한국어 주석 OK, 변수/함수명은 영어
-- 로깅: `loguru`의 `logger` 사용. 매수/매도/손절은 INFO 이상
-- KIS API 호출은 반드시 try-except로 감싸고 에러 로깅
-- `from __future__ import annotations` + 타입힌트 사용
-- 모든 API 호출은 `async/await`
-- 코드는 설명 없이 전체를 작성 (Terry 선호)
-- 환경: `C:\Users\terryn\AUTOTRADE`, Git Bash에서는 `export` 사용 (`set` 아님)
+### 06:40 — cron 자동 가동
+
+```
+cron → send_dashboard_url.py
+     → autotrade.service 시작
+     → AutoTrader.__init__ + run()
+     → self._loop = asyncio.get_running_loop()
+     → api.connect() (KIS API REST + WebSocket)
+     → api.subscribe_futures() (KOSPI200 선물)
+     → DRY_RUN 모드: dry_run_cash (5천만) 주입
+     → Coordinator.set_available_cash
+     → _start_dashboard_server (FastAPI)
+     → _tunnel.start() (Cloudflare Quick Tunnel)
+     → Telegram: 대시보드 URL 발송
+     → 매매 시각 대기
+```
+
+### 09:30 ~ 09:50 — 수석님 액션
+
+```
+1. 텔레그램으로 대시보드 URL 받음
+2. 대시보드 접속 (admin token)
+3. 직접 입력 박스에 종목 입력 (개수 제한 없음)
+4. [종목 설정] 클릭 → api_set_targets (StockMaster 검증) → _manual_codes 저장
+5. (선택) [수동 스크리닝] 클릭 → start_screening(is_final=False)
+   - 09:50 정규 스크리닝 전에 여러 번 호출 가능 (덮어쓰기)
+```
+
+### 09:50 — 자동 정규 스크리닝
+
+```
+_schedule_screening 트리거
+  → _on_screening() (async)
+  → screener.run_manual(_manual_codes) (async, KIS API 호출)
+  → list[StockCandidate] 반환 (필터 통과 종목 전부, top_n 슬라이싱 없음)
+  → Coordinator.start_screening(targets, is_final=True)
+  → N Watcher 생성 + _t2_callback 주입 + 가동
+  → 각 Watcher: KIS WebSocket subscribe
+  → state = WATCHING
+  → _screening_done = True (이후 추가 호출 차단)
+```
+
+### 09:55 ~ 11:00 — 매매 윈도우
+
+```
+실시세 수신 (KIS WebSocket)
+  → Coordinator.on_realtime_price(code, price, ts)
+  → not w.is_terminal 체크 → Watcher.on_tick(price, ts, futures_price)
+
+[Watcher.on_tick] (terminal 종목은 두 겹 차단)
+  → _handle_watching → 신고가 추적, 1% 하락 시 _fire_trigger → TRIGGERED
+    (W-12-rev2: target_buy1/2_price 와 hard_stop_price_value 가 호가 단위 보정)
+  → _handle_triggered
+    → A: ts >= entry_deadline (10:55) → SKIPPED
+    → B: timeout 20분 (W-13) → SKIPPED
+    → C: 신고가 갱신 → WATCHING 복귀 (재트리거 가능)
+    → D: _evaluate_target → READY / PASSED / DROPPED
+
+[Coordinator._process_signals] (이벤트 루프 polling)
+  → active 청산 신호 처리
+  → 진입 윈도우 체크 (W-11e: _is_in_entry_window, 10:00~10:55)
+  → yes_watchers 수집 (is_yes + not is_terminal)
+  → 첫 매매 tiebreaker: distance_to_buy1 가장 가까운 (현행 유지)
+  → _execute_buy → Trader.place_buy_orders
+    (W-11e: last-line defense, _now >= 11:00 이면 발주 거부)
+  → 체결 콜백: Watcher.on_buy_filled
+    → buy1 체결 → ENTERED
+    → buy2 체결 → _t2_callback(self.code, ts) (try/except 격리)
+
+[Coordinator._on_t2] (T2 콜백, 동기)
+  → active 일치 확인 (방어)
+  → _is_in_entry_window 체크
+  → _try_reserve_at_t2:
+    - YES 후보 수집 (is_yes + not is_terminal + active 제외)
+    - _tiebreaker_for_next: KOSPI 3.8% / KOSDAQ 5.6% + 눌림폭 최대
+    - ReservationSnapshot 생성
+  → _reserved_snapshot 에 저장
+
+[Watcher._handle_entered] (매 tick, ENTERED 상태)
+  → _check_timeout, _check_futures_drop, 하드 손절, 목표가
+  → 충족 시 _emit_exit → _exit_signal_pending = True
+
+[Coordinator._process_signals → _execute_exit]
+  → trader.execute_exit (실제 청산 발주)
+  → await _exit_callback(watcher) = main.py._on_exit_done
+  → _on_exit_done 완료 후 _process_signals 가 self._active_code = None
+
+[main.py._on_exit_done] (W-11e)
+  1. P&L 기록
+  2. TradeRecord + DB 저장
+  3. 손실 한도 체크
+  4. multi_trade.enabled 가드
+  5. 잔고 재조회 + Coordinator.set_available_cash
+  6. trader.reset
+  6.5. (W-11e 신규)
+       self._coordinator._active_code = None
+       await self._coordinator.handle_t3(now_kst())
+  7. 대시보드 동기화
+
+[Coordinator.handle_t3] (W-11d, async)
+  → _is_in_entry_window 체크 (벗어나면 예약 폐기 + return)
+  → 예약 존재 시:
+    → _verify_reservation_at_t3 (5항목 엄격 재확인)
+    → 통과 → _execute_buy (예약 진입)
+    → 실패 → 예약 폐기 + fallthrough 재판정
+  → 재판정 (예약 없음 또는 fallthrough):
+    → yes_watchers 수집
+    → _tiebreaker_for_next
+    → 통과 → _execute_buy
+    → 통과 0 → 포기
+
+→ 두 번째 매매가 ENTERED 되면 또 T1/T2/T3 가능 → N차 매매 연쇄
+→ 진입 윈도우 (10:00~10:55) 끝나면 자연스럽게 멈춤
+→ daily_loss_limit_pct 3% 도달 시 신규 발주 차단
+
+TRIGGERED 후 20분 미체결 → _check_high_confirm_timeout → SKIPPED
+```
+
+### 10:55 — on_buy_deadline
+
+```
+_schedule_buy_deadline 트리거
+  → Coordinator.on_buy_deadline
+  → 모든 Watcher: ENTERED 아닌 상태 → SKIPPED
+  → Telegram: 매수 마감 알림
+```
+
+### 11:00 — Trader last-line defense (W-11e)
+
+```
+이 시각 이후 어떤 경로로도 _execute_buy 가 호출되면
+  → Trader.place_buy_orders 진입부에서:
+    _now >= dtime.fromisoformat(repeat_end='11:00')
+  → logger.error("CRITICAL: 매매 철학 시한 위반 시도 ... 발주 거부")
+  → return (발주 차단)
+```
+
+### 11:20 — on_force_liquidate
+
+```
+_schedule_force_liquidate 트리거
+  → Coordinator.on_force_liquidate
+  → 모든 Watcher: ENTERED → 강제 매도 (시장가)
+  → Trader.execute_exit (강제)
+  → 체결 후 EXITED
+```
+
+### 장 마감 — 일일 리포트
+
+```
+_schedule_market_close 트리거
+  → _build_trade_record (각 Watcher 별)
+  → Database.save_trade + save_daily_summary
+  → Notifier.notify_daily_report
+  → Telegram: 일일 리포트
+```
 
 ---
 
-## 9. 주요 유의사항
+## 7. 개발 / 운영 환경
 
-- **프로그램매매 순위 API 없음**: KIS API에 프로그램 순매수 *순위* 조회 엔드포인트 없음. 종목별 개별 조회만 가능 → 1단계 수동 입력 방식 채택 배경
-- **프로그램매매 데이터 지연**: KIS API 지연 5분 이상이면 전략 전제 재검토
-- **프로그램매매 ≠ 기관 순매수**: 차익/비차익 프로그램 주문만 포함, 기관 수동 주문 미포함
-- **슬리피지**: 손절은 시장가, 그 외 지정가
-- **거래비용**: 총 추정 ~0.4~0.7% (수수료 + 거래세 + 슬리피지). 백테스트 시 반드시 반영
-- **DRY_RUN**: 단순 주문 미전송이 아니라 완전한 가상 체결/P&L 추적 엔진
-- **선물 데이터**: KOSPI200 선물(101S) WebSocket 구독 필요 (청산 조건 ④)
+### 개발 환경 (수석님 PC)
+- **OS**: Windows 11
+- **Shell**: Git Bash (PowerShell 아님)
+- **Python**: 3.11 (venv)
+- **IDE**: VSCode + Claude Code / Cowork
+- **AUTOTRADE 경로**: `C:\Users\terryn\AUTOTRADE`
+- **Obsidian vault**: `C:\Users\terryn\Documents\Obsidian\AUTOTRADE`
 
-### 운영 사고 학습 (2026-04-07)
+### 운영 환경 (Oracle Cloud)
+- **IP**: 134.185.115.229
+- **스펙**: Oracle Cloud Seoul E2.1.Micro (1 vCPU, 956Mi RAM + 4GB swap)
+- **OS**: Ubuntu 22.04 LTS
+- **경로**: `/home/ubuntu/AUTOTRADE`
+- **Python**: 3.11 venv (`~/AUTOTRADE/venv`)
+- **사용자**: `ubuntu`
+- **git**: 없음 (수동 scp 배포)
 
-다음 패턴은 클라우드 운영에서 반복되면 안 된다:
-
-1. **백그라운드 실행 좀비 누적**: `python -m src.main &` 패턴이 좀비 5개 누적시킴 (152MB×2). 검증 단계에서는 포그라운드 실행 + 새 터미널에서 명령. 본격 운영은 systemd가 표준화. 백그라운드 `&` 금지.
-
-2. **장중 코드 작업 위험**: 매매 시간 중 코드 변경이 사고 야기. 운영자가 데드 UI 버튼 클릭 → INVALID FID_COND_MRKT_DIV_CODE 에러. 운영용/개발용 환경 분리 필요. 본격 운영은 클라우드 상시.
-
-3. **포트 점유 좀비**: launcher.py가 포트 정리 코드 가지고 있지만, 백그라운드 실행 시 우회됨. systemd가 표준화하면 해결.
-
-4. **K 수석님 PC가 24/7 안 켜져있음**: 클라우드 이전의 본질적 가치. 매매 시간(09:00~15:30 KST)에 PC가 켜져있어야 한다는 제약 자체가 v.1의 존재 이유.
-
-5. **텔레그램 polling Conflict**: 좀비 main.py 두 인스턴스가 같은 봇 토큰으로 polling 시도 → telegram.error.Conflict 무한 반복. 단일 인스턴스 보장 필수.
-
----
-
-## 11. 미해결 이슈 (Phase α 작업 외)
-
-다음은 Phase α 작업과 무관하게 별도 추적되는 이슈들. Obsidian 이슈 트래커와 동기화 필요.
-
-### ISSUE-035 — Dashboard set-targets aiohttp TimerContext RuntimeError (🔴 Critical)
-- 발견: 2026-04-08 09:30 KST. EXCEPTION-03 임시 logger로 원인 확정.
-- 에러: `RuntimeError: Timeout context manager should be used inside a task`
-- 원인: `state.autotrader.api`(aiohttp ClientSession)를 FastAPI endpoint에서 직접 await → Task 컨텍스트 불일치
-- 영향: Dashboard 수동 종목 입력 100% 실패. 자동 스크리닝/매매/텔레그램 정상.
-- 운영 우회: 텔레그램 `/target` 명령 사용. Dashboard 종목 입력 기능 사용 안 함.
-- 수정 시기: α-1b 또는 α-2 (B 방향: asyncio queue 패턴으로 AutoTrader event loop 위임)
-
-### ISSUE-020 — screener.run() 자동 스크리닝 메서드 정리 (다음 sprint)
-- Cat A 후속 보정에서 임시 차단됨 (deprecated 마킹 + warning)
-- 본격 정리는 별도 sprint
-- 백테스트 코드 의존성 분리 필요
-
-### ~~ISSUE-024~~ — 모니터에 미등록 종목 잔존 (✅ R-07에서 구조적 해결)
-- 2026-04-07 오전 발견
-- **해결**: R-07에서 자동 스크리닝 폴백 경로 완전 폐기. WatcherCoordinator.start_screening()은 수동 입력 검증 결과만 수신. 시스템이 종목을 자동 추가하는 경로 자체가 없음.
-
-### ISSUE-026 — Ampere A1 인스턴스 확보 후 재생성 검토
-- 현재: Oracle E2.1.Micro (AMD, 956Mi RAM + 4GB swap, 1 OCPU) — 134.185.115.229
-- 목표: A1.Flex (Ampere ARM, 24Gi RAM, 4 OCPU) — Oracle Always Free 쿼터
-- 현황: ap-chuncheon-1 AD-1에서 A1.Flex 용량 부족으로 E2.1.Micro 채택
-- 조건: A1 용량 확보 시점에 재검토. 데이터 마이그레이션 절차 별도 작성 필요.
-
-### ISSUE-027 — Telegram bot stop_polling 시 CancelledError traceback
-- 발생: systemd stop → SIGTERM → graceful shutdown 시 telegram bot.stop() 내부에서 traceback 출력
-- 영향: 무해 (종료 플로우 정상 완료), autotrade.err에 기록됨. 로그 noise.
-- 원인: python-telegram-bot v22.7 stop() 내부 update_queue CancelledError 미처리 (알려진 패턴 가능)
-- 처리: α-1b 또는 이후 CancelledError swallow 처리
-
-### ISSUE-028 — Quick Tunnel → Named Tunnel 전환 (α-1b 핵심 작업)
-- 현재: Quick Tunnel (*.trycloudflare.com), 재시작 시마다 URL 변경
-- 목표: Named Tunnel (autotrade.수석님도메인.com), 고정 URL
-- 사전 필요: 도메인 등록 + Cloudflare 계정 + DNS 네임서버 이전 + DNS 전파 확인
-- 코드 선결: `src/utils/tunnel.py` CloudflareTunnel 클래스가 Named 모드를 지원하는지 분석 필요
-- 예상 작업: cloudflared config 파일 작성, 코드 호환성 분석, 무중단 마이그레이션 (16:00 이후)
-
-### ~~ISSUE-029~~ — Dashboard 수동 종목 입력 버튼 응답 없음 (✅ 원인 확정: ISSUE-035로 흡수)
-- 발견: 2026-04-08 01:01 KST 새벽 휴장 시간에 "에코프로" 검증 클릭 시 응답 없음
-- 원인: 장 시간 관계없이 항상 실패. ISSUE-035 (aiohttp TimerContext RuntimeError)가 진짜 원인. 흡수 종료.
-
-### ISSUE-035 — Dashboard set-targets aiohttp TimerContext RuntimeError
-- 발견: 2026-04-08 09:30 KST. EXCEPTION-03 임시 logger로 진단 확정.
-- 에러: `RuntimeError: Timeout context manager should be used inside a task`
-- 호출 경로: `app.py api_set_targets()` → `state.autotrader.api.get_current_price()` → `KISAPI._request()` → `aiohttp.ClientSession.get()` → `TimerContext.__enter__()` → `asyncio.current_task() == None` → RuntimeError
-- 구조적 원인: AutoTrader event loop에서 생성한 aiohttp ClientSession을 FastAPI endpoint의 다른 Task 컨텍스트에서 직접 await. aiohttp timeout이 Task 컨텍스트 검증에서 거부.
-- 영향: Dashboard 수동 종목 입력 100% 실패. 자동 스크리닝(AutoTrader 내부 호출) + 매매 로직 정상.
-- 운영 우회: 수동 종목 입력 기능 사용 안 함. 텔레그램 `/target` 명령 또는 09:50 자동 스크리닝 사용.
-- 수정 시기: α-1b 또는 α-2 (dashboard 인증 분리 작업과 함께)
-- 수정 방향: (B) 선호 — FastAPI endpoint → asyncio queue 패턴으로 AutoTrader event loop에 위임
-
-### ~~ISSUE-036~~ — _monitors 리스트 stale + 청산 경로 단절 (✅ R-07에서 근본 해결)
-- 발견: 2026-04-08. 진단 완료.
-- **해결**: R-07 redesign에서 `_monitors` / `_active_monitor` 단일 폴링 아키텍처 자체를 폐기. WatcherCoordinator가 3종목 전체를 `on_realtime_price`로 라우팅 → 청산 경로 단절 구조적 불가능.
-- 해결 commit: R-07 W-06a (main.py 재배선)
-
-### ~~ISSUE-037~~ — can_open_position(0) 하드코딩 인수 (✅ R-07에서 근본 해결)
-- 발견: 2026-04-08. ISSUE-036 진단 중 발견.
-- **해결**: R-07에서 `_active_monitor` 기반 가드 자체 폐기. WatcherCoordinator가 `_active_code`로 active lock 관리 → 하드코딩 인수 문제 구조적 제거.
-- 해결 commit: R-07 W-06a (main.py 재배선)
-
-### ~~ISSUE-030~~ — Dashboard 예수금 / 평가금액 카드 표시 버그 (✅ 수정 완료 commit fcc5a6a)
-- 발견: 2026-04-08 01:30 KST 새벽 첫 dashboard 접속 시
-
-**버그 1 — 예수금 "-" (WebSocket 인증 미연동)** — ✅ 수정
-- 원인: `index.html:467` WebSocket URL에 `?token=` 미부착 → `is_admin=False` → `available_cash` strip
-- 수정: `/*__TOKEN__*/` 주입 패턴 활용. admin은 `?token=ADMIN_TOKEN` 부착, 비-admin은 빈 문자열 유지
-
-**버그 2 — 평가금액에 투자원금 표시 (label 매핑)** — ✅ 수정
-- 원인: `app.py:405` `state.total_eval = at._initial_cash` (초기 자본금 고정)
-- 수정: `state.total_eval = at._available_cash` (보유 0 가정)
-
-**잔여 — 보유 종목 발생 후 평가금액 정확도** (α-1b 검토)
-- 현재: `total_eval = _available_cash`만. 보유 시 시가 합계 누락.
-- 정상: `total_eval = available_cash + sum(holdings_market_value)` — `holdings_market_value` 미구현
-
-**Phase α-0으로 흡수된 이슈** (별도 추적 종료):
-- ~~ISSUE-025 청산 조건 ④ 선물 급락 미구현~~ → Phase α-0 항목 2
-- ~~monitor.py "25분 타임아웃" 주석 오류~~ → Phase α-0 항목 1
-
----
-
-## 12. 운영 Runbook (α-1a 가동 후)
-
-### 12.1 인스턴스 정보
-
-| 항목 | 값 |
-|------|-----|
-| Host | ubuntu@134.185.115.229 |
-| Region | Seoul (ap-chuncheon-1, icn05 PoP) |
-| Shape | VM.Standard.E2.1.Micro (956Mi RAM + 4GB swap, 1 OCPU AMD) |
-| OS | Ubuntu 22.04 LTS |
-| Service | autotrade.service (systemd, enabled) |
-| Tunnel | Quick Tunnel (*.trycloudflare.com) — α-1b에서 Named 전환 예정 |
-
-### 12.2 09:00 가동 직전 체크리스트
-
-1. 텔레그램 봇 → 가장 최근 Tunnel URL 확인
-2. `URL?token=$DASHBOARD_ADMIN_TOKEN` 으로 dashboard admin 접속
-3. `ssh ubuntu@134.185.115.229 'free -h'` → 메모리 정상 확인
-4. `ssh ubuntu@134.185.115.229 'sudo systemctl is-active autotrade'` → `active`
-5. `ssh ubuntu@134.185.115.229 'tail -30 ~/AUTOTRADE/logs/autotrade.err'` → ERROR 없음 확인
-
-### 12.3 매매 검증 명령어 세트
-
+### 배포 패턴
 ```bash
-# 실시간 로그
-ssh ubuntu@134.185.115.229 'tail -f ~/AUTOTRADE/logs/autotrade.log'
+# 로컬 → 운영
+ssh ubuntu@134.185.115.229
+cd /home/ubuntu/AUTOTRADE
+mkdir -p backups/YYYY-MM-DD-pre-RXX
+cp config/strategy_params.yaml backups/YYYY-MM-DD-pre-RXX/
+# ... (배포 대상 파일 모두)
+exit
 
-# 거래 카운트
-ssh ubuntu@134.185.115.229 'sqlite3 ~/AUTOTRADE/data/trades.db "select count(*) from trades"'
+# 로컬에서 (Git Bash)
+cd /c/Users/terryn/AUTOTRADE
+scp src/utils/price_utils.py ubuntu@134.185.115.229:/home/ubuntu/AUTOTRADE/src/utils/
+scp config/strategy_params.yaml ubuntu@134.185.115.229:/home/ubuntu/AUTOTRADE/config/
+# ... (모든 변경 파일)
 
-# 최근 거래 10건
-ssh ubuntu@134.185.115.229 'sqlite3 -header -column ~/AUTOTRADE/data/trades.db "select datetime(timestamp,\"localtime\") as time, code, side, qty, price from trades order by id desc limit 10"'
+# 운영 검증
+ssh ubuntu@134.185.115.229
+cd /home/ubuntu/AUTOTRADE
+python3 -m py_compile src/core/watcher.py src/core/trader.py src/main.py src/utils/price_utils.py
+python3 -c "from src.main import AutoTrader; ..."  # import 체인
+python3 -c "from config.settings import StrategyParams; ..."  # 파라미터 확인
 
-# 시그널 발화 로그
-ssh ubuntu@134.185.115.229 'grep -E "신고가|트리거|매수|매도|청산" ~/AUTOTRADE/logs/autotrade.log | tail -30'
-
-# 메모리
-ssh ubuntu@134.185.115.229 'free -h'
+# 재시작
+sudo systemctl restart autotrade
+sudo systemctl status autotrade --no-pager
+tail -30 logs/autotrade_$(date +%Y-%m-%d).log
 ```
 
-### 12.4 트러블슈팅
+### 자동화
+- **cron 06:40 KST**: `send_dashboard_url.py` 실행 → service 시작 → URL 텔레그램 발송
+- **systemd**: `autotrade.service` (enabled, 재시작 시 자동)
 
-```bash
-# systemd 재시작
-ssh ubuntu@134.185.115.229 'sudo systemctl restart autotrade'
+### .env 변수 (12개)
 
-# systemd 정지 (긴급)
-ssh ubuntu@134.185.115.229 'sudo systemctl stop autotrade'
+| 변수 | 설명 | 기본값 |
+|---|---|---|
+| KIS_APP_KEY | KIS API 앱 키 | — |
+| KIS_APP_SECRET | KIS API 앱 시크릿 | — |
+| KIS_ACCOUNT_NO | KIS 실거래 계좌번호 | — |
+| KIS_ACCOUNT_NO_PAPER | KIS 모의투자 계좌번호 | — |
+| USE_LIVE_API | 실거래 API 사용 여부 | true |
+| DRY_RUN_CASH | DRY_RUN 가상 예수금 | 50000000 |
+| TRADE_MODE | dry_run / paper / live | dry_run |
+| TELEGRAM_BOT_TOKEN | 텔레그램 봇 토큰 | — |
+| TELEGRAM_CHAT_ID | 알림 수신 채팅 ID | — |
+| DASHBOARD_PORT | 대시보드 포트 | 8503 |
+| DASHBOARD_ADMIN_TOKEN | 대시보드 관리자 토큰 | — |
+| LOG_LEVEL | 로그 레벨 | INFO |
 
-# Tunnel URL 재발송 강제 (재시작 → cloudflared 새 URL → 텔레그램 발송)
-ssh ubuntu@134.185.115.229 'sudo systemctl restart autotrade'
+---
+
+## 8. 협업 규칙 (수석님 ↔ Claude)
+
+### §5.6 협업 규칙 — 8 원칙
+
+> 이 섹션은 vault 의 *원본 §5.6* 기반. 수석님이 직접 관리.
+
+1. **사실 base 우선** — 추측 금지. 코드 / 로그 / 문서 직접 확인. 메모리/추측을 사실로 단정하지 말 것.
+2. **진단 후 작업** — M-N (미션) → 명령서 (W-N) → 검증 → 보고 순서
+3. **멈춤 조건 명시** — 예상 외 결과 시 즉시 멈춤 + 보고. 자동 수정 금지
+4. **화이트리스트 원칙** — 명령서는 *수정 가능한 파일만* 명시. 블랙리스트는 손대지 말 것
+5. **원자 작업** — 한 작업 = 한 영역. 여러 영역 동시 수정 금지
+6. **검증 필수** — 모든 작업 후 자동 검증 (import / grep / 단위 테스트)
+7. **추가 발견 기록** — 작업 중 발견한 빈틈 / 사고 가능성 → [발견] 섹션에 기록
+8. **통합 관점** — W-N 의 좁은 영역도 *전체 시스템 맥락에서* 영향 검토
+
+### 표준 금지 조항 5개 (모든 명령서에 자동 포함)
+
+R-08 진행 중 학습된 안전 조항. 모든 W-N / M-N 명령서 끝에 표준 포함:
+
+1. **운영 서버 접근 0건** — 명령서 안에 ssh / scp / rsync 명령 0건
+2. **운영 서버 배포 금지** — `134.185.115.229` 또는 `/home/ubuntu/AUTOTRADE/` 어떤 변경도 금지
+3. **git commit 자동 실행 금지**
+4. **로컬 AutoTrader 실제 실행 금지** (검증은 import / grep / 단위 테스트만)
+5. **systemd / 데몬 재시작 금지**
+
+이 5개는 명령서 권한 (Code) 과 운영 권한 (수석님) 의 분리를 보장. 운영 환경 변경은 항상 수석님 직접 판단 + 직접 실행.
+
+### 명령서 작성 패턴
+
 ```
+[미션] <목적>
+[제약] 화이트리스트 / 블랙리스트
+[원칙] §5.6 + 자동 진행 모드 여부
+
+[배경 — 사실 base]
+<현재 상태, 진단 결과, 사용 가능한 메서드>
+
+[화이트리스트]
+<수정 가능 파일 명시>
+
+[블랙리스트]
+<손대지 말 영역>
+
+[작업 0] 사전 백업
+[작업 1] 사실 base 확인
+[작업 2] ...
+...
+
+[검증 실패 시 — 멈춤 조건]
+<어떤 경우 멈춤 + 보고>
+
+[모호한 케이스]
+<사전 결정 또는 멈춤 기준>
+
+[보고]
+<Code 가 보고할 형식>
+
+[표준 금지 조항]
+- 5개 항목
+```
+
+### 진단 패턴 — M-N
+
+```
+[미션] M-N — <진단 대상>
+[제약] 코드 수정 0줄, 읽기만, 로컬만
+
+[작업 1] <식별>
+[작업 2] <본문 확인>
+...
+
+[검증]
+<판정 기준>
+
+[보고]
+<형식>
+
+[표준 금지 조항]
+- 5개
+```
+
+### Claude 의 §5.6 원칙 1 위반 패턴 (R-08 학습)
+
+R-08 진행 중 Claude 가 자주 위반한 패턴 (수석님이 매번 짚어줌):
+
+1. **메모리/이전 대화의 값을 사실 base 로 단정** — 코드 grep 으로 재확인 안 함
+2. **명세 사실 base 무시** — 코드는 grep 으로 확인하면서 명세는 머릿속 가정으로 처리
+3. **무의식적 가정** — "재매수 = 사고" 같은 도메인 가정을 명세에 근거 없이 적용
+4. **컨텍스트가 길어질수록 사실 base 확인 게을리짐** — 특히 documents 블록 내용 누락
+5. **답변 모호 시 좁게 해석** — 양쪽 답이 가능한 경우에도 한쪽으로 단정
+
+대응:
+- 모든 결정 전에 "이 결정의 사실 base 가 무엇인가" 자문
+- 모호한 답변 시 즉시 명시 재요청
+- 명령서 작성 시 "이 명령서의 명세 근거는 무엇인가" 자문
+
+---
+
+## 9. 4 페르소나
+
+### 페르소나 1 — 펀드매니저
+- **역할**: 매매 명세 / 매매 철학 결정권자
+- **관심사**: 매매 로직, 리스크 파라미터, 자본 배분
+- **호출 시점**: R-N redesign 시 매매 명세 변경 논의
+
+### 페르소나 2 — 시스템 엔지니어 (SE)
+- **역할**: 아키텍처 / 코드 품질 결정권자
+- **관심사**: 모듈 분리, 의존성, 테스트, 리팩토링
+- **호출 시점**: 코드 작성 / redesign 시 구조 결정
+
+### 페르소나 3 — DBA 센터장
+- **역할**: 데이터 / 스키마 / 저장소 결정권자
+- **관심사**: SQLite 스키마, TradeRecord, 마이그레이션
+- **호출 시점**: 저장소 / 데이터 이슈 발생 시
+
+### 페르소나 4 — 보안팀장
+- **역할**: 보안 / 권한 / 접근 제어 결정권자
+- **관심사**: KIS API 키, Telegram 봇 토큰, 대시보드 admin token, 운영 환경 접근
+- **호출 시점**: 인증 / 권한 / 민감 데이터 이슈 발생 시
+
+### 호출 패턴
+수석님이 명시적으로 *"<페르소나> 관점에서 이 영역을 평가해줘"* 라고 할 때, 또는 영역이 명확할 때 Claude 가 자동 적용.
+
+추가로 **베테랑 주식 시장 리서치/분석가/펀드매니저** 역할 — AUTOTRADE 매매 전략 논의 시 Claude 의 기본 역할. 수석님 인프라 지식과 피어 레벨, 매매/금융 도메인은 멘토 레벨에서 대화하며 *"이 전략에 진짜 알파가 있는가"* 를 능동적으로 도전.
+
+---
+
+## 10. W / M / R 워크플로우
+
+### 접두사 체계
+
+- **R-N** (Redesign): 큰 영역 재설계. 여러 W-N 단계 포함
+- **W-N** (Work): 단일 작업 단위. 명령서 기반
+- **M-N** (Mini): 진단 미션. 코드 수정 없이 읽기만
+- **ISSUE-N**: 사고 / 버그 번호 (vault 에서 관리)
+
+### R-08 진행 (이번 세션, 2026-04-09 ~ 04-10)
+
+```
+R-08 (R-07 빈틈 정리 + 두 번째 매매 + 호가 단위 + 위생)
+├── M-14, M-15, M-16, M-17 (Coordinator 인벤토리, 다양한 진단)
+├── W-10b setup_logger 운영 배포
+├── W-11a yaml R-08 파라미터 (top_n 삭제, profit_only false 등)
+├── W-11b Screener/Coordinator/main.py 정리
+├── W-11c Watcher _t2_callback + get_pullback_pct
+├── W-11c-hotfix is_yes @property READY only 원복
+├── M-18 호가 단위 빈틈 진단
+├── W-12 (1차 → rev2 → rev3 검토 → rev2 재확정) 호가 단위 보정
+│   └── price_utils.py 신규 + screener.py + watcher.py
+├── M-19-pre timeout 사실 base 확정
+├── W-13 high_confirm_timeout_min 10→20
+├── W-11d Coordinator 두 번째 매매 핵심 (+387 라인)
+│   ├── ReservationSnapshot dataclass
+│   ├── _on_t2, _try_reserve_at_t2, _tiebreaker_for_next
+│   ├── _verify_reservation_at_t3, _is_in_entry_window
+│   ├── handle_t3 (async)
+│   └── start_screening is_final 파라미터
+├── M-20 _execute_exit + _on_exit_done 실행 순서 + EXITED tick 처리 진단
+├── W-11e main.py + watcher.py + trader.py 통합
+│   ├── _on_exit_done 에 handle_t3 위임 (6.5 단계)
+│   ├── _process_signals 의 _is_after_buy_deadline → _is_in_entry_window
+│   ├── _is_after_buy_deadline 메서드 제거
+│   └── trader.py place_buy_orders last-line defense
+├── W-14 매수 비율 변경 (KOSPI 2.5/3.5, KOSDAQ 3.5/5.5)
+├── M-21 settings.py default ↔ yaml 전수 비교
+└── W-15 settings.py default 6건 yaml 동기화
+```
+
+운영 배포: 7 파일 + 1 신규 (price_utils.py) → 4/10 운영 서버 정상 가동 (DRY_RUN).
+
+### 명령서 전달 패턴
+
+```
+(가) 짧은 작업: 채팅 직접 전달
+(나) 긴 작업: `docs/W-N_*.md` 파일 → Code 에게 경로 전달
+(다) 진단: M-N 명령어 채팅 직접 전달
+```
+
+---
+
+## 11. 이력 + 사고 이력
+
+### R-07 종결 (2026-04-09, v2 시점)
+- Watcher + WatcherCoordinator 중심 (8 state)
+- 3종목 동시 + single active rotation
+- 매매 명세 (09:50 / 10:55 / 11:20 / -2.7%/-3.3% / -4.0%/-5.0%)
+- W-09 로 dashboard ISSUE-035 정정
+- 매매 0건 baseline day 통과 (시장 조건 미충족 = 정상)
+
+### R-08 진행 (2026-04-09 ~ 04-10, 이번 세션)
+
+**R-07 재평가**: R-07 은 "종결" 이 아니라 "운 좋게 테스트되지 않았던 미완성 상태". 5건 빈틈 발견:
+1. 두 번째 매매 예약 구조 부재
+2. setup_logger() 미호출
+3. dashboard `.stock` 잔존 참조
+4. ISSUE-E1 rapid restart transient
+5. multi_trade.repeat_start/end 미구현
+
+**오늘 추가 발견** (R-08 진행 중):
+6. 호가 단위 보정 누락 (수석님 화면 발견)
+7. (종결) 삼성전기 SKIPPED 사고 → timeout 10분이 너무 짧음 (코드 버그 아님)
+8. slippage_ticks 미사용 (yaml 정의, 코드 0건)
+9. R-08 재매수 명세-구현 갭 (M-20 발견)
+10. settings.py default ↔ yaml 6건 불일치 (M-21 전수 발견)
+11. Pydantic validator 부재 (시각 필드, W-15 작업 중 발견)
+
+**R-08 매매 명세 변경**:
+- 유니버스: 수동 입력 개수 제한 없음
+- 09:50 단일 정규 스크리닝 + 09:50 이전 수동 여러 번 허용
+- 두 번째 매매 예약 구조 (T1/T2/T3)
+- 진입 윈도우 10:00~10:55 (모든 신규 진입)
+- 매수 비율 변경 (W-14)
+- timeout 20분 (W-13)
+- 동일 종목 당일 재매수 허용 (코드 갭은 백로그)
+
+### 주요 사고 이력
+
+| ISSUE | 영역 | 발견 시점 | 상태 |
+|---|---|---|---|
+| ISSUE-030 | 대시보드 평가금액 = 예수금 표시 | W-07b | R-08 대기 |
+| ISSUE-035 | dashboard set-targets + run-manual-screening KIS API 컨텍스트 충돌 | 2026-04-09 오전 | W-09 해소 |
+| W-07b 검증 빈틈 | `at._monitors` 패턴만 검사, 잔존 | W-09 작업 중 | 해소 |
+| t.stock.* 잔존 | W-07a 후 main.py 정정 누락 | 2026-04-09 09:22 | 해소 |
+| `.stock` 잔존 참조 | screening broadcast 경로 (StockCandidate) | 2026-04-09 09:22 | R-08 백로그 #25 |
+| 호가 단위 미보정 | 매수가/손절가가 KRX 호가 단위 위반 | 2026-04-10 (수석님 화면) | W-12-rev2 해소 |
+| 삼성전기 SKIPPED | 트리거 후 10분 SKIPPED, 시장은 19분에 도달 | 2026-04-10 운영 | W-13 timeout 20분 (빈틈 아님) |
+
+### KIS API 크로스루프 위험 영역
+
+| 위치 | 호출 | 위험도 |
+|---|---|---|
+| dashboard/app.py:309 | `api.get_current_price()` in `api_search_stock` | 🔴 ISSUE-035 패턴 (수석님 미사용 합의) |
+
+> 나머지 20+ KIS API 호출은 모두 AutoTrader event loop 내부 — 안전.
+
+### 환경 사고 이력
+
+| # | 사고 | 해소 |
+|---|---|---|
+| E1 | 토큰 캐시 read-only filesystem | 자연 해소 (디스크 19%, 쓰기 정상) |
+| E2 | ISSUE-035 | W-09 |
+| E3 | KIS API FHKST01010100 일시 에러 | 재시도 성공 |
+| E4 | systemd SIGTERM (원인 미지) | R-08 백로그 |
+
+---
+
+## 12. R-08 빈틈 카탈로그 + 백로그
+
+### R-08 빈틈 (전체 11건)
+
+| # | 빈틈 | 위험도 | 상태 | 해결 작업 |
+|---|---|---|---|---|
+| 1 | 두 번째 매매 예약 구조 부재 | 🔴 높음 | ✅ 해결 | W-11d (Coordinator 핵심) |
+| 2 | setup_logger() 미호출 | 🟡 중간 | ✅ 해결 | W-10b |
+| 3 | dashboard `.stock` 잔존 참조 (app.py:356) | 🟡 중간 | 백로그 | R-08 #25 |
+| 4 | ISSUE-E1 rapid restart transient | 🟢 낮음 | ✅ 흡수 | 방어 설계 |
+| 5 | multi_trade.repeat_start/end 미구현 | 🔴 높음 | ✅ 해결 | W-11d/e |
+| 6 | 호가 단위 보정 누락 | 🔴 높음 | ✅ 해결 | W-12-rev2 |
+| 7 | (종결) 삼성전기 SKIPPED — 빈틈 아님 | — | ✅ 종결 | W-13 (timeout 20분) |
+| 8 | slippage_ticks 미사용 | 🟢 낮음 | 백로그 | 매매 의도 확인 필요 |
+| 9 | R-08 재매수 명세-구현 갭 | 🟡 중간 | 백로그 | EXITED Watcher tick 차단 |
+| 10 | settings.py default ↔ yaml 6건 불일치 | 🟡 중간 | ✅ 해결 | W-15 |
+| 11 | Pydantic validator 부재 (시각 필드) | 🟢 낮음 | 백로그 | str 타입 직접 할당 |
+
+**해결**: 6건 (#1, #2, #5, #6, #7, #10) + 흡수 1건 (#4)
+**백로그**: 4건 (#3, #8, #9, #11)
+
+### R-08 백로그 (작업 영역)
+
+| # | 항목 | 우선순위 |
+|---|---|---|
+| #3 (R-08 #25) | dashboard `.stock` 잔존 참조 — 원인 지점 외부 (main._on_screening / Coordinator.start_screening / DashboardState 후보) | 중 |
+| #8 | slippage_ticks 의도 확인 (구현 / 삭제 / 잔존 결정) | 낮 |
+| #9 | R-08 재매수 명세-구현 갭 — EXITED Watcher 리셋 또는 새 인스턴스 | 중 |
+| #11 | Pydantic validator 추가 (entry_deadline, force_liquidate_time) | 낮 |
+| #14 | ISSUE-030 대시보드 평가금액 (잔여) | 중 |
+| #19 | api_search_stock ISSUE-035 정정 | 중 |
+| #20 | stock_master.json 자동 갱신 | 중 |
+| 신규 | Watcher 기반 유닛 테스트 신규 작성 | 중 |
+
+### 환경 영역
+
+| # | 항목 | 우선순위 |
+|---|---|---|
+| E1 | 토큰 캐시 read-only 재발 감시 | 중 (자연 해소) |
+| E3 | KIS API 재시도 로직 강화 | 중상 |
+| E4 | systemd SIGTERM 원인 식별 (OOM?) | 중 |
+
+### 8 카테고리 실거래 위험 (R-04 원본)
+
+> vault 의 8 카테고리 원본 확인 후 갱신 필요. 현재까지 알려진 영역:
+
+1. 슬리피지 / 호가 단위 → ✅ W-12-rev2 (호가 단위), 🟢 슬리피지 백로그 #8
+2. 주문 거부 처리 → R-08 영역
+3. 잔고 정확성 → R-08 영역
+4. 부분 체결 → R-08 영역
+5. 네트워크 끊김 / 재시작 → R-08 영역 (E4)
+6. 수수료 / 세금 → R-08 영역
+7. VI / 거래정지 시나리오 → R-08 영역
+8. 모니터링 / 알람 강화 → R-08 영역
+
+---
+
+## 13. 향후 확장 방향
+
+### 단기 (R-08 백로그 정리, 실거래 전)
+- 빈틈 #3, #8, #9, #11 정리
+- ISSUE-030 대시보드 평가금액
+- api_search_stock ISSUE-035 정정
+- Watcher 기반 유닛 테스트 신규
+- 8 카테고리 위험 해소 (우선순위 순)
+- DRY_RUN 검증 → LIVE 전환 결정
+
+### 중기 (R-09 이후, 도메인 확장)
+- 매매 명세 개선 (백테스트 기반)
+- 복수 전략 지원 (현재 단타 1개 → 다중 전략, Strategy plug-in 패턴)
+- Account Executor 구조 (계좌별 분리)
+- 실시간 리스크 관리 (VaR, drawdown 제한)
+- 성과 분석 대시보드 (일별 / 주별 / 월별)
+- 알림 고도화 (텔레그램 인터랙티브)
+
+### 장기
+- Phase α-1: 클라우드 lift-and-shift + 멀티 사용자 UI
+- Phase α-2: Strategy plug-in 패턴 + Account Executor
+- Phase β: 두 번째 KIS 계좌 활성화, Signal Hub fan-out
+- 백테스트 엔진 신규 구축
+- 다른 거래소 지원 (NASDAQ, HKEX)
+- AI 기반 종목 선정 보조
+- 포트폴리오 관리 (다중 계좌)
+
+### 단계적 자본 증가 계획
+
+> vault 의 자본 증가 계획 원본 확인 후 갱신 필요.
+
+---
+
+## 14. vault 참조 원칙
+
+### vault 위치
+`C:\Users\terryn\Documents\Obsidian\AUTOTRADE`
+
+### vault 와 CLAUDE.md v3 의 관계
+- **CLAUDE.md v3 = 앵커** — 신규 채팅 시 한 번에 읽는 self-contained 명세
+- **vault = 상세 자료** — 각 영역의 심화 내용, 결정 근거, ISSUE 상세
+- **우선순위**: CLAUDE.md v3 가 *현재 유효한 기준*. vault 는 *참조용*
+
+### vault 이식 예정 영역
+- 매매 철학 / R-04 의사결정 원본
+- 4 페르소나 정의 원본
+- §5.6 협업 규칙 원본 (8 원칙)
+- 8 카테고리 실거래 위험 분석
+- 단계적 자본 증가 계획
+- ISSUE 번호 체계 전수 목록
+
+---
+
+## 15. 금지 사항
+
+### 절대 금지
+1. **DRY_RUN 없이 실거래 가동** — 수석님 명시 결정 전까지 LIVE 모드 자동 전환 금지
+2. **매매 명세 임의 변경** — yaml 동결값. 변경 시 새 R-N redesign 필수
+3. **Coordinator / Watcher / Trader 의 상태 전이 로직 임의 변경** — 검증 없이 금지
+4. **운영 환경 직접 코드 수정** — 로컬 → 검증 → 배포 순서 엄수
+
+### 작업 시 금지 (§5.6)
+5. **추측 기반 작업** — 사실 base 우선
+6. **광범위 검증 없이 단일 파일 정정** — 사용처 grep 필수
+7. **화이트리스트 외 파일 수정** — W-N 명령서의 화이트리스트 엄수
+8. **commit 자동 실행** — 수석님 결정
+9. **테스트 없는 배포** — 로컬 검증 → 운영 배포 → 운영 검증 3단계
+10. **중간 멈춤 없는 자동 진행** — 멈춤 조건 충족 시 즉시 보고
+
+### 표준 금지 조항 (R-08 학습, 모든 명령서 표준 포함)
+11. **운영 서버 접근 0건** (Code 측)
+12. **운영 서버 배포 금지** (Code 측)
+13. **git commit 자동 실행 금지** (Code 측)
+14. **로컬 AutoTrader 실제 실행 금지** (Code 측)
+15. **systemd / 데몬 재시작 금지** (Code 측)
+
+### 문서 금지
+16. **vault 의 원본 문서 삭제** — 이식 후에도 백업 보존
+
+---
+
+## 부록 A — R-08 구현 작업 요약 (2026-04-09 ~ 04-10)
+
+### 진단 미션 (M-N)
+
+| # | 미션 | 내용 |
+|---|---|---|
+| M-14 | watcher.py 인벤토리 (1차) | 좁은 범위 |
+| M-15 | watcher.py 인벤토리 (2차) | is_yes 기존 정의 누락 |
+| M-16 | watcher.py 추가 인벤토리 | top_n_candidates 누락 |
+| M-17 | Coordinator 전체 인벤토리 | 동시성 분석 + 메서드 매트릭스 |
+| M-18 | 호가 단위 빈틈 진단 | 매수가/손절가 KRX 위반 확인 |
+| M-19-pre | timeout 사실 base | high_confirm_timeout 10분 = 정확히 600초 |
+| M-20 | _execute_exit + _on_exit_done 실행 순서 | EXITED tick 처리, _execute_buy active 가드 |
+| M-21 | settings.py ↔ yaml 전수 비교 | 6건 불일치 발견 |
+
+### 작업 (W-N)
+
+| # | 작업 | 영역 | 결과 |
+|---|---|---|---|
+| W-10b | setup_logger 운영 배포 | logger.py | 운영 배포 완료 |
+| W-11a | yaml R-08 파라미터 | strategy_params.yaml | top_n 삭제, profit_only false 등 |
+| W-11b | Screener/Coordinator/main 정리 | 4 파일 | R-08 명세 반영 |
+| W-11c | Watcher T2 콜백 | watcher.py | _t2_callback + get_pullback_pct |
+| W-11c-hotfix | is_yes @property 원복 | watcher.py | READY only |
+| W-12 (1→rev2→rev3→rev2) | 호가 단위 보정 | price_utils.py 신규 + watcher.py + screener.py | KRX 2023 개편 후 기준 |
+| W-13 | high_confirm_timeout_min | yaml | 10→20 |
+| W-11d | Coordinator 두 번째 매매 핵심 | watcher.py | +387 라인 |
+| W-11e | main + watcher + trader 통합 | 3 파일 | handle_t3 위임, 진입 윈도우 통합, last-line defense |
+| W-14 | 매수 비율 변경 | yaml | KOSPI 2.5/3.5, KOSDAQ 3.5/5.5 |
+| W-15 | settings.py default 동기화 | settings.py | 6건 yaml 동기화 |
+
+### 운영 배포 (2026-04-10)
+
+**배포 대상 7 파일 + 1 신규**:
+1. `config/strategy_params.yaml` (W-11a + W-13 + W-14)
+2. `config/settings.py` (W-11b + W-15)
+3. `src/utils/price_utils.py` (W-12-rev2 신규)
+4. `src/core/screener.py` (W-11b + W-12-rev2)
+5. `src/core/watcher.py` (W-11b + W-11c + W-11c-hotfix + W-11d + W-12-rev2 + W-11e)
+6. `src/core/trader.py` (W-11e)
+7. `src/main.py` (W-11b + W-11e)
+
+**검증 결과**:
+- py_compile 5 파일 ✅
+- ReservationSnapshot 9 필드 ✅
+- WatcherCoordinator W-11d 6 신규 메서드 ✅
+- handle_t3 async / _on_t2 sync ✅
+- start_screening is_final keyword-only ✅
+- trader.py last-line defense ✅
+- main.py T3 위임 ✅
+- _is_after_buy_deadline 삭제 ✅
+- _is_in_entry_window 사용 ✅
+- settings W-13/W-14/W-15 8 값 ✅
+- price_utils 18 함수 ✅
+
+**가동 상태**: active (running), PID 60305, DRY_RUN 모드, 16:05 KST 기동
+
+**git commit**: `59d41aa` (8 파일, +651/-120) — feature/dashboard-fix-v1 브랜치
+
+---
+
+## 부록 B — Claude (Code) 대화 시 주의 사항
+
+이 섹션은 신규 Claude 세션이 R-08 진행 중 발견한 자기 약점을 미리 인지할 수 있도록 작성.
+
+### Claude 의 R-08 §5.6 원칙 1 위반 (8회 이상)
+
+R-08 진행 중 Claude 가 자주 추측을 사실로 단정하여 수석님이 매번 정정한 패턴:
+
+1. **호가 단위 단정** (W-12 작업 3회 반복) — 우리 코드가 틀렸다고 추측, 사실은 일부만 틀림
+2. **timeout 10분 메모리 단정** — grep 으로 재확인 안 함
+3. **W-11e 보고 빈 메시지 단정** — 컨텍스트의 documents 블록 못 봄
+4. **재매수 = 사고 무의식 가정** — 명세 사실 base 확인 안 함
+5. **결정 답변 좁게 해석** — "결정 1=B" 답을 "결정 1만" 으로 단정
+6. **CLAUDE.md 갱신 정확도** — vault 원본 확인 없이 추정 작성
+
+### 대응 원칙
+
+- 모든 결정 전에 "이 결정의 사실 base 가 무엇인가" 자문
+- 메모리/이전 대화의 값을 사실 base 로 단정 금지 → grep 재확인
+- 컨텍스트가 길 때 마지막 200~300줄 우선 정독
+- 답변 모호 시 즉시 명시 재요청, 좁은 해석 금지
+- 명령서 작성 시 "이 명령서의 명세 근거는 무엇인가" 자문
+
+### 수석님 작업 스타일
+
+- **간결한 의사소통**: "내려" (배포), "1=B" (선택), 단음절 답
+- **명시적 멈춤 조건 요구**: 자동 수정/추측 진행 금지
+- **화이트리스트 엄수**: 명령서 외 영역 수정 시 즉시 정정 요청
+- **사실 base 즉시 검증**: Claude 의 추측을 매번 짚음
+- **범위 외 작업 절단**: 불필요한 아키텍처 가이드/결정 프레임워크 즉시 차단
+
+---
+
+**문서 끝 (v3, 2026-04-10)**

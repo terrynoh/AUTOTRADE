@@ -39,3 +39,7 @@ nul
 
 # Claude Code
 .claude/
+
+# Work backups (W-N / R-N 작업 백업)
+*.pre-W*
+*.pre-R*
