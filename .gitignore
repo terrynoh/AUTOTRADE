@@ -69,3 +69,7 @@ Obsidian/*.zip
 !backtest/**/*.json
 !backtest/**/*.md
 !backtest/**/*.py
+
+# W-16 vault 작업 산출물 (1 회성, 비추적)
+vault_*.zip
+W-*_vault_*.md
