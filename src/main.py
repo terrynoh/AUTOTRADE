@@ -41,7 +41,6 @@ from src.core.watcher import Watcher, WatcherCoordinator
 from src.models.trade import TradeRecord, DailySummary, ExitReason
 from src.storage.database import Database
 from src.utils.notifier import Notifier
-from src.utils.tunnel import CloudflareTunnel
 from src.utils.logger import setup_logger
 from src.utils.market_calendar import now_kst
 
@@ -101,8 +100,6 @@ class AutoTrader:
         # ── DB ──
         self._db = Database()
 
-        # ── Cloudflare Tunnel ──
-        self._tunnel = CloudflareTunnel(port=self.settings.dashboard_port)
 
     # ── 수동 종목 설정 ────────────────────────────────────
 
@@ -208,16 +205,6 @@ class AutoTrader:
             dashboard_task = self._start_dashboard_server()
             await self._build_stock_name_cache()
 
-            # Cloudflare Tunnel 시작 → URL 텔레그램 발송 (관리자 토큰 포함)
-            tunnel_url = await self._tunnel.start()
-            if tunnel_url:
-                admin_token = os.getenv("DASHBOARD_ADMIN_TOKEN", "")
-                admin_url = f"{tunnel_url}?token={admin_token}" if admin_token else tunnel_url
-                self.notifier.notify_system(
-                    f"대시보드 접속 URL (관리자)\n\n{admin_url}\n\n"
-                    f"📌 종목 입력: 직접 입력 박스만 사용 (검색 박스 미지원)"
-                )
-
             self._running = True
             await self._fire_state_update()
 
@@ -262,7 +249,6 @@ class AutoTrader:
                 await asyncio.gather(*tasks, return_exceptions=True)
             await self.notifier.stop_polling()
             await self.api.disconnect()
-            await self._tunnel.stop()
             logger.info("AUTOTRADE 종료")
 
     # ── 스케줄: 09:50 스크리닝 ────────────────────────────
