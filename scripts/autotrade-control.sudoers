@@ -1,0 +1,6 @@
+# /etc/sudoers.d/autotrade-control
+# ubuntu 사용자가 autotrade 서비스만 패스워드 없이 제어 가능
+ubuntu ALL=(ALL) NOPASSWD: /usr/bin/systemctl start autotrade
+ubuntu ALL=(ALL) NOPASSWD: /usr/bin/systemctl stop autotrade
+ubuntu ALL=(ALL) NOPASSWD: /usr/bin/systemctl restart autotrade
+ubuntu ALL=(ALL) NOPASSWD: /usr/bin/systemctl status autotrade

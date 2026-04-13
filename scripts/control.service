@@ -1,0 +1,18 @@
+[Unit]
+Description=AUTOTRADE Control API
+Documentation=https://github.com/terryn/autotrade
+After=network.target cloudflared.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/AUTOTRADE
+ExecStart=/home/ubuntu/AUTOTRADE/venv/bin/python /home/ubuntu/AUTOTRADE/scripts/control_api.py
+Restart=always
+RestartSec=5
+
+# 환경변수
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
