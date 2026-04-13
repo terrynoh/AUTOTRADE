@@ -256,13 +256,26 @@ class AutoTrader:
     # ── 스케줄: 09:50 스크리닝 ────────────────────────────
 
     async def _schedule_screening(self):
-        """09:50까지 대기 후 스크리닝 실행."""
-        screening_time = time.fromisoformat(self.params.screening.screening_time)
-        await self._wait_until(screening_time)
-        await self._on_screening()
+        """09:50에 정규 스크리닝 실행 (is_final=True).
 
-    async def _on_screening(self):
-        """스크리닝 실행 → Coordinator 에 watchers 주입 → 3종목 KIS 구독."""
+        R-09: 프로그램이 여러 날 연속 가동될 경우를 대비해 while 루프로 반복.
+        """
+        screening_time = time.fromisoformat(self.params.screening.screening_time)
+        while self._running:
+            await self._wait_until(screening_time)
+            if not self._running:
+                break
+            await self._on_screening(is_final=True)
+            # 다음 날 09:50까지 최소 12시간 대기 후 다시 체크
+            await asyncio.sleep(43200)  # 12시간
+
+    async def _on_screening(self, *, is_final: bool = False):
+        """스크리닝 실행 → Coordinator 에 watchers 주입 → 3종목 KIS 구독.
+
+        Args:
+            is_final: True=09:50 정규 스크리닝 (이후 추가 호출 차단),
+                      False=수동 스크리닝 (덧어쓰기 가능).
+        """
         if not self.risk.can_open_position(0):
             logger.warning("매매 불가 상태")
             return
@@ -294,8 +307,8 @@ class AutoTrader:
             logger.info(f"  #{i+1} {t.name}({t.code}) {t.market.value} "
                         f"등락={t.price_change_pct:+.2f}% 거래대금={t.trading_volume_krw/1e8:.0f}억")
 
-        # Coordinator 에 watchers 주입 (W-06b2)
-        self._coordinator.start_screening(targets)
+        # Coordinator 에 watchers 주입 (R-09: is_final 전달)
+        self._coordinator.start_screening(targets, is_final=is_final)
 
         # 3종목 KIS WebSocket 구독
         codes = [w.code for w in self._coordinator.watchers]

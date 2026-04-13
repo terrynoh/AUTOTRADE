@@ -141,6 +141,9 @@ class Screener:
                         )
                         continue
 
+                # R-09: 당일 고가 조회 (pre_955_high 초기화용)
+                intraday_high = price_info.get("high", current_price) or current_price
+
                 candidates.append(StockCandidate(
                     code=code,
                     name=name,
@@ -149,6 +152,7 @@ class Screener:
                     program_net_buy=0,
                     price_change_pct=change_pct,
                     current_price=current_price,
+                    intraday_high=intraday_high,
                 ))
 
             except Exception as e:

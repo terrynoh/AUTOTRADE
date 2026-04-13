@@ -25,6 +25,7 @@ class StockCandidate:
     program_net_buy: int                 # 프로그램 순매수 금액 (원)
     price_change_pct: float              # 주가 등락률 (%)
     current_price: int                   # 현재가
+    intraday_high: int = 0               # 당일 고가 (R-09: API 조회값, pre_955_high 초기화용)
 
     @property
     def program_net_buy_ratio(self) -> float:

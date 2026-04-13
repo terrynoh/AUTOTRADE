@@ -651,9 +651,10 @@ class WatcherCoordinator:
                 market=cand.market,
                 params=self.params,
             )
-            # 09:50 시점 사전 고가 / current_price 초기화
-            w.intraday_high = cand.current_price
-            w.pre_955_high = cand.current_price
+            # R-09: API 조회한 당일 고가 사용 (pre_955_high 정확도 향상)
+            actual_high = getattr(cand, 'intraday_high', cand.current_price) or cand.current_price
+            w.intraday_high = actual_high
+            w.pre_955_high = actual_high  # 09:00~09:50 실제 고가 반영
             w.current_price = cand.current_price
 
             # W-11d: T2 이벤트 콜백 주입
