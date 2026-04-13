@@ -51,19 +51,11 @@ def is_trading_day(target_date: date | None = None) -> bool:
         return True
 
     try:
-        # pykrx로 해당 월의 거래일 목록 조회
-        start = target_date.replace(day=1)
-        end = (start + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+        # get_nearest_business_day_in_a_week 사용 (당일 포함 판단)
+        target_str = target_date.strftime("%Y%m%d")
+        nearest = pykrx_stock.get_nearest_business_day_in_a_week(target_str, prev=False)
+        is_open = (nearest == target_str)
 
-        trading_days = pykrx_stock.get_previous_business_days(
-            fromdate=start.strftime("%Y%m%d"),
-            todate=end.strftime("%Y%m%d"),
-        )
-
-        # Timestamp → date 변환
-        trading_dates = {d.date() for d in trading_days}
-
-        is_open = target_date in trading_dates
         logger.info(
             f"{target_date} — {'거래일' if is_open else '비거래일 (공휴일)'}"
         )

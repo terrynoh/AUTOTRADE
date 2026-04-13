@@ -100,6 +100,7 @@ class AutoTrader:
         # ── DB ──
         self._db = Database()
 
+        # ── Cloudflare Tunnel ──
 
     # ── 수동 종목 설정 ────────────────────────────────────
 
@@ -204,6 +205,7 @@ class AutoTrader:
             # 대시보드 서버 시작 (API 연결 + 잔고 확인 후 → attach_autotrader 가능)
             dashboard_task = self._start_dashboard_server()
             await self._build_stock_name_cache()
+
 
             self._running = True
             await self._fire_state_update()
@@ -813,6 +815,10 @@ class AutoTrader:
             age = self.api.ws_last_recv_age
             if age > infra.ws_timeout_sec and self.api.ws_connected:
                 logger.warning(f"WebSocket 무응답 {age:.0f}초 — 연결 상태 의심")
+                # 2배 timeout 초과 시 좀비 연결로 판단, 강제 끊기
+                if age > infra.ws_timeout_sec * 2:
+                    logger.critical(f"WebSocket 좀비 감지 {age:.0f}초 — 연결 강제 종료")
+                    self.api._ws_connected = False  # 재접속 루프 트리거
 
             if not self.api.ws_connected and self._coordinator.has_active and not self._emergency_cancel_done:
                 # WebSocket 끊김 + 활성 모니터 있음 → 긴급 조치

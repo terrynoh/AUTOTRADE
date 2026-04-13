@@ -29,7 +29,6 @@ def load_env(path: Path) -> dict:
 
 def send_message(bot_token: str, chat_id: str, text: str) -> bool:
     import urllib.request
-    import urllib.parse
     import json
     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     data = json.dumps({"chat_id": chat_id, "text": text}).encode()
@@ -54,7 +53,7 @@ def main():
         sys.exit(1)
 
     tunnel_url = get_dashboard_url()
-    display_url = f"{tunnel_url}?token={admin_token}" if admin_token else tunnel_url
+    display_url = tunnel_url
     message = f"🕖 AUTOTRADE 대시보드 (06:40 KST)\n\n{display_url}"
 
     for chat_id in chat_ids:

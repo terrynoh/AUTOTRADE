@@ -743,9 +743,10 @@ class KISAPI:
 
         while True:
             try:
-                self._ws_connected = True
-                self._ws_last_recv = time.time()
                 async for raw in self._ws:
+                    if not self._ws_connected:
+                        self._ws_connected = True
+                        logger.info("WebSocket 데이터 수신 확인 — 연결 정상")
                     backoff = 1.0  # 정상 수신 시 백오프 리셋
                     self._ws_last_recv = time.time()
                     try:
@@ -782,19 +783,19 @@ class KISAPI:
                                         except Exception as e:
                                             logger.error(f"실시간 콜백 에러: {e}")
 
-                                elif tr_id == WS_TR_FUTURES:
-                                    fields = body.split("^")
-                                    if len(fields) >= 3:
-                                        futures_data = {
-                                            "code": fields[0],
-                                            "time": fields[1],
-                                            "current_price": float(fields[2]),
-                                        }
-                                        for cb in self._realtime_callbacks.get(WS_TR_FUTURES, []):
-                                            try:
-                                                cb(futures_data)
-                                            except Exception as e:
-                                                logger.error(f"선물 콜백 에러: {e}")
+                            elif tr_id == WS_TR_FUTURES:
+                                fields = body.split("^")
+                                if len(fields) >= 3:
+                                    futures_data = {
+                                        "code": fields[0],
+                                        "time": fields[1],
+                                        "current_price": float(fields[2]),
+                                    }
+                                    for cb in self._realtime_callbacks.get(WS_TR_FUTURES, []):
+                                        try:
+                                            cb(futures_data)
+                                        except Exception as e:
+                                            logger.error(f"선물 콜백 에러: {e}")
 
                     except Exception as e:
                         logger.error(f"WebSocket 메시지 파싱 에러: {e}")
@@ -822,6 +823,11 @@ class KISAPI:
                 self._ws_last_recv = time.time()
                 logger.info("WebSocket 재접속 성공")
 
+
+                # ws_key 재발급 (기존 키 만료 가능)
+                self._ws_key = ""
+                await self._get_ws_key()
+                logger.info("WebSocket 키 재발급 완료")
                 # 기존 구독 코드 재구독
                 for code in list(self._subscribed_codes):
                     msg = {
