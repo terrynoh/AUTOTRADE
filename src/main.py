@@ -12,8 +12,8 @@ asyncio 기반으로 KIS REST/WebSocket 위에서
 
 타임라인:
   09:00  장 시작 → 토큰 발급, 계좌 확인
-  09:50  스크리닝 → 후보 풀 선정
-  09:55~ 신고가 감시 + 매수 대기
+  09:49  스크리닝 → 후보 풀 선정
+  09:50~ 신고가 감시 + 매수 대기
   수익청산 → 다음 후보 (10:00~11:00, 최대 3회)
   15:20  강제 청산
   15:30  장 마감 리포트
@@ -253,12 +253,12 @@ class AutoTrader:
             await self.api.disconnect()
             logger.info("AUTOTRADE 종료")
 
-    # ── 스케줄: 09:50 스크리닝 ────────────────────────────
+    # ── 스케줄: 09:49 스크리닝 ────────────────────────────
 
     async def _schedule_screening(self):
-        """09:50에 정규 스크리닝 실행 (is_final=True).
+        """09:49에 정규 스크리닝 실행 (is_final=True).
 
-        R-09: 프로그램이 여러 날 연속 가동될 경우를 대비해 while 루프로 반복.
+        R-09b: 프로그램이 여러 날 연속 가동될 경우를 대비해 while 루프로 반복.
         """
         screening_time = time.fromisoformat(self.params.screening.screening_time)
         while self._running:

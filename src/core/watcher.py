@@ -117,8 +117,8 @@ class Watcher:
     # === 시세 ===
     current_price: int = 0
 
-    # === 09:50~09:55 사전 고가 추적 (Q2 보존) ===
-    pre_955_high: int = 0
+    # === 09:00~09:49 사전 고가 추적 ===
+    pre_950_high: int = 0
 
     # === 신고가 추적 ===
     intraday_high: int = 0
@@ -255,13 +255,13 @@ class Watcher:
     def _handle_watching(self, price: int, ts: datetime) -> None:
         """WATCHING 상태 처리.
 
-        09:50~09:55: 사전 고가 추적 (pre_955_high)
-        09:55 이후: 신고가 달성 평가 + 1% 하락 트리거 평가
+        09:50 이전: 사전 고가 추적 (pre_950_high)
+        09:50 이후: 신고가 달성 평가 + 1% 하락 트리거 평가
         """
-        # === A. 09:55 이전: 사전 고가 추적만 ===
+        # === A. 09:50 이전: 사전 고가 추적만 ===
         if ts.time() < self._watch_start:
-            if price > self.pre_955_high:
-                self.pre_955_high = price
+            if price > self.pre_950_high:
+                self.pre_950_high = price
                 self.intraday_high = price
                 self.intraday_high_time = ts
             return
@@ -274,13 +274,13 @@ class Watcher:
             )
             return
 
-        # === C. 09:55 이후: 신고가 달성 평가 ===
+        # === C. 09:50 이후: 신고가 달성 평가 ===
         if not self.new_high_achieved:
-            if price > self.pre_955_high:
+            if price > self.pre_950_high:
                 self.update_intraday_high(price, ts)
                 self.new_high_achieved = True
                 logger.info(
-                    f"[{self.name}] 09:55 이후 신고가 달성: {price:,}원"
+                    f"[{self.name}] 09:50 이후 신고가 달성: {price:,}원"
                 )
             elif price > self.intraday_high:
                 self.update_intraday_high(price, ts)
@@ -651,10 +651,10 @@ class WatcherCoordinator:
                 market=cand.market,
                 params=self.params,
             )
-            # R-09: API 조회한 당일 고가 사용 (pre_955_high 정확도 향상)
+            # R-09b: API 조회한 당일 고가 사용 (pre_950_high 정확도 향상)
             actual_high = getattr(cand, 'intraday_high', cand.current_price) or cand.current_price
             w.intraday_high = actual_high
-            w.pre_955_high = actual_high  # 09:00~09:50 실제 고가 반영
+            w.pre_950_high = actual_high  # 09:00~09:49 실제 고가 반영
             w.current_price = cand.current_price
 
             # W-11d: T2 이벤트 콜백 주입
