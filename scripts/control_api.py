@@ -11,6 +11,7 @@ Cloudflare Access 인증 후 접근 가능.
 """
 import subprocess
 import asyncio
+import socket
 from datetime import datetime, time
 from zoneinfo import ZoneInfo
 
@@ -53,6 +54,15 @@ def run_systemctl(action: str) -> tuple[bool, str]:
         return False, str(e)
 
 
+def is_dashboard_ready() -> bool:
+    """대시보드 포트(8503) 응답 여부 확인."""
+    try:
+        with socket.create_connection(("127.0.0.1", 8503), timeout=2):
+            return True
+    except OSError:
+        return False
+
+
 def get_service_status() -> dict:
     """서비스 상태 조회."""
     try:
@@ -82,6 +92,7 @@ def get_service_status() -> dict:
             "substate": props.get("SubState", "unknown"),
             "pid": props.get("MainPID", ""),
             "started_at": props.get("ActiveEnterTimestamp", ""),
+            "dashboard_ready": is_dashboard_ready() if is_active else False,
         }
     except Exception as e:
         return {"running": False, "error": str(e)}
@@ -319,6 +330,11 @@ CONTROL_HTML = """
                 btnStart.disabled = true;
                 btnStop.disabled = false;
                 dashboardLink.style.display = 'block';
+                if (data.dashboard_ready) {
+                    dashboardLink.innerHTML = '<a href="/" target="_blank">📊 대시보드 열기 →</a>';
+                } else {
+                    dashboardLink.innerHTML = '<span style="color:#eab308;font-size:14px;">⏳ 대시보드 시작 중...</span>';
+                }
             } else {
                 dot.className = 'dot dot-red';
                 text.textContent = '중지됨';
@@ -326,6 +342,7 @@ CONTROL_HTML = """
                 btnStart.disabled = false;
                 btnStop.disabled = true;
                 dashboardLink.style.display = 'none';
+                dashboardLink.innerHTML = '<a href="/" target="_blank">📊 대시보드 열기 →</a>';
             }
 
             if (data.server_time) {
