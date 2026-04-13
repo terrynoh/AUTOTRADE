@@ -41,12 +41,13 @@ else:
 
 app = FastAPI(title="AUTOTRADE Dashboard")
 
-# CORS 미들웨어 — localhost + Cloudflare Tunnel 허용
+# CORS 미들웨어 — localhost + Cloudflare Tunnel + hwrim.trade 허용
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https://.*\.trycloudflare\.com|https://.*\.cloudflareaccess\.com|http://localhost:\d+|http://127\.0\.0\.1:\d+",
+    allow_origin_regex=r"https://hwrim\.trade|https://.*\.trycloudflare\.com|https://.*\.cloudflareaccess\.com|http://localhost:\d+|http://127\.0\.0\.1:\d+",
     allow_methods=["*"],
     allow_headers=["*"],
+    allow_credentials=True,  # 쿠키 허용 (CF_Authorization)
 )
 
 
@@ -210,9 +211,10 @@ async def index(request: Request):
     client_ip = request.client.host if request.client else ""
     is_local = client_ip in ("127.0.0.1", "::1", "localhost")
 
-    # 원격 접속 시 ?token= 쿼리파라미터로 관리자 인증
+    # 관리자 인증: Cloudflare Access 헤더 우선, fallback ?token= 쿼리파라미터
+    cf_email = request.headers.get("CF-Access-Authenticated-User-Email", "")
     token_param = request.query_params.get("token", "")
-    is_admin = is_local or (ADMIN_TOKEN and hmac.compare_digest(token_param, ADMIN_TOKEN))
+    is_admin = is_local or bool(cf_email) or (ADMIN_TOKEN and hmac.compare_digest(token_param, ADMIN_TOKEN))
 
     if is_admin:
         html = html.replace("/*__ADMIN__*/", "const IS_ADMIN = true;")
@@ -369,11 +371,15 @@ async def api_run_manual_screening(token: str = Header(None, alias="X-Admin-Toke
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
-    """WebSocket — 읽기 전용 상태 브로드캐스트. 제어 명령 불가.
-    토큰 인증: ws://host/ws?token=xxx (관리자) 또는 미인증(읽기 전용).
+    """WebSocket — 실시간 상태 브로드캐스트.
+    인증: Cloudflare Access 헤더 우선, fallback ?token= 쿼리파라미터.
     """
+    # Cloudflare Access 헤더 체크 (WebSocket 업그레이드 시에도 전달됨)
+    cf_email = ws.headers.get("cf-access-authenticated-user-email", "")
     token_param = ws.query_params.get("token", "")
-    is_admin = not ADMIN_TOKEN or hmac.compare_digest(token_param, ADMIN_TOKEN)
+    
+    # 관리자 인증: CF Access 헤더 있거나, 토큰 일치하거나, 토큰 미설정
+    is_admin = bool(cf_email) or (not ADMIN_TOKEN) or hmac.compare_digest(token_param, ADMIN_TOKEN)
     await ws.accept()
     state._ws_clients.append(ws)
     try:
