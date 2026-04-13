@@ -889,103 +889,17 @@ tail -30 logs/autotrade_$(date +%Y-%m-%d).log
 
 ### 소스 관리 (git workflow)
 
-**원격 저장소**: 정확한 호스트는 vault 참조 (보안상 이 문서에 노출 안 함)
-
-**브랜치 구조**:
-- `main` — 안정 브랜치, 운영 sync 기준
-- `feature/dashboard-fix-v1` — 작업 브랜치 (R-08 작업 누적, 향후 정리/rename 가능)
-- 단일 개발자 워크플로 → fast-forward merge 가능
-
-**브랜치 전략**:
-- 작업은 feature 브랜치 (`feature/*`) 에서 수행 + commit
-- main 으로 fast-forward merge (diverge 거의 없음)
-- 양쪽 origin push (main + feature 둘 다)
-- merge conflict 거의 없음 (단일 개발자)
+> 브랜치 구조, 배포 흐름, 운영 서버 git 설정 상세 → `Obsidian/개발환경.md`
 
 **commit 메시지 패턴**:
-- `feat: <영역> <내용>` — 기능 추가 (예: R-08 매매 명세 구현)
+- `feat: <영역> <내용>` — 기능 추가
 - `fix: <영역> <내용>` — 버그 수정
 - `chore: <내용>` — 위생 / 인프라 / .gitignore 정리
 - `docs: <내용>` — 문서 (CLAUDE.md vault 등)
 
-**운영 ↔ git 워크플로우**:
-
-```
-1. 로컬 작업 (Claude Code 명령서 기반)
-2. 로컬 검증 (py_compile, import 체인, grep)
-3. 로컬 → 운영 scp 배포 (수동, Git Bash)
-4. 운영 검증 (import + StrategyParams 로드)
-5. systemctl restart autotrade
-6. git commit (수석님 직접, 자동 X)
-7. main fast-forward merge
-8. origin push (main + feature 둘 다)
-```
-
-**중요**: 운영 서버에는 git 이 없음 (수동 scp 배포). 따라서:
-- git 은 *소스 보존 + 추적용*
-- 운영 동기화는 *scp 직접 배포*
-- **운영 ↔ git 비대칭 위험 영역**: 운영 서버에만 있는 파일이 git 에 없으면 다른 환경 재구축 시 누락. R-08 정리 시 발견된 경우:
-  - `scripts/send_dashboard_url.py` (운영 cron 핵심) — 추가 commit 으로 해소
-  - `docs/autotrade.service.*` (systemd 정의) — 추가 commit 으로 해소
-
-**`.gitignore` 주요 패턴** (R-08 정리 후):
-
-```gitignore
-# 보안
-.env
-token_paper.json
-token_live.json
-token_*.tmp
-
-# 런타임
-data/
-logs/
-
-# Python
-__pycache__/
-*.pyc
-*.pyo
-venv/
-.venv/
-dist/
-build/
-
-# IDE
-.vscode/
-.idea/
-*.swp
-
-# Claude / Agents
-.claude/
-.agents/
-
-# Work backups (R-08 추가)
-*.pre-W*
-*.pre-R*
-*.bak
-*.bak.*
-
-# Temporary files (R-08 추가)
-*.patch
-_test_names.txt
-setup.zip
-skills-lock.json
-
-# Vault backups (R-08 추가, 대용량)
-Obsidian/*.tar.gz
-Obsidian/*.zip
-```
-
 **git 추적 vs 비추적 원칙**:
 - ✅ 추적: 소스 코드 (`src/`), 설정 (`config/`), 문서 (`CLAUDE.md`, `docs/W-N_*.md`), 운영 인프라 (`scripts/`, `docs/autotrade.service.*`), `.gitignore`
 - ❌ 비추적: 보안 (.env, token), 런타임 (data, logs, __pycache__), 작업 백업 (`.pre-*`, `.bak`), vault 백업 (대용량)
-
-**3-way 동기화 원칙**: 모든 변경 후 다음 3 영역이 일치해야 함:
-1. 운영 서버 (`/home/ubuntu/AUTOTRADE/`)
-2. 로컬 작업폴더 (`C:\Users\terryn\AUTOTRADE\`)
-3. git origin (main + feature 양쪽)
-
-→ 한 영역만 변경하면 다른 영역과 비대칭 발생. 비대칭은 향후 사고의 시드.
 
 ---
 
