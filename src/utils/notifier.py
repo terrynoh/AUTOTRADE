@@ -89,9 +89,6 @@ class Notifier:
         """
         from src.models.trade import ExitReason
         
-        # 이모지 결정
-        emoji = "📈" if record.pnl >= 0 else "📉"
-        
         # ExitReason 헬퍼
         reason_emoji = "✅" if record.exit_reason == ExitReason.TARGET else "🔴"
         reason_names = {
@@ -111,20 +108,29 @@ class Notifier:
 
         # 시간 포맷
         high_time = record.new_high_time.strftime("%H:%M:%S") if record.new_high_time else "-"
+        buy1_time_str = record.buy1_time.strftime("%H:%M:%S") if record.buy1_time else "-"
 
         pnl_sign = "+" if record.pnl >= 0 else ""
         capital_str = f"{record.capital // 10000:,}만원"
-        
-        # 필드 매핑 (src/models/trade.py TradeRecord)
-        entry_price = int(record.avg_buy_price)
-        entry_qty = record.total_buy_qty
         exit_price = int(record.avg_sell_price)
 
+        # === R10-011: 1차/2차 체결 라인 구성 ===
+        # 1차: 체결 시각 + 체결가 + 수량
+        line_buy1 = f"체결    │ 1차 {buy1_time_str} {record.buy1_price:,}원 × {record.buy1_qty}주"
+
+        # 2차: 체결 시 시각+체결가+수량 / 미체결 시 목표 매수가 + "매수가 미도달"
+        if record.buy2_qty > 0 and record.buy2_time is not None:
+            buy2_time_str = record.buy2_time.strftime("%H:%M:%S")
+            line_buy2 = f"        │ 2차 {buy2_time_str} {record.buy2_price:,}원 × {record.buy2_qty}주"
+        else:
+            line_buy2 = f"        │ 2차 {record.target_buy2_price:,}원 매수가 미도달"
+
         msg = (
-            f"{emoji} <b>[{record.name}] 거래 완료</b>\n"
+            f"<b>[{record.name}] 거래 완료</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"신고가  │ {record.new_high_price:,}원 ({high_time})\n"
-            f"체결    │ {entry_price:,}원 × {entry_qty}주\n"
+            f"{line_buy1}\n"
+            f"{line_buy2}\n"
             f"청산    │ {exit_price:,}원 — {reason_name} {reason_emoji}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"손익    │ {pnl_sign}{int(record.pnl):,}원 ({pnl_sign}{record.pnl_pct:.2f}%)\n"

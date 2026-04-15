@@ -245,11 +245,11 @@ class TradeLogger:
             new_high_price=watcher.confirmed_high,
             new_high_time=watcher.confirmed_high_time,
             buy1_price=watcher.buy1_price,
-            buy1_qty=entry_qty if watcher.buy1_filled else 0,
-            buy1_time=watcher.entered_at if watcher.buy1_filled else None,
+            buy1_qty=watcher.buy1_qty,                          # R10-010
+            buy1_time=watcher.buy1_time,                        # R10-010
             buy2_price=watcher.buy2_price,
-            buy2_qty=0,
-            buy2_time=None,
+            buy2_qty=watcher.buy2_qty,                          # R10-010
+            buy2_time=watcher.buy2_time,                        # R10-010
             
             # 기존 필드
             avg_buy_price=float(entry_price),
@@ -271,6 +271,7 @@ class TradeLogger:
             
             rolling_high=watcher.intraday_high,
             entry_trigger_price=watcher.target_buy1_price,
+            target_buy2_price=watcher.target_buy2_price,        # R10-011
             target_price=float(watcher.target_price),
             hard_stop_price=watcher.hard_stop_price_value,
             
@@ -324,7 +325,7 @@ class TradeLogger:
                 int(record.avg_sell_price), record.sell_time.isoformat() if record.sell_time else None,
                 record.exit_reason.value,
                 int(record.pnl), record.pnl_pct, record.capital_pnl_pct, record.holding_seconds,
-                record.rolling_high, record.entry_trigger_price, record.buy2_price,
+                record.rolling_high, record.entry_trigger_price, record.target_buy2_price,  # R10-011 정정
                 record.hard_stop_price, int(record.target_price),
                 record.trade_mode, record.capital,
             ))

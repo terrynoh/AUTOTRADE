@@ -65,7 +65,10 @@ def _map_exit_reason(s: str) -> ExitReason:
 
 
 def _detect_schema(conn: sqlite3.Connection) -> str:
-    """'new' (trade_id 컬럼 있음) 또는 'old'."""
+    """'r10' (trades_r10 테이블), 'new' (trade_id 있음), 'old'."""
+    tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+    if "trades_r10" in tables:
+        return "r10"
     cols = [c[1] for c in conn.execute("PRAGMA table_info(trades)").fetchall()]
     return "new" if "trade_id" in cols else "old"
 
@@ -101,7 +104,7 @@ def row_to_record_old(row: sqlite3.Row, today: date) -> TradeRecord:
 
 
 def row_to_record_new(row: sqlite3.Row, today: date) -> TradeRecord:
-    """신 스키마 (R-10 trade_logger) → TradeRecord."""
+    """신 스키마 (R-10 trade_logger, trades 테이블) → TradeRecord."""
     d = dict(row)
     return TradeRecord(
         trade_date=today,
@@ -124,6 +127,45 @@ def row_to_record_new(row: sqlite3.Row, today: date) -> TradeRecord:
     )
 
 
+def row_to_record_r10(row: sqlite3.Row, today: date) -> TradeRecord:
+    """trades_r10 스키마 → TradeRecord (buy1/2 상세 포함)."""
+    d = dict(row)
+    entry_price = d.get("entry_price") or 0.0
+    entry_qty = d.get("entry_qty") or 0
+    entry_amount = d.get("entry_amount") or 0
+    if entry_amount == 0 and entry_price > 0 and entry_qty > 0:
+        entry_amount = int(entry_price) * entry_qty
+    return TradeRecord(
+        trade_date=today,
+        code=d.get("code", ""),
+        name=d.get("name", ""),
+        market=d.get("market", ""),
+        new_high_price=d.get("new_high_price") or 0,
+        new_high_time=_parse_dt(d.get("new_high_time")),
+        buy1_price=d.get("buy1_price") or 0,
+        buy1_qty=d.get("buy1_qty") or 0,
+        buy1_time=_parse_dt(d.get("buy1_time")),
+        buy2_price=d.get("buy2_price") or 0,
+        buy2_qty=d.get("buy2_qty") or 0,
+        buy2_time=_parse_dt(d.get("buy2_time")),
+        avg_buy_price=float(entry_price),
+        total_buy_qty=entry_qty,
+        total_buy_amount=entry_amount,
+        avg_sell_price=float(d.get("exit_price") or 0.0),
+        sell_time=_parse_dt(d.get("exit_time")),
+        exit_reason=_map_exit_reason(d.get("exit_reason", "")),
+        pnl=d.get("pnl") or 0.0,
+        pnl_pct=d.get("pnl_pct") or 0.0,
+        capital_pnl_pct=d.get("capital_pnl_pct") or 0.0,
+        holding_seconds=d.get("holding_seconds") or 0,
+        entry_trigger_price=d.get("target_buy1_price") or 0,
+        target_buy2_price=d.get("target_buy2_price") or 0,
+        hard_stop_price=d.get("hard_stop_price") or 0,
+        capital=d.get("capital") or CAPITAL,
+        trade_mode=d.get("trade_mode", "dry_run"),
+    )
+
+
 # ── 메인 ──────────────────────────────────────────────────
 
 def main():
@@ -134,7 +176,7 @@ def main():
         sys.exit(1)
 
     if not DB_PATH.exists():
-        print(f"ERROR: DB 없음 — {DB_PATH}")
+        print(f"ERROR: DB 없음 - {DB_PATH}")
         sys.exit(1)
 
     notifier = Notifier(bot_token=token, chat_id=chat_id)
@@ -145,21 +187,29 @@ def main():
     schema = _detect_schema(conn)
     print(f"DB 스키마: {schema} / 경로: {DB_PATH}")
 
-    rows = conn.execute(
-        "SELECT * FROM trades WHERE trade_date = ? AND exit_reason != 'NO_ENTRY' ORDER BY rowid",
-        (str(today),)
-    ).fetchall()
+    if schema == "r10":
+        rows = conn.execute(
+            "SELECT * FROM trades_r10 WHERE trade_date = ? AND exit_reason != 'NO_ENTRY' ORDER BY id",
+            (str(today),)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM trades WHERE trade_date = ? AND exit_reason != 'NO_ENTRY' ORDER BY rowid",
+            (str(today),)
+        ).fetchall()
     conn.close()
 
     if not rows:
-        print(f"오늘({today}) 거래 데이터 없음 — DB를 확인하세요")
+        print(f"오늘({today}) 거래 데이터 없음 - DB를 확인하세요")
         sys.exit(0)
 
     print(f"오늘 거래 {len(rows)}건 발견\n")
 
     records: list[TradeRecord] = []
     for row in rows:
-        if schema == "new":
+        if schema == "r10":
+            rec = row_to_record_r10(row, today)
+        elif schema == "new":
             rec = row_to_record_new(row, today)
         else:
             rec = row_to_record_old(row, today)

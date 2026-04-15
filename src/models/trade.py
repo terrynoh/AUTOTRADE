@@ -66,7 +66,8 @@ class TradeRecord:
 
     # 기준값
     rolling_high: int = 0
-    entry_trigger_price: int = 0        # 매수 트리거가
+    entry_trigger_price: int = 0        # 매수 트리거가 (= target_buy1_price)
+    target_buy2_price: int = 0          # R10-011: 2차 매수 목표가 (미체결 알림용)
     target_price: float = 0.0          # 목표가
     hard_stop_price: int = 0           # R-10: 손절가
 

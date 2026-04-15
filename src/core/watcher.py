@@ -147,7 +147,11 @@ class Watcher:
     buy1_order_id: str = ""
     buy2_order_id: str = ""
     buy1_price: int = 0
+    buy1_qty: int = 0                              # R10-009
+    buy1_time: Optional[datetime] = None          # R10-009
     buy2_price: int = 0
+    buy2_qty: int = 0                              # R10-009
+    buy2_time: Optional[datetime] = None          # R10-009
     total_buy_amount: int = 0
     total_buy_qty: int = 0
 
@@ -491,11 +495,15 @@ class Watcher:
             self.buy1_filled = True
             self.buy1_pending = False
             self.buy1_price = filled_price
+            self.buy1_qty = filled_qty                # R10-009
+            self.buy1_time = ts                       # R10-009
         elif label == "buy2":
             was_buy2_filled = self.buy2_filled
             self.buy2_filled = True
             self.buy2_pending = False
             self.buy2_price = filled_price
+            self.buy2_qty = filled_qty                # R10-009
+            self.buy2_time = ts                       # R10-009
 
             # T2 이벤트: buy2 최초 체결 시 Coordinator 에 알림 (중복 호출 방지)
             if not was_buy2_filled and self._t2_callback:
