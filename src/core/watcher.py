@@ -716,8 +716,8 @@ class WatcherCoordinator:
         if active is not None and self.trader is not None:
             if self.trader.settings.is_dry_run and (active.buy1_pending or active.buy2_pending):
                 filled = self.trader.simulate_fills(active, active.current_price, ts)
-                for label in filled:
-                    active.on_buy_filled(label, active.current_price, 0, ts)
+                for label, price, qty in filled:
+                    active.on_buy_filled(label, price, qty, ts)
 
         # === 1. active 청산 신호 처리 ===
         active = self.active
@@ -770,6 +770,12 @@ class WatcherCoordinator:
 
     async def _execute_exit(self, watcher: Watcher, ts: datetime) -> None:
         """청산 발주. Trader 호출 후 콜백 통지."""
+        # R10-004 버그 수정: 청산 신호 즉시 리셋 (중복 청산 방지)
+        if not watcher._exit_signal_pending:
+            logger.warning(f"[Coordinator] 청산 중복 호출 방어: {watcher.name}")
+            return
+        watcher._exit_signal_pending = False
+
         logger.warning(
             f"[Coordinator] 청산 발주: {watcher.name} "
             f"reason={watcher.exit_reason} price={watcher.exit_price}"
