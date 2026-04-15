@@ -38,8 +38,7 @@ from src.core.stock_master import StockMaster
 from src.core.trader import Trader
 from src.core.risk_manager import RiskManager
 from src.core.watcher import Watcher, WatcherCoordinator
-from src.models.trade import TradeRecord, DailySummary, ExitReason
-from src.storage.database import Database
+from src.storage.trade_logger import TradeLogger
 from src.utils.notifier import Notifier
 from src.utils.logger import setup_logger
 from src.utils.market_calendar import now_kst
@@ -77,9 +76,6 @@ class AutoTrader:
         # ── 수동 종목 입력 ──
         self._manual_codes: list[str] = []
 
-        # ── 거래 기록 (멀티 트레이드 시 즉시 저장) ──
-        self._trade_records: list[TradeRecord] = []
-
         # ── 기타 ──
         self._available_cash: int = 0
         self._initial_cash: int = 0
@@ -97,8 +93,8 @@ class AutoTrader:
             stock_master=self._stock_master,
         )
 
-        # ── DB ──
-        self._db = Database()
+        # ── 로그 시스템 (R-10) ──
+        self._trade_logger = TradeLogger(capital=50_000_000)
 
         # ── Cloudflare Tunnel ──
 
@@ -350,307 +346,17 @@ class AutoTrader:
 
         today = now_kst().date()
 
-        # ── 1. 미진입 watcher 의 NO_ENTRY 레코드 추가 + 이미 저장된 레코드 합산 ──
-        recorded_codes = {r.code for r in self._trade_records}
-        for watcher in self._coordinator.watchers:
-            if watcher.code not in recorded_codes:
-                # 미진입 또는 아직 기록되지 않은 watcher
-                record = self._build_trade_record(watcher, today)
-                self._trade_records.append(record)
-                try:
-                    self._db.save_trade(record)
-                except Exception as e:
-                    logger.error(f"거래 DB 저장 실패 ({watcher.name}): {e}")
-
-        trade_records = self._trade_records
-
-        # ── 2. DailySummary 생성 + DB 저장 ──
-        summary = DailySummary(
-            summary_date=today,
-            trade_mode=self.settings.trade_mode,
-            candidates_count=len(self._coordinator.watchers),
-            targets_count=len(self._coordinator.watchers),
-        )
-        for record in trade_records:
-            summary.add_trade(record)
-
+        # ── 일별 요약 출력 + 텔레그램 전송 ──
         try:
-            self._db.save_daily_summary(summary)
-            logger.info(f"일일 요약 DB 저장 완료 ({today})")
+            new_summary = self._trade_logger.update_daily_summary(today, self.settings.trade_mode)
+            if new_summary:
+                # 일일 요약 텔레그램 전송
+                self.notifier.notify_daily_summary(new_summary)
         except Exception as e:
-            logger.error(f"일일 요약 DB 저장 실패: {e}")
+            logger.error(f"일별 요약 로그 실패: {e}")
 
-        # ── 3. 콘솔 로그 ──
-        logger.info(f"당일 매매 횟수: {summary.total_trades}회 (승 {summary.winning_trades} / 패 {summary.losing_trades})")
-        logger.info(f"당일 누적 P&L: {summary.total_pnl:+,.0f}원")
-
-        for record in trade_records:
-            if record.exit_reason == ExitReason.NO_ENTRY:
-                logger.info(f"  [{record.name}] 매수 미발생")
-            else:
-                logger.info(
-                    f"  [{record.name}] 평단 {record.avg_buy_price:,.0f}원 → "
-                    f"청산 {record.avg_sell_price:,.0f}원 ({record.exit_reason.value}) "
-                    f"P&L={record.pnl:+,.0f}원 ({record.pnl_pct:+.2f}%) "
-                    f"보유 {record.holding_minutes:.0f}분"
-                )
-
-        # ── 4. 개선안 도출 ──
-        analysis = self._generate_daily_analysis(trade_records, summary)
-
-        # ── 5. 텔레그램 발송 ──
-        details = self._format_report_details(trade_records, analysis)
-        self.notifier.notify_daily_report(
-            trade_date=str(today),
-            mode=self.settings.trade_mode,
-            total_trades=summary.total_trades,
-            winning=summary.winning_trades,
-            losing=summary.losing_trades,
-            total_pnl=summary.total_pnl,
-            details=details,
-        )
-        logger.info("일일 리포트 텔레그램 발송 완료")
+        logger.info("일일 리포트 완료")
         await self._fire_state_update()
-
-    def _build_trade_record(self, watcher: Watcher, today) -> TradeRecord:
-        """Watcher에서 TradeRecord 생성."""
-        pos = self.trader.position
-
-        # 미진입
-        if watcher.total_buy_qty <= 0:
-            return TradeRecord(
-                trade_date=today,
-                code=watcher.code,
-                name=watcher.name,
-                market=watcher.market.value,
-                exit_reason=ExitReason.NO_ENTRY,
-                rolling_high=watcher.intraday_high,
-                trade_mode=self.settings.trade_mode,
-            )
-
-        # 매수/매도 데이터
-        avg_buy = (
-            watcher.total_buy_amount / watcher.total_buy_qty
-            if watcher.total_buy_qty > 0 else 0
-        )
-        pnl = 0.0
-        pnl_pct = 0.0
-        avg_sell = 0.0
-        sell_amount = 0
-        sell_time = None
-        holding_min = 0.0
-
-        # 포지션에서 매도 데이터 추출
-        if pos and pos.sell_orders:
-            sell_amount = pos.total_sell_amount
-            avg_sell = sell_amount / watcher.total_buy_qty if watcher.total_buy_qty > 0 else 0
-            last_sell = pos.sell_orders[-1]
-            sell_time = last_sell.filled_at
-            pnl = sell_amount - watcher.total_buy_amount
-            pnl_pct = (pnl / watcher.total_buy_amount * 100) if watcher.total_buy_amount > 0 else 0
-        elif pos:
-            # 미청산 (현재가 기준)
-            pnl = pos.pnl(watcher.current_price)
-            pnl_pct = pos.pnl_pct(watcher.current_price)
-            avg_sell = watcher.current_price
-
-        # 보유 시간
-        if pos and pos.opened_at and sell_time:
-            holding_min = (sell_time - pos.opened_at).total_seconds() / 60
-        elif pos and pos.opened_at:
-            holding_min = (now_kst() - pos.opened_at).total_seconds() / 60
-
-        # ExitReason 매핑
-        reason_map = {
-            "hard_stop": ExitReason.HARD_STOP,
-            "timeout": ExitReason.TIMEOUT,
-            "target": ExitReason.TARGET,
-            "futures_stop": ExitReason.FUTURES_STOP,
-            "force": ExitReason.FORCE_LIQUIDATE,
-            "manual": ExitReason.MANUAL,
-        }
-        exit_reason = reason_map.get(watcher.exit_reason, ExitReason.NO_ENTRY)
-
-        return TradeRecord(
-            trade_date=today,
-            code=watcher.code,
-            name=watcher.name,
-            market=watcher.market.value,
-            avg_buy_price=avg_buy,
-            total_buy_qty=watcher.total_buy_qty,
-            total_buy_amount=watcher.total_buy_amount,
-            buy_count=int(watcher.buy1_filled) + int(watcher.buy2_filled),
-            first_buy_time=pos.opened_at if pos else None,
-            avg_sell_price=avg_sell,
-            total_sell_amount=sell_amount,
-            sell_time=sell_time,
-            exit_reason=exit_reason,
-            pnl=pnl,
-            pnl_pct=pnl_pct,
-            holding_minutes=holding_min,
-            rolling_high=watcher.intraday_high,
-            entry_trigger_price=watcher.target_buy1_price,
-            target_price=watcher.target_price,
-            trade_mode=self.settings.trade_mode,
-        )
-
-    def _generate_daily_analysis(
-        self, trades: list[TradeRecord], summary: DailySummary
-    ) -> list[str]:
-        """당일 매매 데이터 기반 개선안 도출."""
-        suggestions: list[str] = []
-        ep = self.params.entry
-        xp = self.params.exit
-
-        traded = [t for t in trades if t.exit_reason != ExitReason.NO_ENTRY]
-        no_entry = [t for t in trades if t.exit_reason == ExitReason.NO_ENTRY]
-
-        if not traded:
-            if no_entry:
-                suggestions.append("전 종목 눌림 미발생 → 매매 안 함. 매수 기준 완화 검토 또는 종목 선정 재검토")
-            return suggestions
-
-        # ── 청산 사유 분석 ──
-        reason_stats: dict[str, list[float]] = {}
-        for t in traded:
-            key = t.exit_reason.value
-            reason_stats.setdefault(key, []).append(t.pnl_pct)
-
-        hard_stops = reason_stats.get("HARD_STOP", [])
-        targets = reason_stats.get("TARGET", [])
-        timeouts = reason_stats.get("TIMEOUT", [])
-        futures_stops = reason_stats.get("FUTURES_STOP", [])
-
-        # 하드 손절 비중 높을 때
-        if len(hard_stops) > len(traded) * 0.5:
-            suggestions.append(
-                f"하드 손절 비중 과다 ({len(hard_stops)}/{len(traded)}건). "
-                f"매수 기준 깊이를 넓히거나 손절 기준 완화 검토"
-            )
-
-        # 타임아웃 비중 높을 때
-        if len(timeouts) > len(traded) * 0.5:
-            avg_timeout_pnl = sum(timeouts) / len(timeouts) if timeouts else 0
-            suggestions.append(
-                f"타임아웃 비중 과다 ({len(timeouts)}/{len(traded)}건, 평균 {avg_timeout_pnl:+.2f}%). "
-                f"현재 {xp.timeout_from_low_min}분 → 반등 시간 부족 시 연장 검토"
-            )
-
-        # 선물 급락 청산 발생 시
-        if futures_stops:
-            suggestions.append(
-                f"선물 급락 청산 {len(futures_stops)}건 발생. "
-                f"시장 전체 하락 리스크 → 종목 선정 시 선물 추세 확인 권장"
-            )
-
-        # ── 매수 체결 분석 ──
-        buy1_only = sum(1 for t in traded if t.buy_count == 1)
-        buy_both = sum(1 for t in traded if t.buy_count >= 2)
-
-        if buy1_only > 0 and buy_both == 0:
-            suggestions.append(
-                f"전 매매 1차만 체결 (2차 미체결 {buy1_only}건). "
-                f"눌림이 2차 기준까지 미도달 → 현 파라미터 유지 권장 (얕은 눌림에서 수익 확보)"
-            )
-        elif buy_both > 0 and len(hard_stops) > 0:
-            suggestions.append(
-                f"2차 매수 체결 {buy_both}건 중 손절 발생. "
-                f"2차 매수 깊이가 손절선에 근접 → 간격 확대 검토"
-            )
-
-        # ── 보유 시간 분석 ──
-        hold_times = [t.holding_minutes for t in traded if t.holding_minutes > 0]
-        if hold_times:
-            avg_hold = sum(hold_times) / len(hold_times)
-            if avg_hold > xp.timeout_from_low_min * 0.8:
-                suggestions.append(
-                    f"평균 보유 {avg_hold:.0f}분, 타임아웃({xp.timeout_from_low_min}분) 근접. "
-                    f"반등 속도 느린 종목군 → 타임아웃 연장 또는 종목 변경 검토"
-                )
-            elif avg_hold < 5 and targets:
-                suggestions.append(
-                    f"평균 보유 {avg_hold:.0f}분으로 매우 빠른 목표가 도달. "
-                    f"목표가 상향 또는 분할 매도 검토"
-                )
-
-        # ── 미진입 종목 분석 ──
-        if len(no_entry) >= len(trades) * 0.6 and len(trades) >= 3:
-            suggestions.append(
-                f"후보 {len(trades)}종목 중 {len(no_entry)}종목 미진입. "
-                f"눌림 미발생 비율 높음 → 매수1 기준 완화 검토"
-            )
-
-        # ── 승률 기반 ──
-        if summary.total_trades >= 3 and summary.win_rate < 50:
-            suggestions.append(
-                f"승률 {summary.win_rate:.0f}% (3건+ 기준 50% 미만). "
-                f"종목 선정/진입 타이밍 재검토"
-            )
-        elif summary.total_trades >= 2 and summary.win_rate == 100:
-            suggestions.append("전 매매 수익 — 현 파라미터 유지 권장")
-
-        # ── 과거 대비 (DB에서 최근 5일 조회) ──
-        try:
-            stats = self._db.get_stats(days=7)
-            if stats.get("total_trades", 0) >= 5:
-                hist_win = stats.get("wins", 0)
-                hist_total = stats.get("total_trades", 0)
-                hist_rate = (hist_win / hist_total * 100) if hist_total else 0
-                avg_pnl = stats.get("avg_pnl_pct", 0) or 0
-                suggestions.append(
-                    f"최근 7일 누적: {hist_total}건 승률 {hist_rate:.0f}% 평균수익 {avg_pnl:+.2f}%"
-                )
-        except Exception:
-            pass
-
-        if not suggestions:
-            suggestions.append("특이사항 없음 — 현 파라미터 유지")
-
-        return suggestions
-
-    def _format_report_details(
-        self, trades: list[TradeRecord], analysis: list[str]
-    ) -> str:
-        """텔레그램 발송용 상세 텍스트 포맷."""
-        lines: list[str] = []
-
-        # 거래 상세
-        lines.append("<b>📋 거래 상세</b>")
-        for i, t in enumerate(trades, 1):
-            if t.exit_reason == ExitReason.NO_ENTRY:
-                lines.append(f"  {i}. {t.name}({t.code}) — 눌림 미발생")
-            else:
-                emoji = "🟢" if t.pnl >= 0 else "🔴"
-                lines.append(
-                    f"  {i}. {emoji} {t.name}({t.code}) {t.market}\n"
-                    f"     매수 {t.avg_buy_price:,.0f} → 청산 {t.avg_sell_price:,.0f} "
-                    f"({t.exit_reason.value})\n"
-                    f"     보유 {t.holding_minutes:.0f}분 | "
-                    f"{t.pnl:+,.0f}원 ({t.pnl_pct:+.2f}%)"
-                )
-
-        # 청산 사유 집계
-        reason_counts: dict[str, int] = {}
-        for t in trades:
-            if t.exit_reason != ExitReason.NO_ENTRY:
-                key = t.exit_reason.value
-                reason_counts[key] = reason_counts.get(key, 0) + 1
-        if reason_counts:
-            lines.append("\n<b>📊 청산 사유</b>")
-            for reason, count in reason_counts.items():
-                lines.append(f"  {reason}: {count}건")
-
-        # 개선안
-        if analysis:
-            lines.append("\n<b>💡 개선안</b>")
-            for s in analysis:
-                lines.append(f"  • {s}")
-
-        result = "\n".join(lines)
-        # 텔레그램 메시지 길이 제한 (4096자) — 초과 시 개선안까지만 유지
-        if len(result) > 3800:
-            result = result[:3800] + "\n\n⚠️ 메시지 길이 초과로 일부 생략"
-        return result
 
     # ── 실시간 가격 콜백 ──────────────────────────────────
 
@@ -746,7 +452,7 @@ class AutoTrader:
 
         책임:
         1. P&L 기록
-        2. TradeRecord 생성 + DB 저장
+        2. TradeLogger로 거래 기록 + 로그 출력
         3. 손실 한도 체크
         4. 멀티 트레이드 가드
         5. 잔고 재조회 + Coordinator 갱신
@@ -757,13 +463,16 @@ class AutoTrader:
         pnl = self.trader.get_pnl(watcher.current_price)
         self.risk.record_trade_result(pnl)
 
-        # 2. TradeRecord 생성 + DB 저장
-        record = self._build_trade_record(watcher, now_kst().date())
-        self._trade_records.append(record)
+        # 2. TradeLogger로 거래 기록 + 로그 출력 + 텔레그램 알림 (R-10 새 로그 시스템)
         try:
-            self._db.save_trade(record)
+            record = self._trade_logger.record_trade(
+                watcher, self.trader, trade_mode=self.settings.trade_mode
+            )
+            if record:
+                # 개별 거래 완료 즉시 텔레그램 전송
+                self.notifier.notify_trade_complete(record)
         except Exception as e:
-            logger.error(f"거래 DB 저장 실패 ({watcher.name}): {e}")
+            logger.error(f"거래 로그 저장 실패 ({watcher.name}): {e}")
 
         # 3. 손실 한도 체크
         try:

@@ -3,7 +3,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime
 from enum import Enum
 from typing import Optional
@@ -22,14 +22,29 @@ class ExitReason(str, Enum):
 
 @dataclass
 class TradeRecord:
-    """개별 매매 기록."""
+    """개별 매매 기록.
+    
+    R-10 확장: 신고가/체결/투자금 대비 수익률 필드 추가
+    """
 
     trade_date: date
     code: str
     name: str
     market: str                         # KOSPI / KOSDAQ
 
-    # 매수
+    # R-10: 신고가 달성
+    new_high_price: int = 0             # 09:50 이후 신고가
+    new_high_time: Optional[datetime] = None
+
+    # R-10: 1차/2차 체결 상세
+    buy1_price: int = 0
+    buy1_qty: int = 0
+    buy1_time: Optional[datetime] = None
+    buy2_price: int = 0
+    buy2_qty: int = 0
+    buy2_time: Optional[datetime] = None
+
+    # 매수 요약
     avg_buy_price: float = 0.0
     total_buy_qty: int = 0
     total_buy_amount: int = 0
@@ -45,61 +60,18 @@ class TradeRecord:
     exit_reason: ExitReason = ExitReason.NO_ENTRY
     pnl: float = 0.0                   # 손익 금액
     pnl_pct: float = 0.0               # 손익률(%)
+    capital_pnl_pct: float = 0.0       # R-10: 투자금 대비 수익률(%)
     holding_minutes: float = 0.0        # 보유 시간(분)
+    holding_seconds: int = 0           # R-10: 보유 시간(초)
 
     # 기준값
     rolling_high: int = 0
     entry_trigger_price: int = 0        # 매수 트리거가
     target_price: float = 0.0          # 목표가
+    hard_stop_price: int = 0           # R-10: 손절가
 
     # 메타
     trade_mode: str = "dry_run"         # dry_run | paper | live
+    capital: int = 50_000_000          # R-10: 투자금
 
 
-@dataclass
-class DailySummary:
-    """일일 매매 요약."""
-
-    summary_date: date
-    trade_mode: str = "dry_run"
-
-    # 스크리닝
-    candidates_count: int = 0           # 스크리닝 후보 수
-    targets_count: int = 0              # 타겟 종목 수
-
-    # 매매
-    trades: list[TradeRecord] = field(default_factory=list)
-    total_trades: int = 0
-    winning_trades: int = 0
-    losing_trades: int = 0
-    no_entry_count: int = 0             # 조정 미발생 종목 수
-
-    # 손익
-    total_pnl: float = 0.0
-    total_pnl_pct: float = 0.0
-    max_single_loss: float = 0.0
-    max_single_gain: float = 0.0
-
-    @property
-    def win_rate(self) -> float:
-        """승률(%)."""
-        total = self.winning_trades + self.losing_trades
-        if total == 0:
-            return 0.0
-        return (self.winning_trades / total) * 100
-
-    def add_trade(self, trade: TradeRecord) -> None:
-        self.trades.append(trade)
-        if trade.exit_reason == ExitReason.NO_ENTRY:
-            self.no_entry_count += 1
-            return
-
-        self.total_trades += 1
-        self.total_pnl += trade.pnl
-
-        if trade.pnl > 0:
-            self.winning_trades += 1
-            self.max_single_gain = max(self.max_single_gain, trade.pnl)
-        elif trade.pnl < 0:
-            self.losing_trades += 1
-            self.max_single_loss = min(self.max_single_loss, trade.pnl)

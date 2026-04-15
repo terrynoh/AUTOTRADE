@@ -1,18 +1,25 @@
 """
-텔레그램 알림 — 매수/매도/손절/일일 리포트 등.
+텔레그램 알림 — 거래 완료/일일 리포트.
 텔레그램 명령 수신 — /target, /clear 명령 처리.
 
 python-telegram-bot v20+ (async) 사용.
 Qt 이벤트 루프와 공존하기 위해 동기 방식으로 래핑.
+
+R-10 로그 재설계:
+- notify_trade_complete: 개별 거래 완료 시 즉시 전송
+- notify_daily_summary: 당일 종료 후 1회 전송
 """
 from __future__ import annotations
 
 import asyncio
-import re
 from datetime import datetime
-from typing import Optional, Callable
+from typing import Optional, Callable, TYPE_CHECKING
 
 from loguru import logger
+
+if TYPE_CHECKING:
+    from src.models.trade import TradeRecord
+    from src.storage.trade_logger import DailySummaryR10
 
 try:
     from telegram import Bot, Update
@@ -69,48 +76,117 @@ class Notifier:
             except Exception as e:
                 logger.error(f"텔레그램 전송 실패: {e}")
 
-    # ── 알림 타입별 메서드 ──────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # R-10 로그 재설계: 핵심 알림 메서드
+    # ══════════════════════════════════════════════════════════════
+
+    def notify_trade_complete(self, record: "TradeRecord") -> None:
+        """
+        개별 거래 완료 시 즉시 텔레그램 전송.
+        
+        Args:
+            record: TradeRecord 객체 (src/models/trade.py)
+        """
+        from src.models.trade import ExitReason
+        
+        # 이모지 결정
+        emoji = "📈" if record.pnl >= 0 else "📉"
+        
+        # ExitReason 헬퍼
+        reason_emoji = "✅" if record.exit_reason == ExitReason.TARGET else "🔴"
+        reason_names = {
+            ExitReason.TARGET: "목표가 도달",
+            ExitReason.HARD_STOP: "하드 손절",
+            ExitReason.TIMEOUT: "20분 타임아웃",
+            ExitReason.FUTURES_STOP: "선물 급락",
+            ExitReason.FORCE_LIQUIDATE: "강제 청산",
+            ExitReason.MANUAL: "수동 청산",
+            ExitReason.NO_ENTRY: "미진입",
+        }
+        reason_name = reason_names.get(record.exit_reason, record.exit_reason.value)
+
+        # 보유 시간 포맷
+        mins, secs = divmod(record.holding_seconds, 60)
+        holding_str = f"{mins}분 {secs}초" if mins > 0 else f"{secs}초"
+
+        # 시간 포맷
+        high_time = record.new_high_time.strftime("%H:%M:%S") if record.new_high_time else "-"
+
+        pnl_sign = "+" if record.pnl >= 0 else ""
+        capital_str = f"{record.capital // 10000:,}만원"
+        
+        # 필드 매핑 (src/models/trade.py TradeRecord)
+        entry_price = int(record.avg_buy_price)
+        entry_qty = record.total_buy_qty
+        exit_price = int(record.avg_sell_price)
+
+        msg = (
+            f"{emoji} <b>[{record.name}] 거래 완료</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"신고가  │ {record.new_high_price:,}원 ({high_time})\n"
+            f"체결    │ {entry_price:,}원 × {entry_qty}주\n"
+            f"청산    │ {exit_price:,}원 — {reason_name} {reason_emoji}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"손익    │ {pnl_sign}{int(record.pnl):,}원 ({pnl_sign}{record.pnl_pct:.2f}%)\n"
+            f"투자금比│ {pnl_sign}{record.capital_pnl_pct:.2f}% ({capital_str} 기준)\n"
+            f"보유시간│ {holding_str}"
+        )
+        self._send(msg)
+
+    def notify_daily_summary(self, summary: "DailySummaryR10") -> None:
+        """
+        당일 매매 종료 후 일일 요약 텔레그램 전송.
+        
+        Args:
+            summary: DailySummaryR10 객체 (trade_logger.py)
+        """
+        pnl_sign = "+" if summary.total_pnl >= 0 else ""
+        emoji = "📊" if summary.total_pnl >= 0 else "📉"
+
+        # 실패 상세
+        fail_parts = []
+        if summary.hard_stop_count > 0:
+            fail_parts.append(f"하드손절 {summary.hard_stop_count}")
+        if summary.timeout_count > 0:
+            fail_parts.append(f"타임아웃 {summary.timeout_count}")
+        if summary.futures_stop_count > 0:
+            fail_parts.append(f"선물급락 {summary.futures_stop_count}")
+        if summary.force_count > 0:
+            fail_parts.append(f"강제청산 {summary.force_count}")
+        fail_str = " / ".join(fail_parts) if fail_parts else "없음"
+
+        capital_str = f"{summary.capital // 10000:,}만원"
+
+        msg = (
+            f"{emoji} <b>{summary.summary_date} 매매 일지 ({summary.trade_mode.upper()})</b>\n"
+            f"══════════════════════\n"
+            f"총 거래   │ {summary.total_trades}건\n"
+            f"성공      │ {summary.success_count}건 (목표가 도달)\n"
+            f"실패      │ {summary.fail_count}건 ({fail_str})\n"
+            f"──────────────────────\n"
+            f"총 손익   │ {pnl_sign}{summary.total_pnl:,}원\n"
+            f"투자금比  │ {pnl_sign}{summary.capital_pnl_pct:.2f}% ({capital_str} 기준)\n"
+            f"══════════════════════"
+        )
+        self._send(msg)
+
+    # ══════════════════════════════════════════════════════════════
+    # 기존 호환용 메서드 (점진적 마이그레이션)
+    # ══════════════════════════════════════════════════════════════
 
     def notify_screening_result(self, targets: list, candidates_count: int) -> None:
         """스크리닝 결과 알림."""
         if not targets:
-            msg = f"📊 11시 스크리닝 완료\n후보 {candidates_count}종목 중 타겟 없음"
+            msg = f"📊 스크리닝 완료\n후보 {candidates_count}종목 중 타겟 없음"
         else:
-            lines = [f"📊 <b>11시 스크리닝 완료</b>"]
+            lines = [f"📊 <b>스크리닝 완료 ({len(targets)}종목)</b>"]
             for t in targets:
                 s = t.stock
                 lines.append(
                     f"  ★ {s.name}({s.code}) {s.market.value}\n"
-                    f"    등락 {s.price_change_pct:+.2f}% | "
-                    f"프로그램비중 {s.program_net_buy_ratio:.1f}%"
+                    f"    등락 {s.price_change_pct:+.2f}%"
                 )
             msg = "\n".join(lines)
-
-        self._send(msg)
-
-    def notify_entry(self, name: str, price: int, qty: int, label: str) -> None:
-        """매수 알림."""
-        emoji = "🟢" if label == "initial" else "🔵"
-        msg = (
-            f"{emoji} <b>매수 ({label})</b>\n"
-            f"{name} | {qty}주 @ {price:,}원\n"
-            f"금액: {price * qty:,}원"
-        )
-        self._send(msg)
-
-    def notify_exit(self, name: str, price: int, qty: int, reason: str, pnl: float, pnl_pct: float) -> None:
-        """매도/청산 알림."""
-        emoji = "🎯" if pnl > 0 else "🔴"
-        msg = (
-            f"{emoji} <b>매도 ({reason})</b>\n"
-            f"{name} | {qty}주 @ {price:,}원\n"
-            f"P&L: {pnl:+,.0f}원 ({pnl_pct:+.2f}%)"
-        )
-        self._send(msg)
-
-    def notify_skip(self, name: str, reason: str) -> None:
-        """매매 미진입 알림."""
-        msg = f"⏭️ {name}: {reason}"
         self._send(msg)
 
     def notify_error(self, error_msg: str) -> None:
@@ -118,37 +194,13 @@ class Notifier:
         msg = f"🚨 <b>에러 발생</b>\n{error_msg}"
         self._send(msg)
 
-    def notify_daily_report(
-        self,
-        trade_date: str,
-        mode: str,
-        total_trades: int,
-        winning: int,
-        losing: int,
-        total_pnl: float,
-        details: str = "",
-    ) -> None:
-        """일일 리포트."""
-        win_rate = (winning / (winning + losing) * 100) if (winning + losing) > 0 else 0
-        emoji = "📈" if total_pnl >= 0 else "📉"
-
-        msg = (
-            f"{emoji} <b>일일 리포트</b> ({trade_date})\n"
-            f"모드: {mode}\n"
-            f"매매: {total_trades}건 (승 {winning} / 패 {losing})\n"
-            f"승률: {win_rate:.0f}%\n"
-            f"총 P&L: {total_pnl:+,.0f}원"
-        )
-        if details:
-            msg += f"\n\n{details}"
-
-        self._send(msg)
-
     def notify_system(self, message: str) -> None:
         """시스템 메시지."""
         self._send(f"ℹ️ {message}")
 
-    # ── 텔레그램 명령 수신 ─────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    # 텔레그램 명령 수신
+    # ══════════════════════════════════════════════════════════════
 
     def setup_commands(
         self,
