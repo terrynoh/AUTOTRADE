@@ -166,6 +166,8 @@ class OrderParams(BaseModel):
 class RiskParams(BaseModel):
     daily_loss_limit_pct: float = Field(default=3.0, ge=0.1, le=50.0)
     max_position_size_pct: float = Field(default=100.0, ge=1.0, le=100.0)  # 예수금 대비 100%
+    index_drop_halt_pct: float = Field(default=1.5, ge=0.1, le=10.0)  # 지수 당일 고점 대비 N% 하락 시 매매 중단
+    max_hard_stops_daily: int = Field(default=2, ge=1, le=10)  # 일일 손절 횟수 한도
 
 
 class ApiParams(BaseModel):

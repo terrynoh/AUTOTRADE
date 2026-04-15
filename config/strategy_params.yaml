@@ -74,6 +74,8 @@ order:
 risk:
   daily_loss_limit_pct: 3.0           # 일일 손실 한도 (예수금 대비 %)
   max_position_size_pct: 100          # 최대 포지션 크기 (예수금 대비 %)
+  index_drop_halt_pct: 1.5            # 지수(선물) 당일 고점 대비 N% 하락 시 매매 중단
+  max_hard_stops_daily: 2             # 일일 손절 횟수 한도 (도달 시 매매 중단)
 
 # ── API ────────────────────────────────────────────────────
 api:

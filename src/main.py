@@ -370,11 +370,19 @@ class AutoTrader:
         asyncio.create_task(self._coordinator.on_realtime_price(code, price, ts))
 
     def _on_futures_price(self, data: dict) -> None:
-        """KOSPI200 선물 실시간 체결가 수신 콜백. Coordinator 로 위임."""
+        """KOSPI200 선물 실시간 체결가 수신 콜백. Coordinator + RiskManager 로 위임."""
         price = data.get("current_price", 0.0)
         if price <= 0:
             return
         self._futures_price = price
+
+        # R-12: RiskManager 에 선물 가격 전달 (지수 급락 체크)
+        halted = self.risk.update_futures_price(price)
+        if halted and not getattr(self, '_index_halt_notified', False):
+            self._index_halt_notified = True
+            self.notifier.notify_error(
+                f"🚨 지수 급락 → 매매 중단\n{self.risk.halt_reason}"
+            )
 
         # Coordinator 에 선물 가격 전달
         self._coordinator.on_realtime_futures(price)
@@ -452,18 +460,27 @@ class AutoTrader:
 
         책임:
         1. P&L 기록
-        2. TradeLogger로 거래 기록 + 로그 출력
-        3. 손실 한도 체크
-        4. 멀티 트레이드 가드
-        5. 잔고 재조회 + Coordinator 갱신
-        6. trader.reset
-        7. 대시보드 동기화
+        2. R-12: 손절 횟수 기록 (hard_stop인 경우)
+        3. TradeLogger로 거래 기록 + 로그 출력
+        4. 손실 한도 체크
+        5. 멀티 트레이드 가드
+        6. 잔고 재조회 + Coordinator 갱신
+        7. trader.reset
+        8. 대시보드 동기화
         """
         # 1. P&L 기록
         pnl = self.trader.get_pnl(watcher.current_price)
         self.risk.record_trade_result(pnl)
 
-        # 2. TradeLogger로 거래 기록 + 로그 출력 + 텔레그램 알림 (R-10 새 로그 시스템)
+        # 2. R-12: 손절 횟수 기록 (hard_stop인 경우)
+        if watcher.exit_reason == "hard_stop":
+            halted = self.risk.record_hard_stop()
+            if halted:
+                self.notifier.notify_error(
+                    f"🚨 손절 {self.risk._hard_stop_count}회 → 매매 중단\n{self.risk.halt_reason}"
+                )
+
+        # 3. TradeLogger로 거래 기록 + 로그 출력 + 텔레그램 알림 (R-10 새 로그 시스템)
         try:
             record = self._trade_logger.record_trade(
                 watcher, self.trader, trade_mode=self.settings.trade_mode
@@ -474,20 +491,20 @@ class AutoTrader:
         except Exception as e:
             logger.error(f"거래 로그 저장 실패 ({watcher.name}): {e}")
 
-        # 3. 손실 한도 체크
+        # 4. 손실 한도 체크
         try:
             balance = await self.api.get_balance()
             self.risk.check_daily_loss_limit(balance.get("available_cash", 0))
         except Exception as e:
             logger.error(f"잔고 조회 실패 (손실 한도 체크): {e}")
 
-        # 4. 멀티 트레이드 가드
+        # 5. 멀티 트레이드 가드
         mt = self.params.multi_trade
         if not mt.enabled:
             await self._fire_state_update()
             return
 
-        # 5. 잔고 재조회 + Coordinator 갱신
+        # 6. 잔고 재조회 + Coordinator 갱신
         try:
             if self.settings.is_dry_run and self.settings.dry_run_cash > 0:
                 new_cash = self.risk.calculate_available_cash(self.settings.dry_run_cash)
@@ -503,17 +520,17 @@ class AutoTrader:
         except Exception as e:
             logger.error(f"잔고 조회 실패 (다음 매매 준비): {e}")
 
-        # 6. trader.reset (다음 종목 매수 준비)
+        # 7. trader.reset (다음 종목 매수 준비)
         self.trader.reset()
 
-        # === 6.5. T3 위임 (W-11e: 두 번째 매매 트리거) ===
+        # === 7.5. T3 위임 (W-11e: 두 번째 매매 트리거) ===
         # _on_exit_done 진입 시점에 _active_code 는 여전히 청산된 종목 코드.
         # handle_t3 가 _execute_buy 를 호출하기 전에 _active_code 를 None 으로 명시 처리.
         # 이렇게 하면 handle_t3 안에서 새 chosen.code 로 _active_code 가 atomic 하게 교체됨.
         self._coordinator._active_code = None
         await self._coordinator.handle_t3(now_kst())
 
-        # 7. 대시보드 동기화
+        # 8. 대시보드 동기화
         await self._fire_state_update()
 
     async def _network_health_check(self) -> None:
