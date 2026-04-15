@@ -247,15 +247,17 @@ class Trader:
 
     # ── DRY_RUN 체결 시뮬레이션 ───────────────────────────
 
-    def simulate_fills(self, watcher: Watcher, current_price: int, ts: datetime) -> list[str]:
+    def simulate_fills(self, watcher: Watcher, current_price: int, ts: datetime) -> list[tuple[str, int, int]]:
         """
         DRY_RUN 모드: 현재가가 지정가에 도달하면 가상 체결.
-        체결된 label 리스트 반환.
+        
+        Returns:
+            list[tuple[str, int, int]]: [(label, filled_price, filled_qty), ...]
         """
         if not self.settings.is_dry_run:
             return []
 
-        filled_labels = []
+        filled_data = []
         for order in self.pending_buy_orders:
             if not order.is_active:
                 continue
@@ -269,12 +271,12 @@ class Trader:
                     self.position = Position(code=order.code, opened_at=ts)
                 self.position.add_buy(order)
 
-                filled_labels.append(order.label)
+                filled_data.append((order.label, order.price, order.qty))
                 logger.info(
                     f"[DRY_RUN] {order.label} 가상 체결: {order.price:,}원 × {order.qty}주"
                 )
 
-        return filled_labels
+        return filled_data
 
     # ── 상태 ──────────────────────────────────────────────
 
