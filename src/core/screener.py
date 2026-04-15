@@ -194,6 +194,29 @@ class Screener:
                 logger.warning("프로그램순매수비중 조건 통과 종목 없음")
                 return []
 
+        # ── R-11: KOSDAQ Single 제외 (비중 <10%) ──
+        double_threshold = sp.program_net_buy_ratio_double
+        final_filtered = []
+        for cand in filtered:
+            ratio = cand.program_net_buy_ratio
+            if cand.market == MarketType.KOSDAQ and ratio < double_threshold:
+                logger.info(
+                    f"  → 제외(KOSDAQ Single): {cand.name}({cand.code}) "
+                    f"비중={ratio:.2f}% < {double_threshold}%"
+                )
+                continue
+            final_filtered.append(cand)
+
+        if len(final_filtered) < len(filtered):
+            logger.info(
+                f"KOSDAQ Single 제외: {len(filtered)} → {len(final_filtered)}종목"
+            )
+        filtered = final_filtered
+
+        if not filtered:
+            logger.warning("KOSDAQ Single 제외 후 남은 종목 없음")
+            return []
+
         # ── 6) 상승률 내림차순 정렬 후 전체 반환 (top_n 제한 없음, R-08)
         filtered.sort(key=lambda c: c.price_change_pct, reverse=True)
 

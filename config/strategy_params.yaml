@@ -3,6 +3,7 @@ screening:
   screening_time: "09:49"             # 스크리닝 실행 시각
   volume_min: 50000000000             # 거래대금 최소 (500억)
   program_net_buy_ratio_min: 5.0      # 프로그램순매수비중 최소 (%)
+  program_net_buy_ratio_double: 10.0  # Double/Single 분기 기준 (≥10% = Double)
   max_change_pct: 29.5                # 상한가(+30%) 제외: 이 값 이상 등락률 종목 스킵
 
 # ── 멀티 트레이드 (수익 청산 후 다음 종목) ────────────────
@@ -21,13 +22,23 @@ entry:
   high_confirm_drop_pct: 1.0          # 고가 확정 트리거: 고가 대비 N% 하락
   high_confirm_timeout_min: 20        # 고가 확정 후 N분 내 미체결 시 주문 취소 (모멘텀 소멸, 2026-04-10 W-13: 10→20)
 
-  # KOSPI 분할매수 (고가 대비 하락률 %)
-  kospi_buy1_pct: 2.5                 # 1차 매수 (W-14 2026-04-10: 2.7→2.5, 1차 진입 빈도 상승)
-  kospi_buy2_pct: 3.5                 # 2차 매수 (W-14 2026-04-10: 3.3→3.5, 분할 간격 확대)
+  # KOSPI Double (프로그램순매수비중 ≥10%) — 지지력 강, 얕은 눌림
+  kospi_double_buy1_pct: 1.9          # 1차 매수
+  kospi_double_buy2_pct: 2.4          # 2차 매수 (간격 0.5%)
 
-  # KOSDAQ 분할매수
-  kosdaq_buy1_pct: 3.5               # 1차 매수 (W-14 2026-04-10: 4.0→3.5, 1차 진입 빈도 상승)
-  kosdaq_buy2_pct: 5.5               # 2차 매수 (W-14 2026-04-10: 5.0→5.5, 분할 간격 확대)
+  # KOSPI Single (프로그램순매수비중 <10%) — 지지력 약, 깊은 눌림
+  kospi_single_buy1_pct: 2.5          # 1차 매수
+  kospi_single_buy2_pct: 3.5          # 2차 매수 (간격 1.0%)
+
+  # KOSDAQ Double (프로그램순매수비중 ≥10%) — KOSDAQ Single은 매매 제외
+  kosdaq_double_buy1_pct: 2.9         # 1차 매수
+  kosdaq_double_buy2_pct: 3.9         # 2차 매수 (간격 1.0%)
+
+  # [DEPRECATED] 기존 파라미터 — 하위호환용, 신규 코드는 double/single 사용
+  kospi_buy1_pct: 2.5
+  kospi_buy2_pct: 3.5
+  kosdaq_buy1_pct: 3.5
+  kosdaq_buy2_pct: 5.5
 
   buy1_ratio: 50                      # 1차 매수 비중 (예수금 대비 %)
   buy2_ratio: 50                      # 2차 매수 비중 (예수금 대비 %)
@@ -36,7 +47,13 @@ entry:
 exit:
   profit_target_recovery_pct: 50      # 고가-저가 50% 회복 시 매도
   timeout_from_low_min: 20            # 눌림 최저가 후 N분 내 목표 미도달 시 청산
-  # 하드 손절 (고가 대비 %)
+
+  # 하드 손절 — Double/Single 분기 (고가 대비 %)
+  kospi_double_hard_stop_pct: 3.0     # KOSPI Double 손절
+  kospi_single_hard_stop_pct: 4.0     # KOSPI Single 손절
+  kosdaq_double_hard_stop_pct: 4.4    # KOSDAQ Double 손절 (KOSDAQ Single은 매매 제외)
+
+  # [DEPRECATED] 기존 파라미터 — 하위호환용
   kospi_hard_stop_pct: 4.1
   kosdaq_hard_stop_pct: 6.15
 

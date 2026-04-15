@@ -110,6 +110,7 @@ class Watcher:
     name: str
     market: MarketType
     params: StrategyParams = field(repr=False)
+    is_double_digit: bool = False  # R-11: 프로그램순매수비중 ≥10% 여부
 
     # === 상태 ===
     state: WatcherState = WatcherState.WATCHING
@@ -310,13 +311,21 @@ class Watcher:
         self.high_confirmed_at = ts
 
         if self.market == MarketType.KOSPI:
-            buy1_pct = self.params.entry.kospi_buy1_pct
-            buy2_pct = self.params.entry.kospi_buy2_pct
-            stop_pct = self.params.exit.kospi_hard_stop_pct
+            if self.is_double_digit:
+                # R-11: KOSPI Double (프로그램순매수비중 ≥10%)
+                buy1_pct = self.params.entry.kospi_double_buy1_pct
+                buy2_pct = self.params.entry.kospi_double_buy2_pct
+                stop_pct = self.params.exit.kospi_double_hard_stop_pct
+            else:
+                # R-11: KOSPI Single (프로그램순매수비중 <10%)
+                buy1_pct = self.params.entry.kospi_single_buy1_pct
+                buy2_pct = self.params.entry.kospi_single_buy2_pct
+                stop_pct = self.params.exit.kospi_single_hard_stop_pct
         else:
-            buy1_pct = self.params.entry.kosdaq_buy1_pct
-            buy2_pct = self.params.entry.kosdaq_buy2_pct
-            stop_pct = self.params.exit.kosdaq_hard_stop_pct
+            # R-11: KOSDAQ Double — KOSDAQ Single은 Screener에서 이미 제외됨
+            buy1_pct = self.params.entry.kosdaq_double_buy1_pct
+            buy2_pct = self.params.entry.kosdaq_double_buy2_pct
+            stop_pct = self.params.exit.kosdaq_double_hard_stop_pct
 
         # 호가 단위 보정 (W-12-rev2)
         # 매수가: floor — 더 낮은 가격에 매수 (안전 마진)
@@ -652,12 +661,18 @@ class WatcherCoordinator:
 
         # === C. Watcher 생성 (기존 watchers 폐기 후 새로 생성) ===
         self.watchers = []
+        double_threshold = self.params.screening.program_net_buy_ratio_double
         for cand in candidates:
+            # R-11: 프로그램순매수비중 기준 Double/Single 판정
+            ratio = getattr(cand, 'program_net_buy_ratio', 0.0) or 0.0
+            is_double = ratio >= double_threshold
+
             w = Watcher(
                 code=cand.code,
                 name=cand.name,
                 market=cand.market,
                 params=self.params,
+                is_double_digit=is_double,  # R-11
             )
             # R-09b: API 조회한 당일 고가 사용 (pre_950_high 정확도 향상)
             actual_high = getattr(cand, 'intraday_high', cand.current_price) or cand.current_price
@@ -669,8 +684,10 @@ class WatcherCoordinator:
             w._t2_callback = self._on_t2
 
             self.watchers.append(w)
+            digit_label = "Double" if is_double else "Single"
             logger.info(
-                f"[Coordinator] Watcher 가동: {cand.name}({cand.code}) {cand.market.value}"
+                f"[Coordinator] Watcher 가동: {cand.name}({cand.code}) {cand.market.value} "
+                f"비중={ratio:.1f}% ({digit_label})"
             )
 
         # === D. 상태 초기화 ===

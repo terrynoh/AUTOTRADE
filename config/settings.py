@@ -95,6 +95,7 @@ class ScreeningParams(BaseModel):
     screening_time: str = "09:50"
     volume_min: int = Field(default=50_000_000_000, ge=0, le=1_000_000_000_000)  # 500억
     program_net_buy_ratio_min: float = Field(default=5.0, ge=0.0, le=100.0)  # 프로그램순매수비중 ≥ 5%
+    program_net_buy_ratio_double: float = Field(default=10.0, ge=0.0, le=100.0)  # Double/Single 분기 기준 (≥10% = Double)
     max_change_pct: float = Field(default=29.5, ge=1.0, le=30.0)  # 상한가(+30%) 제외 임계값
 
 
@@ -113,11 +114,21 @@ class EntryParams(BaseModel):
     high_confirm_drop_pct: float = Field(default=1.0, ge=0.1, le=10.0)  # 고가 확정 트리거: 1% 하락
     high_confirm_timeout_min: int = Field(default=20, ge=1, le=120)  # 고가 확정 후 N분 내 미체결 시 주문 취소 (W-15 2026-04-10: 10→20, W-13 yaml 동기화)
 
-    # KOSPI 분할매수 (고가 대비 %)
+    # R-11: KOSPI Double (프로그램순매수비중 ≥10%)
+    kospi_double_buy1_pct: float = Field(default=1.9, ge=0.1, le=15.0)
+    kospi_double_buy2_pct: float = Field(default=2.4, ge=0.1, le=15.0)
+
+    # R-11: KOSPI Single (프로그램순매수비중 <10%)
+    kospi_single_buy1_pct: float = Field(default=2.5, ge=0.1, le=15.0)
+    kospi_single_buy2_pct: float = Field(default=3.5, ge=0.1, le=15.0)
+
+    # R-11: KOSDAQ Double (프로그램순매수비중 ≥10%) — KOSDAQ Single은 매매 제외
+    kosdaq_double_buy1_pct: float = Field(default=2.9, ge=0.1, le=15.0)
+    kosdaq_double_buy2_pct: float = Field(default=3.9, ge=0.1, le=15.0)
+
+    # [DEPRECATED] 기존 파라미터 — 하위호환용
     kospi_buy1_pct: float = Field(default=2.5, ge=0.1, le=15.0)
     kospi_buy2_pct: float = Field(default=3.5, ge=0.1, le=15.0)
-
-    # KOSDAQ 분할매수
     kosdaq_buy1_pct: float = Field(default=3.5, ge=0.1, le=15.0)   # W-15 2026-04-10: 3.75→3.5, W-14 yaml 동기화
     kosdaq_buy2_pct: float = Field(default=5.5, ge=0.1, le=15.0)   # W-15 2026-04-10: 5.25→5.5, W-14 yaml 동기화
 
@@ -130,8 +141,14 @@ class ExitParams(BaseModel):
     profit_target_recovery_pct: float = Field(default=50.0, ge=1.0, le=100.0)  # 고가-저가 50% 회복
     timeout_from_low_min: int = Field(default=20, ge=1, le=120)  # 최저가 후 20분
 
-    kospi_hard_stop_pct: float = Field(default=4.1, ge=0.1, le=30.0)  # KOSPI 하드 손절 (고가 대비 %)
-    kosdaq_hard_stop_pct: float = Field(default=6.15, ge=0.1, le=30.0)  # KOSDAQ 하드 손절 (W-15 2026-04-10: 6.2→6.15, yaml 동기화)
+    # R-11: 하드 손절 — Double/Single 분기 (고가 대비 %)
+    kospi_double_hard_stop_pct: float = Field(default=3.0, ge=0.1, le=30.0)
+    kospi_single_hard_stop_pct: float = Field(default=4.0, ge=0.1, le=30.0)
+    kosdaq_double_hard_stop_pct: float = Field(default=4.4, ge=0.1, le=30.0)  # KOSDAQ Single은 매매 제외
+
+    # [DEPRECATED] 기존 파라미터 — 하위호환용
+    kospi_hard_stop_pct: float = Field(default=4.1, ge=0.1, le=30.0)
+    kosdaq_hard_stop_pct: float = Field(default=6.15, ge=0.1, le=30.0)
 
     futures_drop_pct: float = Field(default=1.0, ge=0.1, le=20.0)  # 선물 급락 손절 (%)
 
