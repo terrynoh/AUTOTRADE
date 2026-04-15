@@ -187,11 +187,20 @@ def main():
     schema = _detect_schema(conn)
     print(f"DB 스키마: {schema} / 경로: {DB_PATH}")
 
+    effective_schema = schema
     if schema == "r10":
         rows = conn.execute(
             "SELECT * FROM trades_r10 WHERE trade_date = ? AND exit_reason != 'NO_ENTRY' ORDER BY id",
             (str(today),)
         ).fetchall()
+        # trades_r10 데이터 없으면 구 trades 테이블 fallback
+        if not rows:
+            print("trades_r10 데이터 없음 - 구 trades 테이블로 fallback")
+            rows = conn.execute(
+                "SELECT * FROM trades WHERE trade_date = ? AND exit_reason != 'NO_ENTRY' ORDER BY rowid",
+                (str(today),)
+            ).fetchall()
+            effective_schema = "old"
     else:
         rows = conn.execute(
             "SELECT * FROM trades WHERE trade_date = ? AND exit_reason != 'NO_ENTRY' ORDER BY rowid",
@@ -203,13 +212,13 @@ def main():
         print(f"오늘({today}) 거래 데이터 없음 - DB를 확인하세요")
         sys.exit(0)
 
-    print(f"오늘 거래 {len(rows)}건 발견\n")
+    print(f"오늘 거래 {len(rows)}건 발견 (스키마: {effective_schema})\n")
 
     records: list[TradeRecord] = []
     for row in rows:
-        if schema == "r10":
+        if effective_schema == "r10":
             rec = row_to_record_r10(row, today)
-        elif schema == "new":
+        elif effective_schema == "new":
             rec = row_to_record_new(row, today)
         else:
             rec = row_to_record_old(row, today)
