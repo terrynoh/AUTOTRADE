@@ -94,7 +94,7 @@ class AutoTrader:
         )
 
         # ── 로그 시스템 (R-10) ──
-        self._trade_logger = TradeLogger(capital=50_000_000)
+        self._trade_logger = TradeLogger(capital=self.settings.dry_run_cash)
 
         # ── Cloudflare Tunnel ──
 
