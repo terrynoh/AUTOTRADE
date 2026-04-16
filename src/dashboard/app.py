@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import os
+import sqlite3
 from pathlib import Path
 
 from src.utils.market_calendar import now_kst
@@ -25,6 +26,7 @@ load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 from src.core.watcher import Watcher
 
 ADMIN_TOKEN = os.getenv("DASHBOARD_ADMIN_TOKEN", "")
+DB_PATH = Path(__file__).resolve().parents[2] / "data" / "trades.db"
 
 # 관리자 토큰 미설정 시 경고
 if not ADMIN_TOKEN:
@@ -317,6 +319,42 @@ async def api_search_stock(q: str = ""):
             pass
 
     return {"results": results}
+
+
+@app.get("/api/trades/recent")
+async def api_trades_recent(since_id: int = 0, date: str = ""):
+    """청산 거래 조회 — 로컬 sync용. 토큰 불필요.
+
+    Args:
+        since_id: 이 id 초과 건만 반환 (전역 autoincrement id).
+        date: YYYY-MM-DD 필터 (생략 시 전체).
+    """
+    if not DB_PATH.exists():
+        return {"ok": False, "msg": "DB 없음", "trades": []}
+
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        if date:
+            rows = conn.execute(
+                "SELECT * FROM trades_r10 WHERE id > ? AND trade_date = ? "
+                "AND exit_reason NOT IN ('NO_ENTRY') ORDER BY id",
+                (since_id, date),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM trades_r10 WHERE id > ? "
+                "AND exit_reason NOT IN ('NO_ENTRY') ORDER BY id",
+                (since_id,),
+            ).fetchall()
+        conn.close()
+
+        trades = [dict(row) for row in rows]
+        return {"ok": True, "count": len(trades), "trades": trades}
+
+    except Exception as e:
+        logger.error(f"/api/trades/recent 오류: {e}")
+        return {"ok": False, "msg": str(e), "trades": []}
 
 
 @app.post("/api/run-manual-screening")
