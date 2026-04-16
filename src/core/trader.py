@@ -8,7 +8,7 @@ live: 실매매 주문
 from __future__ import annotations
 
 from datetime import datetime, time as dtime
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from src.utils.market_calendar import now_kst
 
@@ -20,6 +20,9 @@ from src.kis_api.constants import ORDER_TYPE_LIMIT, ORDER_TYPE_MARKET
 from src.core.watcher import Watcher
 from src.models.order import Order, OrderSide, OrderStatus, Position
 
+if TYPE_CHECKING:
+    from src.core.fill_manager import FillManager
+
 
 class Trader:
     """주문 실행 엔진."""
@@ -30,6 +33,15 @@ class Trader:
         self.params = params
         self.position: Optional[Position] = None
         self.pending_buy_orders: list[Order] = []
+        self._fill_manager: Optional["FillManager"] = None  # R-14: W-36
+
+    def set_fill_manager(self, fill_manager: "FillManager") -> None:
+        """FillManager 주입 (R-14: W-36).
+        
+        main.py에서 Trader 생성 후 호출.
+        """
+        self._fill_manager = fill_manager
+        logger.debug("[Trader] FillManager 연결 완료")
 
     # ── 매수 주문 배치 (지정가 2건) ────────────────────────
 
@@ -106,7 +118,17 @@ class Trader:
 
         if self.settings.is_dry_run:
             order.order_id = f"DRY_{label}_{ts.strftime('%H%M%S')}"
-            order.status = OrderStatus.PENDING
+            
+            # R-14: FillManager로 예수금 검증 + 동결
+            if self._fill_manager is not None:
+                ok, reason = self._fill_manager.try_place_order(order)
+                if not ok:
+                    logger.warning(f"[DRY_RUN] 주문 거부 ({label}): {reason}")
+                    return None
+                # try_place_order가 order.status = PENDING 설정
+            else:
+                order.status = OrderStatus.PENDING
+            
             logger.debug(f"[DRY_RUN] 매수주문 시뮬: {label} {price:,}원 × {qty}주")
         else:
             try:
@@ -131,7 +153,12 @@ class Trader:
                 continue
 
             if self.settings.is_dry_run:
-                order.status = OrderStatus.CANCELLED
+                # R-14: FillManager로 동결 해제
+                if self._fill_manager is not None:
+                    self._fill_manager.cancel_order(order)
+                    # cancel_order가 order.status = CANCELLED 설정
+                else:
+                    order.status = OrderStatus.CANCELLED
                 logger.debug(f"[DRY_RUN] 주문 취소: {order.label} {order.order_id}")
             else:
                 try:
@@ -146,6 +173,104 @@ class Trader:
         watcher.buy1_order_id = ""
         watcher.buy2_order_id = ""
         self.pending_buy_orders = []
+
+    # ── R-13: 2차 매수 개별 취소 + 재발주 ─────────────────
+
+    async def cancel_and_reorder_buy2(
+        self,
+        watcher: Watcher,
+        new_price: int,
+        available_cash: int
+    ) -> bool:
+        """R-13: 2차 매수 주문만 취소 후 새 가격으로 재발주.
+
+        1차 체결 후 비중 변경 시 호출.
+
+        Args:
+            watcher: 대상 Watcher
+            new_price: 새 2차 매수가
+            available_cash: 가용 현금
+
+        Returns:
+            True: 재발주 성공
+            False: 취소 또는 재발주 실패
+        """
+        # 이미 체결됐으면 재발주 불필요
+        if watcher.buy2_filled:
+            logger.debug(f"[{watcher.name}] buy2 이미 체결됨 — 재발주 스킵")
+            return False
+
+        # buy2 주문이 없으면 재발주 불필요
+        if not watcher.buy2_order_id:
+            logger.debug(f"[{watcher.name}] buy2 주문 없음 — 재발주 스킵")
+            return False
+
+        old_order = None
+        for order in self.pending_buy_orders:
+            if order.label == "buy2" and order.is_active:
+                old_order = order
+                break
+
+        if old_order is None:
+            logger.debug(f"[{watcher.name}] buy2 미체결 주문 없음 — 재발주 스킵")
+            return False
+
+        old_price = old_order.price
+        old_qty = old_order.qty
+
+        # ── 1. 기존 buy2 취소 ──
+        if self.settings.is_dry_run:
+            # R-14: FillManager로 동결 해제
+            if self._fill_manager is not None:
+                self._fill_manager.cancel_order(old_order)
+            else:
+                old_order.status = OrderStatus.CANCELLED
+            logger.info(f"[DRY_RUN] buy2 취소: {old_price:,}원 → 재발주 준비")
+        else:
+            try:
+                await self.api.cancel_order(watcher.buy2_order_id, watcher.code)
+                old_order.status = OrderStatus.CANCELLED
+                logger.info(f"[{watcher.name}] buy2 취소 완료: {old_price:,}원")
+            except Exception as e:
+                logger.error(f"[{watcher.name}] buy2 취소 실패: {e}")
+                return False
+
+        # ── 2. 새 buy2 발주 ──
+        ep = self.params.entry
+        buy2_amount = int(available_cash * ep.buy2_ratio / 100)
+        new_qty = max(1, buy2_amount // new_price) if new_price > 0 else 0
+
+        if new_qty <= 0:
+            logger.warning(f"[{watcher.name}] 새 buy2 수량 0 — 재발주 취소")
+            watcher.buy2_order_id = ""
+            watcher.buy2_placed = False
+            return False
+
+        now = now_kst()
+        new_order = await self._send_buy_order(
+            watcher.code, new_qty, new_price, "buy2", now
+        )
+
+        if new_order:
+            # 기존 주문 목록에서 old_order 제거, new_order 추가
+            self.pending_buy_orders = [
+                o for o in self.pending_buy_orders if o.label != "buy2"
+            ]
+            self.pending_buy_orders.append(new_order)
+
+            watcher.buy2_order_id = new_order.order_id
+            watcher.buy2_placed = True
+
+            logger.info(
+                f"[{watcher.name}] buy2 재발주: {old_price:,} → {new_price:,}원 "
+                f"(수량 {old_qty} → {new_qty}주)"
+            )
+            return True
+        else:
+            logger.error(f"[{watcher.name}] buy2 재발주 실패")
+            watcher.buy2_order_id = ""
+            watcher.buy2_placed = False
+            return False
 
     # ── 매수 체결 처리 ────────────────────────────────────
 
@@ -245,11 +370,13 @@ class Trader:
         """현재가 (dry_run 시뮬레이션용)."""
         return watcher.current_price
 
-    # ── DRY_RUN 체결 시뮬레이션 ───────────────────────────
+    # ── DRY_RUN 체결 시뮬레이션 (R-14: W-36 FillManager 위임) ───
 
     def simulate_fills(self, watcher: Watcher, current_price: int, ts: datetime) -> list[tuple[str, int, int]]:
         """
         DRY_RUN 모드: 현재가가 지정가에 도달하면 가상 체결.
+        
+        R-14 (W-36): FillManager가 있으면 위임, 없으면 기존 로직.
         
         Returns:
             list[tuple[str, int, int]]: [(label, filled_price, filled_qty), ...]
@@ -257,6 +384,23 @@ class Trader:
         if not self.settings.is_dry_run:
             return []
 
+        # R-14: FillManager 사용 (고급 시뮬레이션)
+        if self._fill_manager is not None:
+            filled_data = self._fill_manager.check_fills(watcher, self.pending_buy_orders, ts)
+            
+            # R-14 버그픽스: 부분체결(PARTIAL)도 Position에 반영
+            # 기존: _find_filled_order가 FILLED만 찾아서 PARTIAL 시 Position 미생성
+            # 수정: filled_data의 (label, price, qty)를 직접 Position에 추가
+            for label, price, qty in filled_data:
+                if self.position is None:
+                    self.position = Position(code=watcher.code, opened_at=ts)
+                # 이번 체결분만 직접 추가 (PARTIAL/FILLED 상태와 무관)
+                self.position.total_buy_amount += price * qty
+                self.position.total_qty += qty
+            
+            return filled_data
+
+        # 기존 로직 (하위 호환)
         filled_data = []
         for order in self.pending_buy_orders:
             if not order.is_active:
@@ -277,6 +421,13 @@ class Trader:
                 )
 
         return filled_data
+
+    def _find_filled_order(self, label: str) -> Optional[Order]:
+        """체결 완료된 주문 찾기 (R-14: W-36)."""
+        for o in self.pending_buy_orders:
+            if o.label == label and o.status == OrderStatus.FILLED:
+                return o
+        return None
 
     # ── 상태 ──────────────────────────────────────────────
 

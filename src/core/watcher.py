@@ -111,6 +111,7 @@ class Watcher:
     market: MarketType
     params: StrategyParams = field(repr=False)
     is_double_digit: bool = False  # R-11: 프로그램순매수비중 ≥10% 여부
+    program_ratio: float = 0.0     # R-13: 프로그램순매수비중 실수값 (0.0~100.0)
 
     # === 상태 ===
     state: WatcherState = WatcherState.WATCHING
@@ -234,6 +235,41 @@ class Watcher:
             self.post_entry_low = price
             self.post_entry_low_time = ts
 
+    # (5-2.5) _recalc_prices — R-13 가격 재계산
+
+    def _recalc_prices(self) -> None:
+        """is_double_digit 기준으로 매수가/손절가 재계산.
+
+        R-13: 비중 변경 시 호출하여 가격 갱신.
+        confirmed_high가 설정된 상태(TRIGGERED 이후)에서만 유효.
+        """
+        if self.confirmed_high <= 0:
+            return  # TRIGGERED 이전이면 무시
+
+        if self.market == MarketType.KOSPI:
+            if self.is_double_digit:
+                # R-11: KOSPI Double (프로그램순매수비중 ≥10%)
+                buy1_pct = self.params.entry.kospi_double_buy1_pct
+                buy2_pct = self.params.entry.kospi_double_buy2_pct
+                stop_pct = self.params.exit.kospi_double_hard_stop_pct
+            else:
+                # R-11: KOSPI Single (프로그램순매수비중 <10%)
+                buy1_pct = self.params.entry.kospi_single_buy1_pct
+                buy2_pct = self.params.entry.kospi_single_buy2_pct
+                stop_pct = self.params.exit.kospi_single_hard_stop_pct
+        else:
+            # R-11: KOSDAQ Double — KOSDAQ Single은 Screener에서 이미 제외됨
+            buy1_pct = self.params.entry.kosdaq_double_buy1_pct
+            buy2_pct = self.params.entry.kosdaq_double_buy2_pct
+            stop_pct = self.params.exit.kosdaq_double_hard_stop_pct
+
+        # 호가 단위 보정 (W-12-rev2)
+        # 매수가: floor — 더 낮은 가격에 매수 (안전 마진)
+        # 손절가: ceil  — 더 일찍 손절 (손실 최소화)
+        self.target_buy1_price = floor_to_tick(int(self.confirmed_high * (1 - buy1_pct / 100)))
+        self.target_buy2_price = floor_to_tick(int(self.confirmed_high * (1 - buy2_pct / 100)))
+        self.hard_stop_price_value = ceil_to_tick(int(self.confirmed_high * (1 - stop_pct / 100)))
+
     # (5-3) on_tick
 
     def on_tick(self, price: int, ts: datetime, futures_price: float) -> None:
@@ -310,29 +346,8 @@ class Watcher:
         self.futures_at_confirmed_high = self.futures_price
         self.high_confirmed_at = ts
 
-        if self.market == MarketType.KOSPI:
-            if self.is_double_digit:
-                # R-11: KOSPI Double (프로그램순매수비중 ≥10%)
-                buy1_pct = self.params.entry.kospi_double_buy1_pct
-                buy2_pct = self.params.entry.kospi_double_buy2_pct
-                stop_pct = self.params.exit.kospi_double_hard_stop_pct
-            else:
-                # R-11: KOSPI Single (프로그램순매수비중 <10%)
-                buy1_pct = self.params.entry.kospi_single_buy1_pct
-                buy2_pct = self.params.entry.kospi_single_buy2_pct
-                stop_pct = self.params.exit.kospi_single_hard_stop_pct
-        else:
-            # R-11: KOSDAQ Double — KOSDAQ Single은 Screener에서 이미 제외됨
-            buy1_pct = self.params.entry.kosdaq_double_buy1_pct
-            buy2_pct = self.params.entry.kosdaq_double_buy2_pct
-            stop_pct = self.params.exit.kosdaq_double_hard_stop_pct
-
-        # 호가 단위 보정 (W-12-rev2)
-        # 매수가: floor — 더 낮은 가격에 매수 (안전 마진)
-        # 손절가: ceil  — 더 일찍 손절 (손실 최소화)
-        self.target_buy1_price = floor_to_tick(int(self.confirmed_high * (1 - buy1_pct / 100)))
-        self.target_buy2_price = floor_to_tick(int(self.confirmed_high * (1 - buy2_pct / 100)))
-        self.hard_stop_price_value = ceil_to_tick(int(self.confirmed_high * (1 - stop_pct / 100)))
+        # R-13: 가격 계산 메서드로 위임
+        self._recalc_prices()
 
         self.state = WatcherState.TRIGGERED
         logger.info(
@@ -496,23 +511,26 @@ class Watcher:
     # (5-14) on_buy_filled
 
     def on_buy_filled(self, label: str, filled_price: int, filled_qty: int, ts: datetime) -> None:
-        """매수 체결 통보. 첫 체결 시 ENTERED 전이 + post_entry_low 초기화."""
+        """매수 체결 통보. 첫 체결 시 ENTERED 전이 + post_entry_low 초기화.
+        
+        R-14 (W-39): 부분체결 지원 — 매 체결 통보마다 누적 처리.
+        """
         self.total_buy_amount += filled_price * filled_qty
         self.total_buy_qty += filled_qty
 
         if label == "buy1":
             self.buy1_filled = True
             self.buy1_pending = False
-            self.buy1_price = filled_price
-            self.buy1_qty = filled_qty                # R10-009
-            self.buy1_time = ts                       # R10-009
+            self.buy1_price = filled_price         # 마지막 체결가
+            self.buy1_qty += filled_qty            # R-14 W-39: 누적
+            self.buy1_time = ts
         elif label == "buy2":
             was_buy2_filled = self.buy2_filled
             self.buy2_filled = True
             self.buy2_pending = False
-            self.buy2_price = filled_price
-            self.buy2_qty = filled_qty                # R10-009
-            self.buy2_time = ts                       # R10-009
+            self.buy2_price = filled_price         # 마지막 체결가
+            self.buy2_qty += filled_qty            # R-14 W-39: 누적
+            self.buy2_time = ts
 
             # T2 이벤트: buy2 최초 체결 시 Coordinator 에 알림 (중복 호출 방지)
             if not was_buy2_filled and self._t2_callback:
@@ -529,7 +547,7 @@ class Watcher:
 
         avg = self.total_buy_amount / self.total_buy_qty if self.total_buy_qty > 0 else 0
         logger.info(
-            f"[{self.name}] {label} 체결: {filled_price:,}원 × {filled_qty}주 (평단 {avg:,.0f}원)"
+            f"[{self.name}] {label} 체결: {filled_price:,}원 × {filled_qty}주 (1차 {self.buy1_qty}주, 2차 {self.buy2_qty}주, 평단 {avg:,.0f}원)"
         )
 
     # (5-15) get_pullback_pct
@@ -590,6 +608,7 @@ class WatcherCoordinator:
         self._latest_futures_price: float = 0.0
         self._available_cash: int = 0  # main.py 에서 주입
         self._exit_callback = None  # 청산 후 콜백 (main.py 에서 주입)
+        self._risk_manager = None  # R-14 버그픽스: 리스크 매니저 (main.py에서 주입)
 
         # 매수 마감 / 강제 청산 시각 (캐싱)
         self._entry_deadline = time.fromisoformat(params.entry.entry_deadline)
@@ -616,6 +635,14 @@ class WatcherCoordinator:
         호출 시점: _execute_exit 가 trader.execute_exit 끝낸 직후
         """
         self._exit_callback = callback
+
+    def set_risk_manager(self, risk_manager) -> None:
+        """R-14 버그픽스: 리스크 매니저 주입. main.py 가 호출.
+        
+        _process_signals에서 trading_halted 상태를 체크하여
+        지수 급락(-1.5%) 또는 손절 2회 후 신규 매수 차단.
+        """
+        self._risk_manager = risk_manager
 
     @property
     def active(self) -> Optional[Watcher]:
@@ -673,6 +700,7 @@ class WatcherCoordinator:
                 market=cand.market,
                 params=self.params,
                 is_double_digit=is_double,  # R-11
+                program_ratio=ratio,        # R-13
             )
             # R-09b: API 조회한 당일 고가 사용 (pre_950_high 정확도 향상)
             actual_high = getattr(cand, 'intraday_high', cand.current_price) or cand.current_price
@@ -732,11 +760,25 @@ class WatcherCoordinator:
         """매 틱 후 호출. 청산 신호 처리 + 매수 발주 평가.
 
         흐름:
-        0. DRY_RUN 시뮬레이션 (active 의 미체결 매수)
-        1. active watcher 의 _exit_signal_pending 처리 (청산 발주 + active 해제)
-        2. active 가 없으면 yes_watchers 평가 (매수 발주)
+        0. R-14 버그픽스: DROPPED 상태 미체결 취소
+        1. DRY_RUN 시뮬레이션 (active 의 미체결 매수)
+        2. active watcher 의 _exit_signal_pending 처리 (청산 발주 + active 해제)
+        3. active 가 없으면 yes_watchers 평가 (매수 발주)
         """
-        # === 0. DRY_RUN 시뮬레이션 (active watcher 의 미체결 매수만) ===
+        # === R-14 버그픽스: DROPPED 상태 미체결 취소 ===
+        # _evaluate_target에서 DROPPED로 전이되면 _exit_signal_pending이 false이므로
+        # 청산 로직을 안 탐 → 미체결 주문이 그대로 잔존 + frozen 미해제
+        active = self.active
+        if active is not None and active.state == WatcherState.DROPPED:
+            logger.warning(
+                f"[Coordinator] DROPPED 상태 감지: {active.name} 미체결 취소"
+            )
+            if self.trader is not None:
+                await self.trader.cancel_buy_orders(active)
+            self._active_code = None
+            return
+
+        # === 1. DRY_RUN 시뮬레이션 (active watcher 의 미체결 매수만) ===
         active = self.active
         if active is not None and self.trader is not None:
             if self.trader.settings.is_dry_run and (active.buy1_pending or active.buy2_pending):
@@ -752,9 +794,13 @@ class WatcherCoordinator:
             # T 시점: active 가 비었음. 다음 매수 평가는 다음 틱에서 자동 처리
             return
 
-        # === 2. active 가 비어있으면 매수 발주 평가 ===
+        # === 3. active 가 비어있으면 매수 발주 평가 ===
         if self._active_code is not None:
             return  # active 잠금 (체결 대기 또는 청산 대기)
+
+        # R-14 버그픽스: 리스크 체크 (지수 급락 -1.5% 또는 손절 2회)
+        if self._risk_manager is not None and self._risk_manager.trading_halted:
+            return
 
         # W-11e: 진입 윈도우 체크 (10:00 ~ 10:55)
         # 첫 매매와 두 번째 매매 모두 동일 윈도우 적용 (수석님 확정).

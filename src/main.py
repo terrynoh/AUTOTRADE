@@ -37,7 +37,9 @@ from src.core.screener import Screener
 from src.core.stock_master import StockMaster
 from src.core.trader import Trader
 from src.core.risk_manager import RiskManager
-from src.core.watcher import Watcher, WatcherCoordinator
+from src.core.watcher import Watcher, WatcherCoordinator, WatcherState
+from src.core.cash_manager import CashManager
+from src.core.fill_manager import FillManager  # R-14: W-37
 from src.storage.trade_logger import TradeLogger
 from src.utils.notifier import Notifier
 from src.utils.logger import setup_logger
@@ -96,6 +98,17 @@ class AutoTrader:
         # ── 로그 시스템 (R-10) ──
         self._trade_logger = TradeLogger(capital=self.settings.dry_run_cash)
 
+        # ── 예수금 관리 (R-14: W-30/31) ──
+        self._cash_manager: CashManager = CashManager()
+
+        # ── 체결 관리자 (R-14: W-35/37) ──
+        self._fill_manager: FillManager = FillManager(
+            settings=self.settings,
+            cash_manager=self._cash_manager,
+            params=self.params,
+        )
+        self.trader.set_fill_manager(self._fill_manager)
+
         # ── Cloudflare Tunnel ──
 
     # ── 수동 종목 설정 ────────────────────────────────────
@@ -131,6 +144,8 @@ class AutoTrader:
             "daily_pnl": self.risk.daily_pnl,
             "manual_codes": self._manual_codes,
             "monitors": monitors,
+            # R-14: CashManager 상태
+            "cash_manager": self._cash_manager.get_summary(),
         }
 
     def _stop_trading(self) -> None:
@@ -178,6 +193,9 @@ class AutoTrader:
             # Coordinator 청산 콜백 등록 (W-06b1)
             self._coordinator.set_exit_callback(self._on_exit_done)
 
+            # R-14 버그픽스: 리스크 매니저 주입 (지수 급락/-1.5% 또는 손절 2회 시 매수 차단)
+            self._coordinator.set_risk_manager(self.risk)
+
             # WebSocket 끊김 콜백 등록 (1차 방어: 즉시 미체결 매수 취소)
             self.api.set_ws_disconnect_callback(self._on_ws_disconnect)
 
@@ -196,7 +214,13 @@ class AutoTrader:
                 self._initial_cash = balance.get("available_cash", 0)
             self._available_cash = self.risk.calculate_available_cash(self._initial_cash)
             self._coordinator.set_available_cash(self._available_cash)  # W-06b1
-            logger.info(f"예수금: {self._initial_cash:,}원 → 매매가용: {self._available_cash:,}원")
+            
+            # R-14: CashManager 초기화
+            self._cash_manager.reset(self._available_cash)
+            logger.info(
+                f"예수금: {self._initial_cash:,}원 → 매매가용: {self._available_cash:,}원 "
+                f"(CashManager 초기화 완료)"
+            )
 
             # 대시보드 서버 시작 (API 연결 + 잔고 확인 후 → attach_autotrader 가능)
             dashboard_task = self._start_dashboard_server()
@@ -214,6 +238,7 @@ class AutoTrader:
                 asyncio.create_task(self._schedule_force_liquidate(), name="force_liquidate"),
                 asyncio.create_task(self._schedule_market_close(), name="market_close"),
                 asyncio.create_task(self._network_health_check(), name="health_check"),
+                asyncio.create_task(self._ratio_updater(), name="ratio_updater"),  # R-13
             ]
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
 
@@ -504,16 +529,29 @@ class AutoTrader:
             await self._fire_state_update()
             return
 
-        # 6. 잔고 재조회 + Coordinator 갱신
+        # 6. 잔고 재조회 + Coordinator 갱신 + CashManager 동기화
         try:
             if self.settings.is_dry_run and self.settings.dry_run_cash > 0:
-                new_cash = self.risk.calculate_available_cash(self.settings.dry_run_cash)
-                logger.info(f"[DRY_RUN] 가상 예수금 재설정: {new_cash:,}원")
+                # R-14: DRY_RUN에서 P&L 반영
+                if self._cash_manager.used > 0:
+                    # CashManager가 예수금을 추적 중인 경우 (W-35+ 이후)
+                    # 청산 금액 = 현재가 × 보유수량
+                    exit_value = watcher.current_price * self.trader.position.total_qty if self.trader.position else 0
+                    self._cash_manager.restore(exit_value, reason=watcher.exit_reason)
+                    new_cash = self._cash_manager.available
+                else:
+                    # CashManager가 예수금을 추적 안 하는 경우 (현재 단계)
+                    # P&L을 반영한 새 예수금 계산
+                    new_cash = self._available_cash + int(pnl)
+                    self._cash_manager.reset(new_cash)
+                logger.info(f"[DRY_RUN] 예수금: {self._available_cash:,} → {new_cash:,}원 (P&L {int(pnl):+,})")
             else:
                 balance = await self.api.get_balance()
                 new_cash = self.risk.calculate_available_cash(
                     balance.get("available_cash", 0)
                 )
+                # LIVE: API 잔고로 CashManager 동기화
+                self._cash_manager.reset(new_cash)
             self._available_cash = new_cash
             self._coordinator.set_available_cash(new_cash)
             logger.info(f"다음 매매 가용 예수금: {new_cash:,}원")
@@ -532,6 +570,112 @@ class AutoTrader:
 
         # 8. 대시보드 동기화
         await self._fire_state_update()
+
+    async def _ratio_updater(self) -> None:
+        """R-13: 프로그램 순매수 비중 실시간 업데이트.
+
+        1초 간격으로 WATCHING/TRIGGERED/BUY1_FILLED 상태 Watcher의 비중 조회.
+        비중 변경 시 is_double_digit 갱신 및 가격 재계산.
+        """
+        DOUBLE_THRESHOLD = 10.0  # 10% 이상이면 Double
+
+        # 모의투자: 2.5초 간격 (rate limit 2건/초)
+        interval = 2.5 if self.settings.is_paper_mode else 1.0
+
+        # 비중 업데이트 대상 상태
+        target_states = {
+            WatcherState.WATCHING,
+            WatcherState.TRIGGERED,
+            WatcherState.READY,
+            WatcherState.ENTERED,
+        }
+
+        while self._running:
+            try:
+                await asyncio.sleep(interval)
+
+                for w in self._coordinator.watchers:
+                    if w.state not in target_states:
+                        continue
+
+                    try:
+                        # 1. REST 호출
+                        prog = await self.api.get_program_trade(w.code)
+                        price_info = await self.api.get_current_price(w.code)
+                        trading_value = price_info.get("trading_value", 0)
+
+                        # 2. 비중 계산
+                        if trading_value > 0:
+                            net_buy = prog.get("program_net_buy", 0)
+                            new_ratio = (net_buy / trading_value) * 100
+                        else:
+                            new_ratio = 0.0
+
+                        # 3. 변경 감지
+                        old_ratio = w.program_ratio
+                        old_is_double = w.is_double_digit
+                        new_is_double = new_ratio >= DOUBLE_THRESHOLD
+
+                        # 비중 갱신
+                        w.program_ratio = new_ratio
+
+                        # 4. Double/Single 상태 변경 시 처리
+                        if old_is_double != new_is_double:
+                            w.is_double_digit = new_is_double
+
+                            logger.info(
+                                f"[{w.name}] 비중 변경: {old_ratio:.1f}% → {new_ratio:.1f}% "
+                                f"({'Double' if new_is_double else 'Single'})"
+                            )
+
+                            # 5. 상태별 처리
+                            if w.state == WatcherState.TRIGGERED:
+                                # 1차 미체결 상태: 가격만 재계산
+                                old_buy1 = w.target_buy1_price
+                                old_stop = w.hard_stop_price_value
+
+                                w._recalc_prices()
+
+                                logger.info(
+                                    f"[{w.name}] 가격 재계산: "
+                                    f"buy1 {old_buy1:,} → {w.target_buy1_price:,}, "
+                                    f"stop {old_stop:,} → {w.hard_stop_price_value:,}"
+                                )
+
+                            elif w.state == WatcherState.ENTERED:
+                                # 1차 체결 상태: 2차 재발주 (A안 확정)
+                                old_buy2 = w.target_buy2_price
+                                old_stop = w.hard_stop_price_value
+
+                                w._recalc_prices()
+
+                                logger.info(
+                                    f"[{w.name}] 가격 재계산: "
+                                    f"buy2 {old_buy2:,} → {w.target_buy2_price:,}, "
+                                    f"stop {old_stop:,} → {w.hard_stop_price_value:,}"
+                                )
+
+                                # 2차 미체결 시 재발주
+                                if not w.buy2_filled and w.buy2_order_id:
+                                    balance = await self.api.get_balance()
+                                    cash = balance.get("available_cash", 0)
+
+                                    success = await self.trader.cancel_and_reorder_buy2(
+                                        w, w.target_buy2_price, cash
+                                    )
+                                    if success:
+                                        logger.info(f"[{w.name}] buy2 재발주 완료")
+
+                    except Exception as e:
+                        logger.warning(f"[{w.name}] 비중 업데이트 실패: {e}")
+                        continue
+
+            except asyncio.CancelledError:
+                logger.info("_ratio_updater 종료")
+                break
+            except Exception as e:
+                logger.error(f"_ratio_updater 에러: {e}")
+                await asyncio.sleep(5)  # 에러 시 5초 대기 후 재시도
 
     async def _network_health_check(self) -> None:
         """
