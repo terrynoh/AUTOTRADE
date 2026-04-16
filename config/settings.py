@@ -49,6 +49,7 @@ class Settings(BaseSettings):
     # 대시보드
     dashboard_admin_token: str = ""
     dashboard_port: int = 8503
+    dashboard_url: str = ""          # 로컬 sync용 Cloudflare 외부 URL
 
     # 로깅
     log_level: str = "DEBUG"
@@ -211,6 +212,25 @@ class InfraParams(BaseModel):
     upper_limit_multiplier: float = Field(default=1.30, ge=1.0, le=1.50)
 
 
+class SimulationParams(BaseModel):
+    """시뮬레이션 파라미터 (R-14: W-34).
+    
+    DRY_RUN 모드에서 부분체결, 체결 지연, 주문 거부 시뮬레이션 설정.
+    """
+    # 부분체결 시뮬레이션
+    partial_fill_enabled: bool = False
+    partial_fill_prob: float = Field(default=0.2, ge=0.0, le=1.0)  # 20% 확률
+    partial_fill_min_ratio: float = Field(default=0.5, ge=0.0, le=1.0)  # 최소 50% 체결
+
+    # 체결 지연 시뮬레이션
+    fill_delay_enabled: bool = False
+    fill_delay_sec: float = Field(default=2.0, ge=0.0, le=60.0)  # 2초 지연
+
+    # 주문 거부 시뮬레이션
+    reject_on_insufficient_cash: bool = True
+    reject_on_invalid_tick: bool = True
+
+
 class StrategyParams(BaseModel):
     """strategy_params.yaml 전체 로드."""
 
@@ -223,6 +243,7 @@ class StrategyParams(BaseModel):
     api: ApiParams = ApiParams()
     market: MarketParams = MarketParams()
     infra: InfraParams = InfraParams()
+    simulation: SimulationParams = SimulationParams()  # R-14: W-34
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> StrategyParams:

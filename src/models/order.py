@@ -46,6 +46,17 @@ class Order:
     def is_active(self) -> bool:
         return self.status in (OrderStatus.PENDING, OrderStatus.PARTIAL)
 
+    @property
+    def remaining_qty(self) -> int:
+        """미체결 수량 (W-33: R-14).
+        
+        부분체결 시뮬레이션 및 LIVE 체결통보에서 사용.
+        
+        Returns:
+            주문수량 - 체결수량 (0 이상)
+        """
+        return max(0, self.qty - self.filled_qty)
+
 
 @dataclass
 class Position:

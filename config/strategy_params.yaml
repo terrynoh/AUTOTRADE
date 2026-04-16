@@ -117,3 +117,18 @@ infra:
   # 상한가 체크
   upper_limit_check_pct: 20.0         # 상한가 체크 대상 등락률 임계값
   upper_limit_multiplier: 1.30        # 상한가 배수 (1.30 = +30%)
+
+# ── 시뮬레이션 (R-14: W-34) ───────────────────────────
+simulation:
+  # 부분체결 시뮬레이션
+  partial_fill_enabled: false         # 활성화 시 부분체결 발생
+  partial_fill_prob: 0.2              # 부분체결 확률 (20%)
+  partial_fill_min_ratio: 0.5         # 최소 체결 비율 (50%)
+
+  # 체결 지연 시뮬레이션
+  fill_delay_enabled: false           # 활성화 시 주문 후 N초 뒤 체결
+  fill_delay_sec: 2.0                 # 지연 시간 (초)
+
+  # 주문 거부 시뮬레이션
+  reject_on_insufficient_cash: true   # 잔고 부족 시 거부
+  reject_on_invalid_tick: true        # 호가 단위 오류 시 거부
