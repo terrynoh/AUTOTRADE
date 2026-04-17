@@ -26,8 +26,8 @@ from loguru import logger
 _TOKEN_CACHE_DIR = Path(__file__).resolve().parent.parent.parent  # PROJECT_ROOT
 
 
-def _token_cache_path(is_paper: bool) -> Path:
-    return _TOKEN_CACHE_DIR / ("token_paper.json" if is_paper else "token_live.json")
+def _token_cache_path() -> Path:
+    return _TOKEN_CACHE_DIR / "token_live.json"
 
 
 def _key_hash(app_key: str) -> str:
@@ -76,11 +76,41 @@ def _load_token_cache(path: Path, app_key: str) -> dict | None:
         logger.warning(f"토큰 캐시 읽기 실패: {e}")
         return None
 
+# ── 체결통보 필드 (R15-005) ──────────────────────────────
+# 공식 문서 '국내주식 실시간체결통보' (실시간-005) 기준 26개 필드 순서.
+# 체결통보 body (AES 복호화 후 '^' 구분 평문) 를 순서대로 매핑.
+_EXECUTION_FIELDS = [
+    "CUST_ID",          # 0  고객 ID (HTS ID 와 동일)
+    "ACNT_NO",          # 1  계좌번호
+    "ODER_NO",          # 2  주문번호 (10자리)
+    "OODER_NO",         # 3  원주문번호 (정정/취소 시)
+    "SELN_BYOV_CLS",    # 4  01:매도 02:매수
+    "RCTF_CLS",         # 5  0:정상 1:정정 2:취소
+    "ODER_KIND",        # 6  00:지정가 01:시장가 ...
+    "ODER_COND",        # 7  0:없음 1:IOC 2:FOK
+    "STCK_SHRN_ISCD",   # 8  단축 종목코드 (6자리 평문)
+    "CNTG_QTY",         # 9  체결수량
+    "CNTG_UNPR",        # 10 체결단가
+    "STCK_CNTG_HOUR",   # 11 체결시각 HHMMSS
+    "RFUS_YN",          # 12 0:승인 1:거부
+    "CNTG_YN",          # 13 1:접수/정정/취소/거부 2:체결  ← 핵심 분기
+    "ACPT_YN",          # 14 1:주문접수 2:확인 3:취소(FOK/IOC)
+    "BRNC_NO",          # 15 지점번호
+    "ODER_QTY",         # 16 주문수량
+    "ACNT_NAME",        # 17 계좌명
+    "ORD_COND_PRC",     # 18 호가조건가격
+    "ORD_EXG_GB",       # 19 1:KRX 2:NXT 3:SOR-KRX 4:SOR-NXT
+    "POPUP_YN",         # 20 Y/N
+    "FILLER",           # 21
+    "CRDT_CLS",         # 22 신용구분
+    "CRDT_LOAN_DATE",   # 23 신용대출일자
+    "CNTG_ISNM40",      # 24 체결종목명 (한글)
+    "ODER_PRC",         # 25 주문가격
+]
+
 from src.kis_api.constants import (
     BASE_URL_REAL,
-    BASE_URL_PAPER,
     WS_URL_REAL,
-    WS_URL_PAPER,
     EP_TOKEN,
     EP_WEBSOCKET_KEY,
     EP_PRICE,
@@ -90,6 +120,7 @@ from src.kis_api.constants import (
     EP_ORDER,
     EP_ORDER_CANCEL,
     EP_BALANCE,
+    EP_BUY_AVAILABLE,
     EP_MINUTE_CHART,
     TR_PRICE,
     TR_VOLUME_RANK,
@@ -97,20 +128,17 @@ from src.kis_api.constants import (
     TR_PROGRAM_TRADE_BY_STOCK,
     TR_ORDER_BUY,
     TR_ORDER_SELL,
-    TR_ORDER_BUY_PAPER,
-    TR_ORDER_SELL_PAPER,
     TR_ORDER_CANCEL,
-    TR_ORDER_CANCEL_PAPER,
     TR_BALANCE,
-    TR_BALANCE_PAPER,
+    TR_BUY_AVAILABLE,
     TR_MINUTE_CHART,
     WS_TR_PRICE,
     WS_TR_FUTURES,
+    WS_TR_EXECUTION,
     FUTURES_KOSPI200_NEAR,
     ORDER_TYPE_LIMIT,
     ORDER_TYPE_MARKET,
     RATE_LIMIT_REAL,
-    RATE_LIMIT_PAPER,
 )
 
 
@@ -122,20 +150,18 @@ class KISAPI:
         app_key: str,
         app_secret: str,
         account_no: str,
-        is_paper: bool = True,
         infra_params: object | None = None,
     ):
         self.app_key = app_key
         self.app_secret = app_secret
         self.account_no = account_no
-        self.is_paper = is_paper
 
         # 인프라 파라미터 (None이면 기본값 사용)
         from config.settings import InfraParams
         self._infra = infra_params if infra_params else InfraParams()
 
-        self.base_url = BASE_URL_PAPER if is_paper else BASE_URL_REAL
-        self.ws_url = WS_URL_PAPER if is_paper else WS_URL_REAL
+        self.base_url = BASE_URL_REAL
+        self.ws_url = WS_URL_REAL
 
         # 계좌번호 분리: 앞 8자리(CANO) + 뒤 2자리(ACNT_PRDT_CD)
         self._cano = account_no[:8]
@@ -156,8 +182,15 @@ class KISAPI:
         self._ws_last_recv: float = 0.0   # 마지막 수신 시각 (time.time())
         self._on_ws_disconnect: Optional[Callable] = None  # 연결 끊김 콜백
 
+        # R15-005: 체결통보 (H0STCNI0) 상태
+        self._execution_aes_iv: str = ""
+        self._execution_aes_key: str = ""
+        self._execution_subscribed: bool = False
+        self._execution_hts_id: str = ""
+        self._execution_callbacks: list[Callable] = []
+
         # rate limit: Semaphore(1) + 최소 간격으로 초당 요청 수 제한
-        self._min_interval = 0.5 if is_paper else (1.0 / RATE_LIMIT_REAL)
+        self._min_interval = 1.0 / RATE_LIMIT_REAL
         self._rate_limiter = asyncio.Semaphore(1)
         self._last_request_time: float = 0.0
 
@@ -171,7 +204,7 @@ class KISAPI:
         )
         self._session = aiohttp.ClientSession(timeout=timeout)
         await self._get_token()
-        logger.info(f"KIS API 연결 완료 ({'모의투자' if self.is_paper else '실거래'})")
+        logger.info("KIS API 연결 완료 (실거래)")
 
     async def disconnect(self):
         """세션 종료."""
@@ -196,7 +229,7 @@ class KISAPI:
             return
 
         # 2. 파일 캐시 확인
-        cache = _load_token_cache(_token_cache_path(self.is_paper), self.app_key)
+        cache = _load_token_cache(_token_cache_path(), self.app_key)
         if cache:
             self._token = cache["access_token"]
             self._token_expires = datetime.fromisoformat(cache["expires_at"])
@@ -221,7 +254,7 @@ class KISAPI:
             self._token = data["access_token"]
             expires_in = data.get("expires_in", 86400)
             self._token_expires = now_kst() + timedelta(seconds=expires_in - 3600)
-            _save_token_cache(_token_cache_path(self.is_paper), self._token,
+            _save_token_cache(_token_cache_path(), self._token,
                               self._token_expires, self.app_key, self._ws_key)
             logger.info(f"KIS 토큰 발급 완료 (만료: {self._token_expires.strftime('%Y-%m-%d %H:%M')})")
 
@@ -232,7 +265,7 @@ class KISAPI:
             return self._ws_key
 
         # 2. 파일 캐시
-        cache = _load_token_cache(_token_cache_path(self.is_paper), self.app_key)
+        cache = _load_token_cache(_token_cache_path(), self.app_key)
         if cache and cache.get("ws_key"):
             self._ws_key = cache["ws_key"]
             logger.info("WebSocket 키 캐시 로드")
@@ -253,7 +286,7 @@ class KISAPI:
 
             self._ws_key = data["approval_key"]
             # 파일 캐시 갱신 (ws_key 추가)
-            _save_token_cache(_token_cache_path(self.is_paper), self._token,
+            _save_token_cache(_token_cache_path(), self._token,
                               self._token_expires, self.app_key, self._ws_key)
             logger.info("WebSocket 키 발급 완료")
             return self._ws_key
@@ -501,7 +534,7 @@ class KISAPI:
         price_type: str = ORDER_TYPE_LIMIT,
     ) -> dict:
         """매수 주문."""
-        tr_id = TR_ORDER_BUY_PAPER if self.is_paper else TR_ORDER_BUY
+        tr_id = TR_ORDER_BUY
 
         body = {
             "CANO": self._cano,
@@ -535,7 +568,7 @@ class KISAPI:
         price_type: str = ORDER_TYPE_LIMIT,
     ) -> dict:
         """매도 주문."""
-        tr_id = TR_ORDER_SELL_PAPER if self.is_paper else TR_ORDER_SELL
+        tr_id = TR_ORDER_SELL
 
         body = {
             "CANO": self._cano,
@@ -565,7 +598,7 @@ class KISAPI:
 
     async def cancel_order(self, order_no: str, code: str) -> dict:
         """주문 취소."""
-        tr_id = TR_ORDER_CANCEL_PAPER if self.is_paper else TR_ORDER_CANCEL
+        tr_id = TR_ORDER_CANCEL
 
         body = {
             "CANO": self._cano,
@@ -591,7 +624,7 @@ class KISAPI:
 
     async def get_balance(self) -> dict:
         """계좌 잔고 조회."""
-        tr_id = TR_BALANCE_PAPER if self.is_paper else TR_BALANCE
+        tr_id = TR_BALANCE
 
         params = {
             "CANO": self._cano,
@@ -633,6 +666,124 @@ class KISAPI:
             "total_profit": int(summary.get("evlu_pfls_smtl_amt", "0")),
             "available_cash": int(summary.get("dnca_tot_amt", "0")),
         }
+
+    # ── 매수가능조회 (R15-007) ─────────────────────────────
+
+    async def get_buy_available(self) -> dict:
+        """매수 가능 금액 조회 (TTTC8908R / inquire-psbl-order).
+
+        R15-007 / R16: 실제 주문가능금액 조회.
+        PDNO/ORD_UNPR 공란 + ORD_DVSN='01' → 종목 무관 전체 금액만 조회.
+        AUTOTRADE 는 미수 사용 안 함 → nrcvb_buy_amt 를 주 필드로 사용
+        (MTS 주문가능원화와 일치).
+
+        Returns:
+            {
+                "buyable_cash": int,   # nrcvb_buy_amt (미수없는매수금액) ← 주 사용 필드
+                "ord_psbl_cash": int,  # 예수금 기준 주문가능금액
+                "ruse_psbl_amt": int,  # 재사용가능금액 (전일/금일 매도대금)
+                "raw": dict,           # 원본 응답 전체 (디버깅용)
+            }
+        """
+        tr_id = TR_BUY_AVAILABLE
+        params = {
+            "CANO": self._cano,
+            "ACNT_PRDT_CD": self._acnt_prdt_cd,
+            "PDNO": "",                      # 공란: 종목 무관 전체 금액
+            "ORD_UNPR": "",                  # 공란: 시장가 조회
+            "ORD_DVSN": "01",                # 시장가 (증거금율 반영)
+            "CMA_EVLU_AMT_ICLD_YN": "N",
+            "OVRS_ICLD_YN": "N",
+        }
+        data = await self._get(EP_BUY_AVAILABLE, tr_id, params)
+        output = data.get("output", {}) or {}
+        return {
+            "buyable_cash": int(output.get("nrcvb_buy_amt", "0")),
+            "ord_psbl_cash": int(output.get("ord_psbl_cash", "0")),
+            "ruse_psbl_amt": int(output.get("ruse_psbl_amt", "0")),
+            "raw": output,
+        }
+
+    # ── 체결통보 (H0STCNI0) ── R15-005 ──────────────────
+
+    def add_execution_callback(self, callback: Callable) -> None:
+        """체결통보 콜백 등록. main.py 가 파싱된 dict (26 필드) 를 받음."""
+        if callback not in self._execution_callbacks:
+            self._execution_callbacks.append(callback)
+
+    def _decrypt_execution(self, cipher_b64: str) -> str:
+        """R15-005: AES-256-CBC / PKCS7 복호화.
+
+        구독 응답의 output.iv / output.key 는 ASCII 문자열 그대로 utf-8 인코딩해서
+        AES 키(32바이트) / IV(16바이트) 로 사용. cipher_b64 는 base64 디코딩 후
+        암문으로 취급.
+        """
+        import base64
+        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+        from cryptography.hazmat.primitives.padding import PKCS7
+
+        ct = base64.b64decode(cipher_b64)
+        k = self._execution_aes_key.encode("utf-8")
+        i = self._execution_aes_iv.encode("utf-8")
+        cipher = Cipher(algorithms.AES(k), modes.CBC(i))
+        decryptor = cipher.decryptor()
+        padded = decryptor.update(ct) + decryptor.finalize()
+        unpadder = PKCS7(128).unpadder()
+        plain = unpadder.update(padded) + unpadder.finalize()
+        return plain.decode("utf-8")
+
+    def _parse_execution_body(self, plain: str) -> dict:
+        """R15-005: '^' 구분 평문 body 를 26 필드 dict 로 파싱.
+
+        부족 필드는 빈 문자열 기본값. 과잉 필드는 무시 (향후 KIS 문서 확장 대비).
+        """
+        fields = plain.split("^")
+        parsed: dict = {}
+        for i, name in enumerate(_EXECUTION_FIELDS):
+            parsed[name] = fields[i] if i < len(fields) else ""
+        return parsed
+
+    async def subscribe_execution(self, hts_id: str) -> None:
+        """R15-005: 체결통보 구독 (H0STCNI0).
+
+        LIVE 전용. tr_key 는 HTS ID (계좌번호 아님).
+        구독 응답에 담기는 AES IV/Key 는 _ws_receiver 의 JSON 분기에서 수신 시 저장됨.
+        """
+        if not hts_id:
+            raise ValueError("subscribe_execution: hts_id 가 비어있음 (.env KIS_HTS_ID 확인)")
+
+        if not self._ws_key:
+            await self._get_ws_key()
+
+        if not self._ws:
+            self._ws = await websockets.connect(
+                self.ws_url,
+                ping_interval=self._infra.ws_ping_interval_sec,
+                ping_timeout=self._infra.ws_timeout_sec,
+            )
+            self._ws_task = asyncio.create_task(self._ws_receiver())
+
+        self._execution_hts_id = hts_id
+        tr_id = WS_TR_EXECUTION
+
+        msg = {
+            "header": {
+                "approval_key": self._ws_key,
+                "custtype": "P",
+                "tr_type": "1",
+                "content-type": "utf-8",
+            },
+            "body": {
+                "input": {
+                    "tr_id": tr_id,
+                    "tr_key": hts_id,
+                }
+            },
+        }
+        await self._ws.send(json.dumps(msg))
+        self._execution_subscribed = True
+        # HTS ID 전체 유출 방지 (로그): 앞 4글자만 표시
+        logger.info(f"체결통보 구독 요청: tr_id={tr_id} tr_key={hts_id[:4]}***")
 
     # ── WebSocket 실시간 ──────────────────────────────────────
 
@@ -753,17 +904,74 @@ class KISAPI:
                         if raw.startswith("{"):
                             data = json.loads(raw)
                             header = data.get("header", {})
-                            if header.get("tr_id") == "PINGPONG":
+                            tr_id_hdr = header.get("tr_id", "")
+                            if tr_id_hdr == "PINGPONG":
                                 await self._ws.send(raw)
                                 continue
+                            # R15-005: 체결통보 구독 응답에서 AES 키 추출
+                            if tr_id_hdr == WS_TR_EXECUTION:
+                                body_resp = data.get("body", {}) or {}
+                                rt_cd = body_resp.get("rt_cd", "")
+                                msg1 = body_resp.get("msg1", "")
+                                output = body_resp.get("output") or {}
+                                if (rt_cd == "0" and isinstance(output, dict)
+                                        and "iv" in output and "key" in output):
+                                    self._execution_aes_iv = output["iv"]
+                                    self._execution_aes_key = output["key"]
+                                    logger.info(
+                                        f"[R15-005] 체결통보 AES 키 수신: "
+                                        f"iv_len={len(self._execution_aes_iv)} "
+                                        f"key_len={len(self._execution_aes_key)} msg={msg1!r}"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"[R15-005] 체결통보 구독 응답 이상: "
+                                        f"rt_cd={rt_cd} msg={msg1!r}"
+                                    )
                         else:
-                            # '0|TR_ID|count|data^data^...' 형식
-                            parts = raw.split("|")
+                            # '0|TR_ID|count|body' (평문) 또는 '1|TR_ID|count|<base64>' (암호화)
+                            parts = raw.split("|", 3)
                             if len(parts) < 4:
                                 continue
 
+                            enc_flag = parts[0]
                             tr_id = parts[1]
                             body = parts[3]
+
+                            # R15-005: 체결통보 (암호화 기본)
+                            if tr_id == WS_TR_EXECUTION:
+                                if enc_flag == "1":
+                                    if not (self._execution_aes_key and self._execution_aes_iv):
+                                        logger.error(
+                                            "[R15-005] 암호화 체결통보 수신했으나 AES 키 미보유 — 드롭"
+                                        )
+                                        continue
+                                    try:
+                                        body = self._decrypt_execution(body)
+                                    except Exception as e:
+                                        logger.error(
+                                            f"[R15-005] AES 복호화 실패: {type(e).__name__}: {e}"
+                                        )
+                                        continue
+                                elif enc_flag == "0":
+                                    # 예상 외 — KIS 문서상 항상 암호화되어 오는 것이 정상
+                                    logger.warning(
+                                        f"[R15-005] 체결통보가 평문 (enc_flag=0) — 문서와 다름. body 처리 계속."
+                                    )
+                                try:
+                                    parsed = self._parse_execution_body(body)
+                                    for cb in self._execution_callbacks:
+                                        try:
+                                            cb(parsed)
+                                        except Exception as cb_err:
+                                            logger.error(
+                                                f"[R15-005] 체결통보 콜백 에러: {cb_err}"
+                                            )
+                                except Exception as e:
+                                    logger.error(
+                                        f"[R15-005] 체결통보 파싱 에러: {e}"
+                                    )
+                                continue  # 시세/선물 분기로 내려가지 않음
 
                             if tr_id == WS_TR_PRICE:
                                 fields = body.split("^")
@@ -866,6 +1074,26 @@ class KISAPI:
                     await self._ws.send(json.dumps(futures_msg))
                     logger.info(f"선물 재구독 완료: {FUTURES_KOSPI200_NEAR}")
 
+                # R15-005: 체결통보 재구독 (AES 키는 새 구독 응답에서 자동 수신)
+                if self._execution_subscribed and self._execution_hts_id:
+                    exec_tr_id = WS_TR_EXECUTION
+                    exec_msg = {
+                        "header": {
+                            "approval_key": self._ws_key,
+                            "custtype": "P",
+                            "tr_type": "1",
+                            "content-type": "utf-8",
+                        },
+                        "body": {
+                            "input": {
+                                "tr_id": exec_tr_id,
+                                "tr_key": self._execution_hts_id,
+                            }
+                        },
+                    }
+                    await self._ws.send(json.dumps(exec_msg))
+                    logger.info(f"체결통보 재구독: tr_id={exec_tr_id}")
+
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -892,4 +1120,4 @@ class KISAPI:
     # ── 서버 정보 ──────────────────────────────────────────────
 
     def get_server_type(self) -> str:
-        return "모의투자" if self.is_paper else "실서버"
+        return "실서버"

@@ -70,13 +70,16 @@ def main() -> None:
 
 
 def _sync_to_dashboard(trader, dash_state) -> None:
-    """AutoTrader 상태를 대시보드 state에 동기화."""
+    """AutoTrader 상태를 대시보드 state에 동기화.
+
+    R16: dead reference (_monitors, dash_state.trader, dash_state.risk) 정리.
+    대시보드 내 DashboardState 실제 필드만 셀팅.
+    실제 동기화는 main.py _start_dashboard_server 의 attach_autotrader →
+    dashboard/app.py _sync_from_autotrader 에서 수행됨.
+    """
     dash_state.connected = True
     dash_state.trade_mode = trader.settings.trade_mode
     dash_state.available_cash = trader._available_cash
-    dash_state.monitors = trader._monitors
-    dash_state.trader = trader.trader
-    dash_state.risk = trader.risk
 
 
 if __name__ == "__main__":

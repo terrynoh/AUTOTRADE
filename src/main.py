@@ -4,8 +4,12 @@ AUTOTRADE 메인 진입점.
 asyncio 기반으로 KIS REST/WebSocket 위에서
 전체 매매 프로세스를 오케스트레이션한다.
 
+R16: LIVE 전용 (paper/dry_run/FillManager/CashManager 폐기).
+R15-005: LIVE 체결통보 (H0STCNI0) 본구현.
+R15-007: 매수가능조회 (TTTC8908R, nrcvb_buy_amt) 기반 예수금 관리.
+
 멀티 트레이드:
-  - 09:50 스크리닝 → 후보 풀 최대 5종목 선정
+  - 09:49 스크리닝 → 후보 풀 최대 5종목 선정
   - 1번 종목부터 신고가 감시 → 매수 → 청산
   - 수익 청산 시 10:00~11:00 이내면 다음 후보로 전환
   - 일일 최대 3회, 손실 시 당일 중단
@@ -15,7 +19,7 @@ asyncio 기반으로 KIS REST/WebSocket 위에서
   09:49  스크리닝 → 후보 풀 선정
   09:50~ 신고가 감시 + 매수 대기
   수익청산 → 다음 후보 (10:00~11:00, 최대 3회)
-  15:20  강제 청산
+  11:20  강제 청산
   15:30  장 마감 리포트
 """
 from __future__ import annotations
@@ -38,8 +42,6 @@ from src.core.stock_master import StockMaster
 from src.core.trader import Trader
 from src.core.risk_manager import RiskManager
 from src.core.watcher import Watcher, WatcherCoordinator, WatcherState
-from src.core.cash_manager import CashManager
-from src.core.fill_manager import FillManager  # R-14: W-37
 from src.storage.trade_logger import TradeLogger
 from src.utils.notifier import Notifier
 from src.utils.logger import setup_logger
@@ -48,7 +50,7 @@ from src.utils.market_calendar import now_kst
 
 
 class AutoTrader:
-    """AUTOTRADE 메인 오케스트레이터."""
+    """AUTOTRADE 메인 오케스트레이터 (R16 LIVE 전용)."""
 
     def __init__(self):
         self.settings = Settings()
@@ -57,13 +59,12 @@ class AutoTrader:
             app_key=self.settings.kis_app_key,
             app_secret=self.settings.kis_app_secret,
             account_no=self.settings.account_no,
-            is_paper=self.settings.is_paper_mode,
             infra_params=self.params.infra,
         )
         # ── StockMaster (W-02 결과물, Screener/Notifier 공유) ──
         self._stock_master = StockMaster(Path(__file__).parent.parent / "config" / "stock_master.json")
 
-        self.screener = Screener(self.api, self.params, stock_master=self._stock_master, is_live=self.settings.is_live, use_live_data=self.settings.use_live_data)
+        self.screener = Screener(self.api, self.params, stock_master=self._stock_master)
         self.trader = Trader(self.api, self.settings, self.params)
         self.risk = RiskManager(self.params)
 
@@ -78,9 +79,13 @@ class AutoTrader:
         # ── 수동 종목 입력 ──
         self._manual_codes: list[str] = []
 
-        # ── 기타 ──
-        self._available_cash: int = 0
+        # ── 예수금 상태 (R16: CashManager 제거, 단순 int 관리) ──
+        # _initial_cash: 시작 시 조회한 buyable_cash (하루 고정, 수익률 분모)
+        # _available_cash: 매 청산 후 갱신되는 매수 가용 금액 (변동)
         self._initial_cash: int = 0
+        self._available_cash: int = 0
+
+        # ── 기타 ──
         self._futures_price: float = 0.0
         self._running: bool = False
         self._network_ok: bool = True       # 네트워크 정상 여부
@@ -96,20 +101,8 @@ class AutoTrader:
         )
 
         # ── 로그 시스템 (R-10) ──
-        self._trade_logger = TradeLogger(capital=self.settings.dry_run_cash)
-
-        # ── 예수금 관리 (R-14: W-30/31) ──
-        self._cash_manager: CashManager = CashManager()
-
-        # ── 체결 관리자 (R-14: W-35/37) ──
-        self._fill_manager: FillManager = FillManager(
-            settings=self.settings,
-            cash_manager=self._cash_manager,
-            params=self.params,
-        )
-        self.trader.set_fill_manager(self._fill_manager)
-
-        # ── Cloudflare Tunnel ──
+        # capital 은 run() 초기 잔고 확인 후 self._initial_cash 로 갱신됨.
+        self._trade_logger = TradeLogger()
 
     # ── 수동 종목 설정 ────────────────────────────────────
 
@@ -139,13 +132,12 @@ class AutoTrader:
             })
         return {
             "trade_mode": self.settings.trade_mode,
+            "initial_cash": self._initial_cash,
             "available_cash": self._available_cash,
             "daily_trades": self.risk.daily_trades,
             "daily_pnl": self.risk.daily_pnl,
             "manual_codes": self._manual_codes,
             "monitors": monitors,
-            # R-14: CashManager 상태
-            "cash_manager": self._cash_manager.get_summary(),
         }
 
     def _stop_trading(self) -> None:
@@ -190,6 +182,21 @@ class AutoTrader:
                 self.api.add_realtime_callback(WS_TR_FUTURES, self._on_futures_price)
                 self._realtime_callback_registered = True
 
+            # R15-005 SA-5c: 체결통보 구독 (LIVE 전용 — R16 이후 is_live 가드 불필요).
+            # 콜백 등록 -> 구독 순서. JSON 구독응답에서 IV/KEY 수신 후
+            # 실제 체결통보 메시지가 언제든 올 수 있으므로 callback 이 먼저 준비되어야 함.
+            # KIS_HTS_ID 미설정 시 즉시 ValueError -> 거래 시작 거부 (안전).
+            if not self.settings.kis_hts_id:
+                raise ValueError(
+                    "KIS_HTS_ID 미설정 — LIVE 모드 시작 거부. "
+                    ".env 에 KIS_HTS_ID=<HTS ID> 추가 필요"
+                )
+            self.api.add_execution_callback(self._on_execution_notify)
+            await self.api.subscribe_execution(self.settings.kis_hts_id)
+            logger.info(
+                f"[R15-005] 체결통보 구독 시작 (HTS ID: {self.settings.kis_hts_id[:4]}***)"
+            )
+
             # Coordinator 청산 콜백 등록 (W-06b1)
             self._coordinator.set_exit_callback(self._on_exit_done)
 
@@ -205,21 +212,31 @@ class AutoTrader:
             except Exception as e:
                 logger.error(f"선물 구독 실패: {e}")
 
-            # 계좌 잔고 확인
-            if self.settings.is_dry_run and self.settings.dry_run_cash > 0:
-                self._initial_cash = self.settings.dry_run_cash
-                logger.info(f"[DRY_RUN] 가상 예수금 사용: {self._initial_cash:,}원")
-            else:
-                balance = await self.api.get_balance()
-                self._initial_cash = balance.get("available_cash", 0)
-            self._available_cash = self.risk.calculate_available_cash(self._initial_cash)
-            self._coordinator.set_available_cash(self._available_cash)  # W-06b1
-            
-            # R-14: CashManager 초기화
-            self._cash_manager.reset(self._available_cash)
+            # ── 초기 예수금 확인 (R15-007) ──
+            # get_buy_available() 반환 buyable_cash (nrcvb_buy_amt) = MTS 주문가능원화
+            buy_info = await self.api.get_buy_available()
+            self._initial_cash = buy_info["buyable_cash"]
             logger.info(
-                f"예수금: {self._initial_cash:,}원 → 매매가용: {self._available_cash:,}원 "
-                f"(CashManager 초기화 완료)"
+                f"[R15-007] 초기 주문가능금액 조회:"
+                f"\n  buyable_cash (nrcvb_buy_amt) = {buy_info['buyable_cash']:,}원  ← 주 사용 필드"
+                f"\n  ord_psbl_cash              = {buy_info['ord_psbl_cash']:,}원"
+                f"\n  ruse_psbl_amt              = {buy_info['ruse_psbl_amt']:,}원"
+            )
+            logger.info(
+                f"[R15-007] 첫 실측 검증 포인트: MTS 앱 '주문가능원화' 와 "
+                f"buyable_cash ({self._initial_cash:,}원) 일치 여부 확인"
+            )
+
+            # 매매 가용 자금 = buyable_cash × max_position_size_pct (기본 100%)
+            self._available_cash = self.risk.calculate_available_cash(self._initial_cash)
+            self._coordinator.set_available_cash(self._available_cash)
+
+            # TradeLogger capital 갱신 (수익률 % 분모 = 시작 시 투자 기준금액)
+            self._trade_logger.capital = self._initial_cash
+
+            logger.info(
+                f"초기 예수금: {self._initial_cash:,}원 → 매매가용: {self._available_cash:,}원 "
+                f"(max_position_size_pct 반영)"
             )
 
             # 대시보드 서버 시작 (API 연결 + 잔고 확인 후 → attach_autotrader 가능)
@@ -343,7 +360,7 @@ class AutoTrader:
 
         await self._fire_state_update()
 
-    # ── 스케줄: 15:20 강제 청산 ───────────────────────────
+    # ── 스케줄: 11:20 강제 청산 ───────────────────────────
 
     async def _schedule_buy_deadline(self):
         """매수 마감 시각 도달 시 Coordinator 에 통지 (10:55)."""
@@ -412,7 +429,148 @@ class AutoTrader:
         # Coordinator 에 선물 가격 전달
         self._coordinator.on_realtime_futures(price)
 
-    # ── 모니터 루프 (시그널 폴링) ─────────────────────────
+    # ── R15-005: 체결통보 (H0STCNI0) 콜백 ────────────────
+
+    def _on_execution_notify(self, parsed: dict) -> None:
+        """KIS 체결통보 (H0STCNI0) 동기 콜백.
+
+        KISAPI._ws_receiver 가 동기적으로 호출함. 비동기 처리는
+        _process_execution_notify 에 위임.
+        """
+        asyncio.create_task(self._process_execution_notify(parsed))
+
+    async def _process_execution_notify(self, parsed: dict) -> None:
+        """체결통보 본체 처리 — 5 케이스 분기.
+
+        CNTG_YN=1 → 접수/정정/취소/거부
+            RCTF_CLS=0 → 정상 접수 → trader.on_live_acknowledged
+            RCTF_CLS∈(1,2) → 정정/취소 통보 → 외부 개입 확정 → 텔레그램 critical
+        CNTG_YN=2 → 체결
+            SELN_BYOV_CLS=02 → 매수 체결 → trader.on_live_buy_filled + coordinator.on_buy_filled
+            SELN_BYOV_CLS=01 → 매도 체결 → trader.on_live_sell_filled + coordinator.on_sell_filled
+                                                        → 전량 체결 시 coordinator.on_sell_complete
+        RFUS_YN=1 → 거부 → trader.on_live_rejected + 텔레그램 error
+
+        예외 시: 로그 저장 후 return (상위는 _ws_receiver 의 try 블록이 혹시모를
+        잡아줬으나 이로 인해 WS 수신 중단되면 안 됨).
+        """
+        try:
+            cntg_yn = parsed.get("CNTG_YN", "")
+            side = parsed.get("SELN_BYOV_CLS", "")     # 01=매도, 02=매수
+            rctf = parsed.get("RCTF_CLS", "")
+            rfus = parsed.get("RFUS_YN", "")
+            order_id = parsed.get("ODER_NO", "")
+            oorder_id = parsed.get("OODER_NO", "")
+            code = parsed.get("STCK_SHRN_ISCD", "")
+            ts = now_kst()
+
+            # ── 케이스 0: 거부 (최우선 체크) ──
+            if rfus == "1":
+                self.trader.on_live_rejected(order_id, ts)
+                self.notifier.notify_error(
+                    f"🚨 LIVE 주문 거부\n"
+                    f"종목: {code}\n"
+                    f"주문번호: {order_id}\n"
+                    f"side: {'매수' if side == '02' else ('매도' if side == '01' else side)}"
+                )
+                return
+
+            # ── 케이스 1: 접수 통보 (CNTG_YN=1) ──
+            if cntg_yn == "1":
+                if rctf == "0":
+                    # 정상 접수 → SUBMITTED → ACKNOWLEDGED
+                    self.trader.on_live_acknowledged(order_id, ts)
+                    return
+                elif rctf in ("1", "2"):
+                    # 정정(1)/취소(2) — AUTOTRADE 는 정정/취소 발주 안 함 → 외부 개입 확정
+                    action = "정정" if rctf == "1" else "취소"
+                    logger.critical(
+                        f"[R15-005] 외부 개입 감지: {action} 접수 통보 "
+                        f"ODER={order_id} OODER={oorder_id} code={code}"
+                    )
+                    self.notifier.notify_error(
+                        f"🚨 외부 개입 감지 ({action})\n"
+                        f"종목: {code}\n"
+                        f"주문번호: {order_id}\n"
+                        f"원주문: {oorder_id}\n"
+                        f"AUTOTRADE 는 {action} 발주 안 함 → HTS/MTS 확인 필요"
+                    )
+                    return
+                else:
+                    logger.warning(
+                        f"[R15-005] 알 수 없는 RCTF_CLS={rctf!r}, ODER={order_id}, parsed={parsed}"
+                    )
+                    return
+
+            # ── 케이스 2: 체결 통보 (CNTG_YN=2) ──
+            if cntg_yn == "2":
+                try:
+                    filled_price = int(parsed.get("CNTG_UNPR", "0"))
+                    filled_qty = int(parsed.get("CNTG_QTY", "0"))
+                except (ValueError, TypeError) as e:
+                    logger.error(
+                        f"[R15-005] 체결 수량/가격 파싱 실패: {e}, parsed={parsed}"
+                    )
+                    return
+
+                if filled_price <= 0 or filled_qty <= 0:
+                    logger.error(
+                        f"[R15-005] 체결 수량/가격 이상: "
+                        f"price={filled_price} qty={filled_qty}, parsed={parsed}"
+                    )
+                    return
+
+                if side == "02":
+                    # 매수 체결
+                    order = self.trader.on_live_buy_filled(order_id, filled_price, filled_qty, ts)
+                    if order is None:
+                        return
+                    # Coordinator 에 매수 체결 라우팅 (Watcher.on_buy_filled → ENTERED 전이 + T2 콜백)
+                    self._coordinator.on_buy_filled(
+                        order.code, order.label, filled_price, filled_qty, ts
+                    )
+                    return
+
+                elif side == "01":
+                    # 매도 체결
+                    order = self.trader.on_live_sell_filled(order_id, filled_price, filled_qty, ts)
+                    if order is None:
+                        return
+                    # Coordinator 에 매도 체결 라우팅 (avg_sell_price 갱신)
+                    self._coordinator.on_sell_filled(
+                        order.code, filled_price, filled_qty, ts
+                    )
+                    # 전량 체결 확정 시 on_sell_complete 체인 발화 → _on_exit_done
+                    pos = self.trader.position
+                    if pos is not None and not pos.is_open:
+                        watcher = next(
+                            (w for w in self._coordinator.watchers if w.code == order.code),
+                            None,
+                        )
+                        if watcher is not None:
+                            logger.info(
+                                f"[R15-005] 매도 전량 체결 확정 → on_sell_complete 발화: "
+                                f"{watcher.name} code={order.code}"
+                            )
+                            await self._coordinator.on_sell_complete(watcher, ts)
+                        else:
+                            logger.error(
+                                f"[R15-005] 매도 전량 체결했으나 watcher 미일치: "
+                                f"code={order.code}"
+                            )
+                    return
+
+                else:
+                    logger.warning(
+                        f"[R15-005] 알 수 없는 SELN_BYOV_CLS={side!r}, ODER={order_id}, parsed={parsed}"
+                    )
+                    return
+
+            # ── 케이스 3: 알 수 없는 CNTG_YN ──
+            logger.warning(f"[R15-005] 알 수 없는 CNTG_YN={cntg_yn!r}, parsed={parsed}")
+
+        except Exception as e:
+            logger.exception(f"[R15-005] _process_execution_notify 예외: {e}, parsed={parsed}")
 
     # ── 네트워크 안전 장치 ─────────────────────────────────
 
@@ -481,17 +639,18 @@ class AutoTrader:
             )
 
     async def _on_exit_done(self, watcher: Watcher) -> None:
-        """청산 완료 콜백. Coordinator._execute_exit 가 호출.
+        """청산 완료 콜백. Coordinator.on_sell_complete 가 호출 (R15-005).
 
         책임:
         1. P&L 기록
         2. R-12: 손절 횟수 기록 (hard_stop인 경우)
         3. TradeLogger로 거래 기록 + 로그 출력
-        4. 손실 한도 체크
+        4. 손실 한도 체크 (get_balance 사용 — 기존 동작 유지)
         5. 멀티 트레이드 가드
-        6. 잔고 재조회 + Coordinator 갱신
+        6. 다음 매매 가용 예수금 갱신 (get_buy_available 사용 — R15-007)
         7. trader.reset
-        8. 대시보드 동기화
+        8. T3 위임 (W-11e 두 번째 매매 트리거)
+        9. 대시보드 동기화
         """
         # 1. P&L 기록
         pnl = self.trader.get_pnl(watcher.current_price)
@@ -516,7 +675,8 @@ class AutoTrader:
         except Exception as e:
             logger.error(f"거래 로그 저장 실패 ({watcher.name}): {e}")
 
-        # 4. 손실 한도 체크
+        # 4. 손실 한도 체크 (기존 동작 유지 — get_balance().available_cash 사용)
+        # R15-007 범위 밖 (손실률 분모는 별도 이슈로 분리).
         try:
             balance = await self.api.get_balance()
             self.risk.check_daily_loss_limit(balance.get("available_cash", 0))
@@ -529,47 +689,38 @@ class AutoTrader:
             await self._fire_state_update()
             return
 
-        # 6. 잔고 재조회 + Coordinator 갱신 + CashManager 동기화
+        # 6. 다음 매매 가용 예수금 갱신 (R15-007: get_buy_available 사용)
+        # 매도 체결 직후 KIS 서버 nrcvb_buy_amt 에 P&L 반영 기대.
+        # 첫 매매 청산 후 두 번째 매수 시점에 P&L 반영된 합산 금액 조회.
+        # 타이밍 이슈 발견 시 안 B (내부 계산 + 교차 검증) 로 전환 가능.
         try:
-            if self.settings.is_dry_run and self.settings.dry_run_cash > 0:
-                # R-14: DRY_RUN에서 P&L 반영
-                if self._cash_manager.used > 0:
-                    # CashManager가 예수금을 추적 중인 경우 (W-35+ 이후)
-                    # 청산 금액 = 현재가 × 보유수량
-                    # R-14 버그픽스: self.trader.position이 None일 수 있으므로 watcher.total_buy_qty 사용
-                    exit_value = watcher.current_price * watcher.total_buy_qty if watcher.total_buy_qty > 0 else 0
-                    self._cash_manager.restore(exit_value, reason=watcher.exit_reason)
-                    new_cash = self._cash_manager.available
-                else:
-                    # CashManager가 예수금을 추적 안 하는 경우 (현재 단계)
-                    # P&L을 반영한 새 예수금 계산
-                    new_cash = self._available_cash + int(pnl)
-                    self._cash_manager.reset(new_cash)
-                logger.info(f"[DRY_RUN] 예수금: {self._available_cash:,} → {new_cash:,}원 (P&L {int(pnl):+,})")
-            else:
-                balance = await self.api.get_balance()
-                new_cash = self.risk.calculate_available_cash(
-                    balance.get("available_cash", 0)
-                )
-                # LIVE: API 잔고로 CashManager 동기화
-                self._cash_manager.reset(new_cash)
+            prev_cash = self._available_cash
+            buy_info = await self.api.get_buy_available()
+            new_cash = self.risk.calculate_available_cash(buy_info["buyable_cash"])
             self._available_cash = new_cash
             self._coordinator.set_available_cash(new_cash)
-            logger.info(f"다음 매매 가용 예수금: {new_cash:,}원")
+            logger.info(
+                f"[R15-007] 청산 후 예수금 갱신:"
+                f"\n  직전 _available_cash:      {prev_cash:,}원"
+                f"\n  buyable_cash (API):        {buy_info['buyable_cash']:,}원  (P&L {int(pnl):+,} 반영 기대)"
+                f"\n  ord_psbl_cash:             {buy_info['ord_psbl_cash']:,}원"
+                f"\n  ruse_psbl_amt:             {buy_info['ruse_psbl_amt']:,}원"
+                f"\n  다음 매매 가용 (new_cash): {new_cash:,}원"
+            )
         except Exception as e:
             logger.error(f"잔고 조회 실패 (다음 매매 준비): {e}")
 
         # 7. trader.reset (다음 종목 매수 준비)
         self.trader.reset()
 
-        # === 7.5. T3 위임 (W-11e: 두 번째 매매 트리거) ===
+        # === 8. T3 위임 (W-11e: 두 번째 매매 트리거) ===
         # _on_exit_done 진입 시점에 _active_code 는 여전히 청산된 종목 코드.
         # handle_t3 가 _execute_buy 를 호출하기 전에 _active_code 를 None 으로 명시 처리.
         # 이렇게 하면 handle_t3 안에서 새 chosen.code 로 _active_code 가 atomic 하게 교체됨.
         self._coordinator._active_code = None
         await self._coordinator.handle_t3(now_kst())
 
-        # 8. 대시보드 동기화
+        # 9. 대시보드 동기화
         await self._fire_state_update()
 
     async def _ratio_updater(self) -> None:
@@ -577,11 +728,10 @@ class AutoTrader:
 
         1초 간격으로 WATCHING/TRIGGERED/BUY1_FILLED 상태 Watcher의 비중 조회.
         비중 변경 시 is_double_digit 갱신 및 가격 재계산.
-        """
-        DOUBLE_THRESHOLD = 10.0  # 10% 이상이면 Double
 
-        # 모의투자: 2.5초 간격 (rate limit 2건/초)
-        interval = 2.5 if self.settings.is_paper_mode else 1.0
+        R16: is_paper_mode 분기 제거 (LIVE 전용, 1.0초 간격 고정).
+        """
+        interval = 1.0  # LIVE: 1초 간격 (rate limit 20건/초 충분)
 
         # 비중 업데이트 대상 상태
         target_states = {
@@ -615,7 +765,7 @@ class AutoTrader:
                         # 3. 변경 감지
                         old_ratio = w.program_ratio
                         old_is_double = w.is_double_digit
-                        new_is_double = new_ratio >= DOUBLE_THRESHOLD
+                        new_is_double = new_ratio >= self.params.screening.program_net_buy_ratio_double
 
                         # 비중 갱신
                         w.program_ratio = new_ratio
@@ -656,10 +806,10 @@ class AutoTrader:
                                     f"stop {old_stop:,} → {w.hard_stop_price_value:,}"
                                 )
 
-                                # 2차 미체결 시 재발주
+                                # 2차 미체결 시 재발주 (R15-007: get_buy_available 사용)
                                 if not w.buy2_filled and w.buy2_order_id:
-                                    balance = await self.api.get_balance()
-                                    cash = balance.get("available_cash", 0)
+                                    buy_info = await self.api.get_buy_available()
+                                    cash = buy_info["buyable_cash"]
 
                                     success = await self.trader.cancel_and_reorder_buy2(
                                         w, w.target_buy2_price, cash

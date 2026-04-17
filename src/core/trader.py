@@ -1,14 +1,13 @@
 """
 주문 실행 — 지정가 매수 2건 배치, 취소/재주문, 청산.
 
-dry_run: 가상 체결 기록
-paper: 모의투자 실제 주문
-live: 실매매 주문
+R16: LIVE 전용 (paper/dry_run 폐기).
+모든 체결은 KIS 체결통보(H0STCNI0) 경로로 비동기 수신.
 """
 from __future__ import annotations
 
 from datetime import datetime, time as dtime
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 from src.utils.market_calendar import now_kst
 
@@ -20,12 +19,9 @@ from src.kis_api.constants import ORDER_TYPE_LIMIT, ORDER_TYPE_MARKET
 from src.core.watcher import Watcher
 from src.models.order import Order, OrderSide, OrderStatus, Position
 
-if TYPE_CHECKING:
-    from src.core.fill_manager import FillManager
-
 
 class Trader:
-    """주문 실행 엔진."""
+    """주문 실행 엔진 (LIVE 전용)."""
 
     def __init__(self, api: KISAPI, settings: Settings, params: StrategyParams):
         self.api = api
@@ -33,15 +29,7 @@ class Trader:
         self.params = params
         self.position: Optional[Position] = None
         self.pending_buy_orders: list[Order] = []
-        self._fill_manager: Optional["FillManager"] = None  # R-14: W-36
-
-    def set_fill_manager(self, fill_manager: "FillManager") -> None:
-        """FillManager 주입 (R-14: W-36).
-        
-        main.py에서 Trader 생성 후 호출.
-        """
-        self._fill_manager = fill_manager
-        logger.debug("[Trader] FillManager 연결 완료")
+        self.pending_sell_orders: list[Order] = []  # R15-005: LIVE 체결통보 매칭용
 
     # ── 매수 주문 배치 (지정가 2건) ────────────────────────
 
@@ -116,31 +104,22 @@ class Trader:
             created_at=ts,
         )
 
-        if self.settings.is_dry_run:
-            order.order_id = f"DRY_{label}_{ts.strftime('%H%M%S')}"
-            
-            # R-14: FillManager로 예수금 검증 + 동결
-            if self._fill_manager is not None:
-                ok, reason = self._fill_manager.try_place_order(order)
-                if not ok:
-                    logger.warning(f"[DRY_RUN] 주문 거부 ({label}): {reason}")
-                    return None
-                # try_place_order가 order.status = PENDING 설정
-            else:
-                order.status = OrderStatus.PENDING
-            
-            logger.debug(f"[DRY_RUN] 매수주문 시뮬: {label} {price:,}원 × {qty}주")
-        else:
-            try:
-                result = await self.api.buy_order(
-                    code=code, qty=qty, price=price, price_type=ORDER_TYPE_LIMIT
-                )
-                order.order_id = result.get("order_no", "")
-                order.status = OrderStatus.PENDING
-            except Exception as e:
-                logger.error(f"매수주문 실패 [{label}]: {e}")
-                order.status = OrderStatus.REJECTED
-                return None
+        try:
+            result = await self.api.buy_order(
+                code=code, qty=qty, price=price, price_type=ORDER_TYPE_LIMIT
+            )
+            order.order_id = result.get("order_no", "")
+            # R15-005: LIVE 경로 상태 전이 — REST 발주 완료 후 체결통보 대기
+            order.status = OrderStatus.SUBMITTED
+            order.submitted_at = now_kst()
+            logger.info(
+                f"[R15-005] LIVE 매수 SUBMITTED: {label} order_id={order.order_id!r} "
+                f"{price:,}원 × {qty}주 (submitted_at={order.submitted_at})"
+            )
+        except Exception as e:
+            logger.error(f"매수주문 실패 [{label}]: {e}")
+            order.status = OrderStatus.REJECTED
+            return None
 
         return order
 
@@ -152,21 +131,12 @@ class Trader:
             if not order.is_active:
                 continue
 
-            if self.settings.is_dry_run:
-                # R-14: FillManager로 동결 해제
-                if self._fill_manager is not None:
-                    self._fill_manager.cancel_order(order)
-                    # cancel_order가 order.status = CANCELLED 설정
-                else:
-                    order.status = OrderStatus.CANCELLED
-                logger.debug(f"[DRY_RUN] 주문 취소: {order.label} {order.order_id}")
-            else:
-                try:
-                    await self.api.cancel_order(order.order_id, order.code)
-                    order.status = OrderStatus.CANCELLED
-                    logger.info(f"주문 취소: {order.label} {order.order_id}")
-                except Exception as e:
-                    logger.error(f"주문 취소 실패 [{order.label}]: {e}")
+            try:
+                await self.api.cancel_order(order.order_id, order.code)
+                order.status = OrderStatus.CANCELLED
+                logger.info(f"주문 취소: {order.label} {order.order_id}")
+            except Exception as e:
+                logger.error(f"주문 취소 실패 [{order.label}]: {e}")
 
         watcher.buy1_placed = False
         watcher.buy2_placed = False
@@ -219,21 +189,13 @@ class Trader:
         old_qty = old_order.qty
 
         # ── 1. 기존 buy2 취소 ──
-        if self.settings.is_dry_run:
-            # R-14: FillManager로 동결 해제
-            if self._fill_manager is not None:
-                self._fill_manager.cancel_order(old_order)
-            else:
-                old_order.status = OrderStatus.CANCELLED
-            logger.info(f"[DRY_RUN] buy2 취소: {old_price:,}원 → 재발주 준비")
-        else:
-            try:
-                await self.api.cancel_order(watcher.buy2_order_id, watcher.code)
-                old_order.status = OrderStatus.CANCELLED
-                logger.info(f"[{watcher.name}] buy2 취소 완료: {old_price:,}원")
-            except Exception as e:
-                logger.error(f"[{watcher.name}] buy2 취소 실패: {e}")
-                return False
+        try:
+            await self.api.cancel_order(watcher.buy2_order_id, watcher.code)
+            old_order.status = OrderStatus.CANCELLED
+            logger.info(f"[{watcher.name}] buy2 취소 완료: {old_price:,}원")
+        except Exception as e:
+            logger.error(f"[{watcher.name}] buy2 취소 실패: {e}")
+            return False
 
         # ── 2. 새 buy2 발주 ──
         ep = self.params.entry
@@ -272,32 +234,6 @@ class Trader:
             watcher.buy2_placed = False
             return False
 
-    # ── 매수 체결 처리 ────────────────────────────────────
-
-    def on_buy_filled(self, label: str, filled_price: int, filled_qty: int, ts: datetime) -> None:
-        """매수 체결 통보 → 포지션 생성/갱신."""
-        order = self._find_pending_order(label)
-        if order:
-            order.filled_price = filled_price
-            order.filled_qty = filled_qty
-            order.filled_at = ts
-            order.status = OrderStatus.FILLED
-
-        if self.position is None:
-            self.position = Position(
-                code=order.code if order else "",
-                opened_at=ts,
-            )
-
-        if order:
-            self.position.add_buy(order)
-
-    def _find_pending_order(self, label: str) -> Optional[Order]:
-        for o in self.pending_buy_orders:
-            if o.label == label and o.is_active:
-                return o
-        return None
-
     # ── 청산 주문 ─────────────────────────────────────────
 
     async def execute_exit(
@@ -326,121 +262,226 @@ class Trader:
             created_at=now,
         )
 
-        if self.settings.is_dry_run:
-            sell_price = self._current_price(watcher) if use_market else price
-            order.order_id = f"DRY_{reason}_{now.strftime('%H%M%S')}"
-            order.filled_price = sell_price
-            order.filled_qty = qty
-            order.filled_at = now
-            order.status = OrderStatus.FILLED
-            self.position.add_sell(order)
-            logger.info(
-                f"[DRY_RUN] 청산: {reason} {sell_price:,}원 × {qty}주 "
-                f"(P&L {self.position.pnl():+,.0f}원)"
+        try:
+            price_type = ORDER_TYPE_MARKET if use_market else ORDER_TYPE_LIMIT
+            result = await self.api.sell_order(
+                code=code, qty=qty, price=price,
+                price_type=price_type,
             )
-        else:
-            try:
-                price_type = ORDER_TYPE_MARKET if use_market else ORDER_TYPE_LIMIT
-                result = await self.api.sell_order(
-                    code=code, qty=qty, price=price,
-                    price_type=price_type,
-                )
-                order.order_id = result.get("order_no", "")
-                order.status = OrderStatus.PENDING
-                logger.info(f"매도주문 접수: {reason} {qty}주 ({'시장가' if use_market else f'{price:,}원'})")
-            except Exception as e:
-                logger.error(f"매도주문 실패 [{reason}]: {e}")
-                # 하드 손절 실패 시 재시도
-                if reason in ("hard_stop", "futures_stop"):
-                    logger.warning(f"{reason} 재시도 (시장가)")
-                    try:
-                        result = await self.api.sell_order(
-                            code=code, qty=qty, price=0,
-                            price_type=ORDER_TYPE_MARKET,
-                        )
-                        order.order_id = result.get("order_no", "")
-                        order.status = OrderStatus.PENDING
-                    except Exception as e2:
-                        logger.critical(f"{reason} 재시도 실패: {e2}")
-                        order.status = OrderStatus.REJECTED
+            order.order_id = result.get("order_no", "")
+            # R15-005: LIVE 경로 상태 전이 + pending_sell_orders 추적
+            order.status = OrderStatus.SUBMITTED
+            order.submitted_at = now_kst()
+            self.pending_sell_orders.append(order)
+            logger.info(
+                f"[R15-005] LIVE 매도 SUBMITTED: {reason} order_id={order.order_id!r} "
+                f"{qty}주 ({'시장가' if use_market else f'{price:,}원'})"
+            )
+        except Exception as e:
+            logger.error(f"매도주문 실패 [{reason}]: {e}")
+            # 하드 손절 실패 시 재시도
+            if reason in ("hard_stop", "futures_stop"):
+                logger.warning(f"{reason} 재시도 (시장가)")
+                try:
+                    result = await self.api.sell_order(
+                        code=code, qty=qty, price=0,
+                        price_type=ORDER_TYPE_MARKET,
+                    )
+                    order.order_id = result.get("order_no", "")
+                    # R15-005: 재시도 성공 경로도 SUBMITTED + pending_sell_orders 추적
+                    order.status = OrderStatus.SUBMITTED
+                    order.submitted_at = now_kst()
+                    self.pending_sell_orders.append(order)
+                except Exception as e2:
+                    logger.critical(f"{reason} 재시도 실패: {e2}")
+                    order.status = OrderStatus.REJECTED
 
         return order
 
-    def _current_price(self, watcher: Watcher) -> int:
-        """현재가 (dry_run 시뮬레이션용)."""
-        return watcher.current_price
+    # ── R15-005: LIVE 체결통보 처리 ────────────────────
 
-    # ── DRY_RUN 체결 시뮬레이션 (R-14: W-36 FillManager 위임) ───
+    def _find_order_by_id(self, order_id: str) -> Optional[Order]:
+        """R15-005: order_id 로 pending_buy_orders / pending_sell_orders 전체 검색.
 
-    def simulate_fills(self, watcher: Watcher, current_price: int, ts: datetime) -> list[tuple[str, int, int]]:
+        체결통보의 ODER_NO 는 10자리 zero-padded string.
+        KIS REST 발주 응답의 ODNO 와 동일 포맷.
         """
-        DRY_RUN 모드: 현재가가 지정가에 도달하면 가상 체결.
-        
-        R-14 (W-36): FillManager가 있으면 위임, 없으면 기존 로직.
-        
-        Returns:
-            list[tuple[str, int, int]]: [(label, filled_price, filled_qty), ...]
-        """
-        if not self.settings.is_dry_run:
-            return []
-
-        # R-14: FillManager 사용 (고급 시뮬레이션)
-        if self._fill_manager is not None:
-            filled_data = self._fill_manager.check_fills(watcher, self.pending_buy_orders, ts)
-            
-            # R-14 디버그: position 생성 추적
-            logger.debug(
-                f"[simulate_fills] 체결 전: filled_data={len(filled_data)}건, "
-                f"position={self.position is not None}, "
-                f"pending_orders={len(self.pending_buy_orders)}"
-            )
-            
-            # R-14 버그픽스: 부분체결(PARTIAL)도 Position에 반영
-            # 기존: _find_filled_order가 FILLED만 찾아서 PARTIAL 시 Position 미생성
-            # 수정: filled_data의 (label, price, qty)를 직접 Position에 추가
-            for label, price, qty in filled_data:
-                if self.position is None:
-                    self.position = Position(code=watcher.code, opened_at=ts)
-                    logger.debug(f"[simulate_fills] Position 생성: {watcher.code}")
-                # 이번 체결분만 직접 추가 (PARTIAL/FILLED 상태와 무관)
-                self.position.total_buy_amount += price * qty
-                self.position.total_qty += qty
-            
-            if filled_data:
-                logger.debug(
-                    f"[simulate_fills] 체결 후: position.total_qty={self.position.total_qty if self.position else 0}"
-                )
-            
-            return filled_data
-
-        # 기존 로직 (하위 호환)
-        filled_data = []
-        for order in self.pending_buy_orders:
-            if not order.is_active:
-                continue
-            if current_price <= order.price:
-                order.filled_price = order.price
-                order.filled_qty = order.qty
-                order.filled_at = ts
-                order.status = OrderStatus.FILLED
-
-                if self.position is None:
-                    self.position = Position(code=order.code, opened_at=ts)
-                self.position.add_buy(order)
-
-                filled_data.append((order.label, order.price, order.qty))
-                logger.info(
-                    f"[DRY_RUN] {order.label} 가상 체결: {order.price:,}원 × {order.qty}주"
-                )
-
-        return filled_data
-
-    def _find_filled_order(self, label: str) -> Optional[Order]:
-        """체결 완료된 주문 찾기 (R-14: W-36)."""
+        if not order_id:
+            return None
         for o in self.pending_buy_orders:
-            if o.label == label and o.status == OrderStatus.FILLED:
+            if o.order_id == order_id:
+                return o
+        for o in self.pending_sell_orders:
+            if o.order_id == order_id:
                 return o
         return None
+
+    def on_live_acknowledged(self, order_id: str, ts: datetime) -> Optional[Order]:
+        """R15-005: CNTG_YN=1 (접수 확정) 수신 처리.
+
+        상태 전이: SUBMITTED → ACKNOWLEDGED. acknowledged_at 갱신.
+        이미 ACKNOWLEDGED/PARTIAL/FILLED/CANCELLED/REJECTED 상태면 no-op.
+        
+        Returns:
+            Order: 발견된 주문
+            None: order_id 매칭 실패 (외부 개입 의심)
+        """
+        order = self._find_order_by_id(order_id)
+        if order is None:
+            logger.warning(
+                f"[R15-005] 접수통보 order_id={order_id!r} 매칭 실패 — 외부 개입 의심"
+            )
+            return None
+
+        if order.status == OrderStatus.SUBMITTED:
+            order.status = OrderStatus.ACKNOWLEDGED
+            order.acknowledged_at = ts
+            if order.submitted_at is not None:
+                lag = (ts - order.submitted_at).total_seconds()
+                lag_suffix = f" 지연={lag:.3f}s"
+            else:
+                lag_suffix = ""
+            logger.info(
+                f"[R15-005] ACKNOWLEDGED: {order.label or order.side.value} "
+                f"order_id={order_id} code={order.code}{lag_suffix}"
+            )
+        else:
+            logger.debug(
+                f"[R15-005] 접수통보 no-op: order_id={order_id} "
+                f"current_status={order.status.value}"
+            )
+        return order
+
+    def on_live_buy_filled(
+        self, order_id: str, filled_price: int, filled_qty: int, ts: datetime
+    ) -> Optional[Order]:
+        """R15-005: 매수 체결 (CNTG_YN=2, SELN_BYOV_CLS=02) 수신 처리.
+
+        책임:
+        1. order_id 로 pending_buy_orders 에서 Order 찾기
+        2. Order 필드 갱신 (filled_price/qty/at, status → PARTIAL 또는 FILLED)
+        3. Position 생성/갱신
+        
+        Coordinator.on_buy_filled 호출은 main.py 가 담당 (분리 역할).
+        
+        Returns:
+            Order: 갱신된 주문
+            None: order_id 매칭 실패
+        """
+        order = self._find_order_by_id(order_id)
+        if order is None:
+            logger.error(
+                f"[R15-005] 매수체결통보 order_id={order_id!r} 매칭 실패 — 무시"
+            )
+            return None
+
+        if order.side != OrderSide.BUY:
+            logger.error(
+                f"[R15-005] on_live_buy_filled: order_id={order_id} 이 BUY 아님 "
+                f"(side={order.side.value}) — 무시"
+            )
+            return None
+
+        # 누적 체결 반영 (부분체결 지원)
+        order.filled_qty += filled_qty
+        order.filled_price = filled_price  # 마지막 체결가
+        order.filled_at = ts
+
+        if order.filled_qty >= order.qty:
+            order.status = OrderStatus.FILLED
+        else:
+            order.status = OrderStatus.PARTIAL
+
+        # Position 생성/갱신
+        if self.position is None:
+            self.position = Position(code=order.code, opened_at=ts)
+            logger.debug(f"[R15-005] Position 생성: {order.code}")
+
+        # 이번 체결분을 Position 에 누적
+        self.position.total_buy_amount += filled_price * filled_qty
+        self.position.total_qty += filled_qty
+
+        logger.info(
+            f"[R15-005] LIVE 매수 체결: {order.label} order_id={order_id} "
+            f"{filled_price:,}원 × {filled_qty}주 (누적 {order.filled_qty}/{order.qty}, "
+            f"status={order.status.value})"
+        )
+        return order
+
+    def on_live_sell_filled(
+        self, order_id: str, filled_price: int, filled_qty: int, ts: datetime
+    ) -> Optional[Order]:
+        """R15-005: 매도 체결 (CNTG_YN=2, SELN_BYOV_CLS=01) 수신 처리.
+
+        책임:
+        1. order_id 로 pending_sell_orders 에서 Order 찾기
+        2. Order 필드 갱신
+        3. Position 매도 반영 (전량 체결 시 is_open=False)
+        
+        Coordinator.on_sell_filled 호출은 main.py 가 담당.
+        """
+        order = self._find_order_by_id(order_id)
+        if order is None:
+            logger.error(
+                f"[R15-005] 매도체결통보 order_id={order_id!r} 매칭 실패 — 무시"
+            )
+            return None
+
+        if order.side != OrderSide.SELL:
+            logger.error(
+                f"[R15-005] on_live_sell_filled: order_id={order_id} 이 SELL 아님 "
+                f"(side={order.side.value}) — 무시"
+            )
+            return None
+
+        # 누적 체결 반영
+        order.filled_qty += filled_qty
+        order.filled_price = filled_price
+        order.filled_at = ts
+
+        if order.filled_qty >= order.qty:
+            order.status = OrderStatus.FILLED
+        else:
+            order.status = OrderStatus.PARTIAL
+
+        # Position 에 매도 반영
+        if self.position is None:
+            logger.error(
+                f"[R15-005] 매도체결 수신했으나 Position 없음 — Trader 상태 이상"
+            )
+        else:
+            # 이번 체결분만 직접 반영
+            if order not in self.position.sell_orders:
+                self.position.sell_orders.append(order)
+            self.position.total_qty -= filled_qty
+            if self.position.total_qty <= 0:
+                self.position.is_open = False
+                self.position.closed_at = ts
+
+        logger.info(
+            f"[R15-005] LIVE 매도 체결: {order.label} order_id={order_id} "
+            f"{filled_price:,}원 × {filled_qty}주 (누적 {order.filled_qty}/{order.qty}, "
+            f"status={order.status.value})"
+        )
+        return order
+
+    def on_live_rejected(self, order_id: str, ts: datetime) -> Optional[Order]:
+        """R15-005: 거부 (RFUS_YN=1) 수신 처리.
+
+        Order 상태를 REJECTED 로 전이. main.py 가 텔레그램 알림 발송.
+        """
+        order = self._find_order_by_id(order_id)
+        if order is None:
+            logger.warning(
+                f"[R15-005] 거부통보 order_id={order_id!r} 매칭 실패"
+            )
+            return None
+        order.status = OrderStatus.REJECTED
+        logger.error(
+            f"[R15-005] LIVE 주문 거부: {order.label} order_id={order_id} "
+            f"side={order.side.value} code={order.code}"
+        )
+        return order
 
     # ── 상태 ──────────────────────────────────────────────
 
@@ -456,3 +497,4 @@ class Trader:
         """일일 초기화."""
         self.position = None
         self.pending_buy_orders = []
+        self.pending_sell_orders = []  # R15-005

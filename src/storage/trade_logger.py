@@ -197,13 +197,13 @@ class TradeLogger:
 
     # ── 거래 기록 ─────────────────────────────────────────
 
-    def record_trade(self, watcher, trader, trade_mode: str = "dry_run") -> Optional[TradeRecord]:
+    def record_trade(self, watcher, trader, trade_mode: str = "live") -> Optional[TradeRecord]:
         """Watcher + Trader 정보로 거래 기록 생성 + 저장 + 로그 출력.
         
         Args:
             watcher: Watcher 인스턴스
             trader: Trader 인스턴스
-            trade_mode: dry_run / paper / live
+            trade_mode: R16 이후 "live" (이전 기록과의 호환성으로 string 유지)
             
         Returns:
             TradeRecord: 저장된 거래 기록 (미진입 시 None)
@@ -366,7 +366,7 @@ class TradeLogger:
 
     # ── 일별 요약 ─────────────────────────────────────────
 
-    def update_daily_summary(self, summary_date: Optional[date] = None, trade_mode: str = "dry_run") -> Optional[DailySummaryR10]:
+    def update_daily_summary(self, summary_date: Optional[date] = None, trade_mode: str = "live") -> Optional[DailySummaryR10]:
         """일별 요약 계산 + 저장 + 출력."""
         if summary_date is None:
             summary_date = now_kst().date()

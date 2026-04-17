@@ -15,11 +15,13 @@ class OrderSide(str, Enum):
 
 
 class OrderStatus(str, Enum):
-    PENDING = "PENDING"       # 미체결
-    FILLED = "FILLED"         # 체결
-    PARTIAL = "PARTIAL"       # 부분 체결
-    CANCELLED = "CANCELLED"   # 취소
-    REJECTED = "REJECTED"     # 거부
+    PENDING = "PENDING"             # 미체결 (R16 이후 legacy — LIVE 경로는 SUBMITTED 사용)
+    SUBMITTED = "SUBMITTED"         # R15-005: KIS REST 발주 완료, 체결통보 대기
+    ACKNOWLEDGED = "ACKNOWLEDGED"   # R15-005: KIS CNTG_YN=1 수신 (접수 확정)
+    FILLED = "FILLED"               # 체결
+    PARTIAL = "PARTIAL"             # 부분 체결
+    CANCELLED = "CANCELLED"         # 취소
+    REJECTED = "REJECTED"           # 거부 (KIS RFUS_YN=1 또는 REST 실패)
 
 
 @dataclass
@@ -34,8 +36,10 @@ class Order:
     filled_price: int = 0               # 체결가
     filled_qty: int = 0                 # 체결수량
     status: OrderStatus = OrderStatus.PENDING
-    created_at: Optional[datetime] = None
-    filled_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None          # dataclass 생성 시점
+    submitted_at: Optional[datetime] = None        # R15-005: KIS REST 발주 완료 시점
+    acknowledged_at: Optional[datetime] = None     # R15-005: CNTG_YN=1 수신 시점
+    filled_at: Optional[datetime] = None           # 체결 확정 시점 (CNTG_YN=2)
     label: str = ""                     # "buy1", "buy2", "target", "hard_stop", "timeout", "futures_stop", "force"
 
     @property
@@ -44,7 +48,21 @@ class Order:
 
     @property
     def is_active(self) -> bool:
-        return self.status in (OrderStatus.PENDING, OrderStatus.PARTIAL)
+        return self.status in (
+            OrderStatus.PENDING,
+            OrderStatus.SUBMITTED,
+            OrderStatus.ACKNOWLEDGED,
+            OrderStatus.PARTIAL,
+        )
+
+    @property
+    def is_terminal(self) -> bool:
+        """R15-005: 주문이 종결 상태인가 (체결 확정 / 취소 / 거부)."""
+        return self.status in (
+            OrderStatus.FILLED,
+            OrderStatus.CANCELLED,
+            OrderStatus.REJECTED,
+        )
 
     @property
     def remaining_qty(self) -> int:

@@ -761,13 +761,14 @@ class WatcherCoordinator:
 
         흐름:
         0. R-14 버그픽스: DROPPED 상태 미체결 취소
-        1. DRY_RUN 시뮬레이션 (active 의 미체결 매수)
-        2. active watcher 의 _exit_signal_pending 처리 (청산 발주 + active 해제)
-        3. active 가 없으면 yes_watchers 평가 (매수 발주)
+        1. active watcher 의 _exit_signal_pending 처리 (청산 발주 + active 해제)
+        2. active 가 없으면 yes_watchers 평가 (매수 발주)
+
+        R16: DRY_RUN 시뮬레이션 블록 제거 (LIVE 전용).
         """
         # === R-14 버그픽스: DROPPED 상태 미체결 취소 ===
         # _evaluate_target에서 DROPPED로 전이되면 _exit_signal_pending이 false이므로
-        # 청산 로직을 안 탐 → 미체결 주문이 그대로 잔존 + frozen 미해제
+        # 청산 로직을 안 탐 → 미체결 주문이 그대로 잔존
         active = self.active
         if active is not None and active.state == WatcherState.DROPPED:
             logger.warning(
@@ -777,14 +778,6 @@ class WatcherCoordinator:
                 await self.trader.cancel_buy_orders(active)
             self._active_code = None
             return
-
-        # === 1. DRY_RUN 시뮬레이션 (active watcher 의 미체결 매수만) ===
-        active = self.active
-        if active is not None and self.trader is not None:
-            if self.trader.settings.is_dry_run and (active.buy1_pending or active.buy2_pending):
-                filled = self.trader.simulate_fills(active, active.current_price, ts)
-                for label, price, qty in filled:
-                    active.on_buy_filled(label, price, qty, ts)
 
         # === 1. active 청산 신호 처리 ===
         active = self.active
@@ -840,7 +833,14 @@ class WatcherCoordinator:
     # ── 3-5. _execute_exit ───────────────────────────────
 
     async def _execute_exit(self, watcher: Watcher, ts: datetime) -> None:
-        """청산 발주. Trader 호출 후 콜백 통지."""
+        """청산 발주. Trader 호출.
+
+        R15-005 변경: _exit_callback 호출을 여기서 제거함.
+        trader.execute_exit 가 REST 발주만 하고 리턴함 (SUBMITTED 상태).
+        실제 체결 확정은 체결통보(H0STCNI0) 시 비동기 처리.
+        _exit_callback (main._on_exit_done) 은 매도 전량 체결 확정 시점에
+        on_sell_complete 에서 발화됨 (position.is_open == False 일 때).
+        """
         # R10-004 버그 수정: 청산 신호 즉시 리셋 (중복 청산 방지)
         if not watcher._exit_signal_pending:
             logger.warning(f"[Coordinator] 청산 중복 호출 방어: {watcher.name}")
@@ -857,7 +857,27 @@ class WatcherCoordinator:
                 watcher, watcher.exit_reason, watcher.exit_price
             )
 
-        # 청산 후 콜백 통지 (main.py 가 TradeRecord 생성 / DB 저장 / 잔고 갱신)
+        # R15-005: _exit_callback 은 이제 여기서 호출되지 않음.
+        # 매도 전량 체결 확정 시점에 on_sell_complete 에서 발화됨.
+        # (main._on_execution_notify 가 position.is_open == False 인지 확인 후 호출)
+
+    # ── 3-5b. on_sell_complete ── R15-005 ─────────────────
+
+    async def on_sell_complete(self, watcher: Watcher, ts: datetime) -> None:
+        """R15-005: 매도 전량 체결 확정 시 호출.
+
+        호출 경로:
+            main._on_execution_notify 에서 on_live_sell_filled 처리 후
+            trader.position.is_open == False 로 전이되면 이 메서드 호출.
+
+        이 시점에 보장:
+            - trader.position 실제 체결가/수량 완전 반영
+            - trader.pending_sell_orders 해당 주문 FILLED 상태
+            - P&L 계산 정확 가능
+
+        후속: _exit_callback (main._on_exit_done) 발화
+            - P&L 기록 / TradeRecord 저장 / 잔고 재조회 / trader.reset / handle_t3
+        """
         if self._exit_callback is not None:
             await self._exit_callback(watcher)
 

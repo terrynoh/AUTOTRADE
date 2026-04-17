@@ -3,8 +3,8 @@
 
 ETF/ETN/스팩/우선주 제외.
 상한가 도달 종목 제외 (장중 고가 == 상한가 → 눌림 전략 무효).
-모의투자(paper/dry_run)에서는 프로그램매매 데이터 미제공 → 필터 건너뜀.
-실매매(live)에서는 프로그램매매 필터 정상 적용.
+
+R16: LIVE 전용 (paper/dry_run 폐기). 프로그램매매 필터 항상 적용.
 """
 from __future__ import annotations
 
@@ -61,12 +61,10 @@ def _is_etf_or_excluded(code: str, name: str) -> bool:
 class Screener:
     """09:50 스크리닝 엔진."""
 
-    def __init__(self, api: KISAPI, params: StrategyParams, stock_master: StockMaster, is_live: bool = False, use_live_data: bool = False):
+    def __init__(self, api: KISAPI, params: StrategyParams, stock_master: StockMaster):
         self.api = api
         self.params = params
         self._stock_master = stock_master
-        self.is_live = is_live
-        self.use_live_data = use_live_data or is_live
 
     async def run_manual(self, codes: list[str]) -> list[StockCandidate]:
         """
@@ -77,7 +75,7 @@ class Screener:
         2. 상승률 > 0% 필터
         3. 거래대금 ≥ 500억 필터
         4. 상한가 미도달 (< 20%) 필터
-        5. 프로그램순매수비중 ≥ 5% 필터 (실매매만)
+        5. 프로그램순매수비중 ≥ 5% 필터
         6. 상승률 최고 1종목 선택
         """
         sp = self.params.screening
@@ -165,34 +163,30 @@ class Screener:
             logger.warning("기본 필터 통과 종목 없음")
             return []
 
-        # ── 5) 프로그램매매 순매수 비중 필터 ──
-        if not self.use_live_data:
-            logger.warning("모의투자 API: 프로그램매매 데이터 미제공 → 필터 건너뜀 (상승률 기준만 적용)")
-            filtered = candidates
-        else:
-            filtered = []
-            for cand in candidates:
-                try:
-                    prog = await self.api.get_program_trade(cand.code)
-                    cand.program_net_buy = prog.get("program_net_buy", 0)
-                    ratio = cand.program_net_buy_ratio
-                    passed = ratio >= sp.program_net_buy_ratio_min
-                    logger.info(
-                        f"  {cand.name}({cand.code}) 프로그램순매수={cand.program_net_buy:,} "
-                        f"비중={ratio:.2f}% {'통과' if passed else '미달'}"
-                    )
-                except Exception as e:
-                    logger.warning(f"{cand.name}({cand.code}) 프로그램매매 조회 실패: {e}")
-                    continue
+        # ── 5) 프로그램매매 순매수 비중 필터 (LIVE 전용) ──
+        filtered = []
+        for cand in candidates:
+            try:
+                prog = await self.api.get_program_trade(cand.code)
+                cand.program_net_buy = prog.get("program_net_buy", 0)
+                ratio = cand.program_net_buy_ratio
+                passed = ratio >= sp.program_net_buy_ratio_min
+                logger.info(
+                    f"  {cand.name}({cand.code}) 프로그램순매수={cand.program_net_buy:,} "
+                    f"비중={ratio:.2f}% {'통과' if passed else '미달'}"
+                )
+            except Exception as e:
+                logger.warning(f"{cand.name}({cand.code}) 프로그램매매 조회 실패: {e}")
+                continue
 
-                if passed:
-                    filtered.append(cand)
+            if passed:
+                filtered.append(cand)
 
-            logger.info(f"프로그램순매수비중 {sp.program_net_buy_ratio_min}% 이상: {len(filtered)}종목")
+        logger.info(f"프로그램순매수비중 {sp.program_net_buy_ratio_min}% 이상: {len(filtered)}종목")
 
-            if not filtered:
-                logger.warning("프로그램순매수비중 조건 통과 종목 없음")
-                return []
+        if not filtered:
+            logger.warning("프로그램순매수비중 조건 통과 종목 없음")
+            return []
 
         # ── R-11: KOSDAQ Single 제외 (비중 <10%) ──
         double_threshold = sp.program_net_buy_ratio_double
@@ -229,4 +223,3 @@ class Screener:
             )
 
         return targets
-

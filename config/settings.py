@@ -24,23 +24,13 @@ PROJECT_ROOT = _get_project_root()
 
 
 class Settings(BaseSettings):
-    """환경변수 (.env) 기반 설정."""
+    """환경변수 (.env) 기반 설정. LIVE 전용 (R15-005 이후)."""
 
     # 한국투자증권 KIS
     kis_app_key: str = ""
     kis_app_secret: str = ""
     kis_account_no: str = ""
-    kis_account_no_paper: str = ""
-
-    # 매매 모드
-    trade_mode: Literal["dry_run", "paper", "live"] = "dry_run"
-
-    # 데이터 소스: 실전 API로 시세 조회하면서 주문은 가상 실행
-    # True: 실전 API URL + 실전 TR ID로 시세 조회, 주문은 trade_mode에 따라
-    use_live_api: bool = False
-
-    # dry_run 가상 예수금 (원). 실계좌에 입금 없이 테스트할 때 사용
-    dry_run_cash: int = 50_000_000
+    kis_hts_id: str = ""  # R15-005: H0STCNI0 체결통보 구독 tr_key (HTS ID, 계좌번호 아님)
 
     # 텔레그램
     telegram_bot_token: str = ""
@@ -61,37 +51,20 @@ class Settings(BaseSettings):
 
     @property
     def account_no(self) -> str:
-        if self.trade_mode == "live" or self.use_live_api:
-            return self.kis_account_no
-        return self.kis_account_no_paper or self.kis_account_no
+        return self.kis_account_no
+
+    @property
+    def trade_mode(self) -> str:
+        """호환성: 로그/대시보드에서 표시용."""
+        return "live"
 
     @property
     def is_live(self) -> bool:
-        return self.trade_mode == "live"
-
-    @property
-    def is_paper(self) -> bool:
-        return self.trade_mode == "paper"
-
-    @property
-    def is_dry_run(self) -> bool:
-        return self.trade_mode == "dry_run"
-
-    @property
-    def is_paper_mode(self) -> bool:
-        """KIS API 모의투자 여부. use_live_api=True면 실전 API 사용."""
-        if self.use_live_api:
-            return False
-        return self.trade_mode != "live"
-
-    @property
-    def use_live_data(self) -> bool:
-        """실전 API 데이터 사용 여부 (live 모드 또는 use_live_api=True)."""
-        return self.trade_mode == "live" or self.use_live_api
+        """호환성: R15-005 이후 항상 True."""
+        return True
 
 
 # ── 전략 파라미터 (YAML) ────────────────────────────────────────
-
 class ScreeningParams(BaseModel):
     screening_time: str = "09:50"
     volume_min: int = Field(default=50_000_000_000, ge=0, le=1_000_000_000_000)  # 500억
@@ -212,25 +185,6 @@ class InfraParams(BaseModel):
     upper_limit_multiplier: float = Field(default=1.30, ge=1.0, le=1.50)
 
 
-class SimulationParams(BaseModel):
-    """시뮬레이션 파라미터 (R-14: W-34).
-    
-    DRY_RUN 모드에서 부분체결, 체결 지연, 주문 거부 시뮬레이션 설정.
-    """
-    # 부분체결 시뮬레이션
-    partial_fill_enabled: bool = False
-    partial_fill_prob: float = Field(default=0.2, ge=0.0, le=1.0)  # 20% 확률
-    partial_fill_min_ratio: float = Field(default=0.5, ge=0.0, le=1.0)  # 최소 50% 체결
-
-    # 체결 지연 시뮬레이션
-    fill_delay_enabled: bool = False
-    fill_delay_sec: float = Field(default=2.0, ge=0.0, le=60.0)  # 2초 지연
-
-    # 주문 거부 시뮬레이션
-    reject_on_insufficient_cash: bool = True
-    reject_on_invalid_tick: bool = True
-
-
 class StrategyParams(BaseModel):
     """strategy_params.yaml 전체 로드."""
 
@@ -243,7 +197,6 @@ class StrategyParams(BaseModel):
     api: ApiParams = ApiParams()
     market: MarketParams = MarketParams()
     infra: InfraParams = InfraParams()
-    simulation: SimulationParams = SimulationParams()  # R-14: W-34
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> StrategyParams:
@@ -253,5 +206,7 @@ class StrategyParams(BaseModel):
         if path.exists():
             with open(path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
+            # R16: simulation 섹션 무시 (DRY_RUN 폐기)
+            data.pop("simulation", None)
             return cls(**data)
         return cls()

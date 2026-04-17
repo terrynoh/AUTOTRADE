@@ -3,15 +3,15 @@
 
 엔드포인트, TR ID, 시장코드, 주문유형 등.
 출처: https://github.com/koreainvestment/open-trading-api
+
+R16: LIVE 전용 (paper/dry_run 폐기).
 """
 
 # ── 베이스 URL ──────────────────────────────────────────────────
 BASE_URL_REAL = "https://openapi.koreainvestment.com:9443"
-BASE_URL_PAPER = "https://openapivts.koreainvestment.com:29443"
 
 # ── WebSocket URL ───────────────────────────────────────────────
 WS_URL_REAL = "ws://ops.koreainvestment.com:21000"
-WS_URL_PAPER = "ws://ops.koreainvestment.com:31000"
 
 # ── 인증 ────────────────────────────────────────────────────────
 EP_TOKEN = "/oauth2/tokenP"
@@ -35,6 +35,7 @@ EP_ORDER_CANCEL = "/uapi/domestic-stock/v1/trading/order-rvsecncl"
 
 # ── 잔고/계좌 엔드포인트 ──────────────────────────────────────
 EP_BALANCE = "/uapi/domestic-stock/v1/trading/inquire-balance"
+EP_BUY_AVAILABLE = "/uapi/domestic-stock/v1/trading/inquire-psbl-order"   # R15-007: 매수가능조회
 EP_UNFILLED = "/uapi/domestic-stock/v1/trading/inquire-psbl-rvsecncl"
 
 # ── TR ID (실거래) ─────────────────────────────────────────────
@@ -52,18 +53,16 @@ TR_ORDER_SELL = "TTTC0011U"             # 현금매도 (실거래)
 TR_ORDER_CANCEL = "TTTC0803U"           # 주문취소
 
 TR_BALANCE = "TTTC8434R"                # 주식잔고조회
-
-# ── TR ID (모의투자) ───────────────────────────────────────────
-TR_ORDER_BUY_PAPER = "VTTC0012U"
-TR_ORDER_SELL_PAPER = "VTTC0011U"
-TR_ORDER_CANCEL_PAPER = "VTTC0803U"
-TR_BALANCE_PAPER = "VTTC8434R"
+TR_BUY_AVAILABLE = "TTTC8908R"          # 매수가능조회 (R15-007)
 
 # ── WebSocket TR ID ────────────────────────────────────────────
 WS_TR_PRICE = "H0UNCNT0"                # 실시간 체결가 (통합 KRX+NXT)
 WS_TR_ORDERBOOK = "H0STASP0"            # 실시간 호가 (KRX)
 WS_TR_PROGRAM = "H0STPGM0"             # 실시간 프로그램매매 (KRX)
 WS_TR_FUTURES = "H0IFCNT0"              # 실시간 선물 체결 (KOSPI200)
+
+# ── 체결통보 (R15-005) ─────────────────────────────────
+WS_TR_EXECUTION = "H0STCNI0"            # 실전 국내주식 체결통보 (tr_key = HTS ID)
 
 # ── 선물 종목코드 ──────────────────────────────────────────────
 FUTURES_KOSPI200_NEAR = "101S3000"       # KOSPI200 선물 근월물 (코드는 분기마다 변경)
@@ -80,7 +79,6 @@ ORDER_TYPE_BEST_LIMIT = "03"             # 최유리지정가
 
 # ── Rate Limit (초당 최대 요청 수) ─────────────────────────────
 RATE_LIMIT_REAL = 20    # 실거래: 초당 20건 (0.05초 간격)
-RATE_LIMIT_PAPER = 2    # 모의투자: 초당 2건 (0.5초 간격)
 
 # ── 에러 코드 ──────────────────────────────────────────────────
 ERROR_CODES = {
