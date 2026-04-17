@@ -60,7 +60,7 @@ TR_ORDER_CANCEL_PAPER = "VTTC0803U"
 TR_BALANCE_PAPER = "VTTC8434R"
 
 # ── WebSocket TR ID ────────────────────────────────────────────
-WS_TR_PRICE = "H0STCNT0"                # 실시간 체결가 (KRX)
+WS_TR_PRICE = "H0UNCNT0"                # 실시간 체결가 (통합 KRX+NXT)
 WS_TR_ORDERBOOK = "H0STASP0"            # 실시간 호가 (KRX)
 WS_TR_PROGRAM = "H0STPGM0"             # 실시간 프로그램매매 (KRX)
 WS_TR_FUTURES = "H0IFCNT0"              # 실시간 선물 체결 (KOSPI200)

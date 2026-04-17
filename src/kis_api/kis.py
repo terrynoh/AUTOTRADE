@@ -346,7 +346,7 @@ class KISAPI:
     async def get_current_price(self, code: str) -> dict:
         """주식 현재가 조회."""
         params = {
-            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_MRKT_DIV_CODE": "UN",
             "FID_INPUT_ISCD": code,
         }
         data = await self._get(EP_PRICE, TR_PRICE, params)
@@ -433,7 +433,7 @@ class KISAPI:
         최신(마지막) 레코드에 현재까지의 누적값이 들어있다.
         """
         params = {
-            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_MRKT_DIV_CODE": "UN",
             "FID_INPUT_ISCD": code,
         }
         data = await self._get(EP_PROGRAM_TRADE_BY_STOCK, TR_PROGRAM_TRADE_BY_STOCK, params)
@@ -472,7 +472,7 @@ class KISAPI:
         now = now_kst()
         params = {
             "FID_ETC_CLS_CODE": "",
-            "FID_COND_MRKT_DIV_CODE": "J",
+            "FID_COND_MRKT_DIV_CODE": "UN",
             "FID_INPUT_ISCD": code,
             "FID_INPUT_HOUR_1": now.strftime("%H%M%S"),
             "FID_PW_DATA_INCU_YN": "N",
