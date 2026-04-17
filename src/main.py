@@ -439,6 +439,43 @@ class AutoTrader:
         """
         asyncio.create_task(self._process_execution_notify(parsed))
 
+    def _check_position_invariant(self, order, label: str) -> None:
+        """Phase 2 B: dual-write 정합성 검증.
+
+        체결통보 처리 직후 호출. trader.position 와 watcher.position 은
+        동일 async task 내 sequential 갱신되므로 반드시 일치해야 함.
+        불일치 시 critical 로그 + 텔레그램 알림 (매매는 계속 — 차후 확인).
+
+        Args:
+            order: 방금 체결 처리된 Order 객체 (code 조회용)
+            label: "buy" 또는 "sell" (로그 식별용)
+        """
+        if self.trader.position is None:
+            return
+        watcher = next(
+            (w for w in self._coordinator.watchers if w.code == order.code),
+            None,
+        )
+        if watcher is None or watcher.position is None:
+            return
+        t_qty = self.trader.position.total_qty
+        w_qty = watcher.position.total_qty
+        t_amt = self.trader.position.total_buy_amount
+        w_amt = watcher.position.total_buy_amount
+        if t_qty != w_qty or t_amt != w_amt:
+            logger.critical(
+                f"[Phase 2 B] Position 불일치 ({label} 체결 후) "
+                f"code={order.code}: "
+                f"trader(qty={t_qty}, amt={t_amt}) vs "
+                f"watcher(qty={w_qty}, amt={w_amt})"
+            )
+            self.notifier.notify_error(
+                f"⚠️ Position dual-write 불일치\n"
+                f"code={order.code} {label}\n"
+                f"trader(qty={t_qty}, amt={t_amt:,})\n"
+                f"watcher(qty={w_qty}, amt={w_amt:,})"
+            )
+
     async def _process_execution_notify(self, parsed: dict) -> None:
         """체결통보 본체 처리 — 5 케이스 분기.
 
@@ -526,9 +563,12 @@ class AutoTrader:
                     if order is None:
                         return
                     # Coordinator 에 매수 체결 라우팅 (Watcher.on_buy_filled → ENTERED 전이 + T2 콜백)
+                    # Phase 2 B: order 도 전달 (dual-write position.buy_orders list 관리용)
                     self._coordinator.on_buy_filled(
-                        order.code, order.label, filled_price, filled_qty, ts
+                        order.code, order.label, filled_price, filled_qty, ts, order=order
                     )
+                    # Phase 2 B: dual-write 정합성 검증
+                    self._check_position_invariant(order, label="buy")
                     return
 
                 elif side == "01":
@@ -537,9 +577,12 @@ class AutoTrader:
                     if order is None:
                         return
                     # Coordinator 에 매도 체결 라우팅 (avg_sell_price 갱신)
+                    # Phase 2 B: order 도 전달 (dual-write position.sell_orders list 관리용)
                     self._coordinator.on_sell_filled(
-                        order.code, filled_price, filled_qty, ts
+                        order.code, filled_price, filled_qty, ts, order=order
                     )
+                    # Phase 2 B: dual-write 정합성 검증 (매도는 total_qty 차감 후 검증)
+                    self._check_position_invariant(order, label="sell")
                     # 전량 체결 확정 시 on_sell_complete 체인 발화 → _on_exit_done
                     pos = self.trader.position
                     if pos is not None and not pos.is_open:

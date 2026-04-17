@@ -26,6 +26,7 @@ from loguru import logger
 from config.settings import StrategyParams
 from src.utils.price_utils import floor_to_tick, ceil_to_tick
 from src.models.stock import MarketType
+from src.models.order import Position, Order   # Phase 2 B: dual-write
 
 
 # ── WatcherState enum ────────────────────────────────────
@@ -156,6 +157,11 @@ class Watcher:
     buy2_time: Optional[datetime] = None          # R10-009
     total_buy_amount: int = 0
     total_buy_qty: int = 0
+
+    # === Phase 2 B: dual-write Position (trader.position 와 병렬 유지) ===
+    # 체결통보 시 trader.position 갱신과 동시에 여기도 갱신됨.
+    # Phase 3 에서 trader.position 정리 시 이 필드가 단일 소스가 됨.
+    position: Optional[Position] = None
 
     # === ENTERED 정보 ===
     entered_at: Optional[datetime] = None
@@ -510,11 +516,16 @@ class Watcher:
 
     # (5-14) on_buy_filled
 
-    def on_buy_filled(self, label: str, filled_price: int, filled_qty: int, ts: datetime) -> None:
+    def on_buy_filled(self, label: str, filled_price: int, filled_qty: int,
+                       ts: datetime, *, order: Optional[Order] = None) -> None:
         """매수 체결 통보. 첫 체결 시 ENTERED 전이 + post_entry_low 초기화.
         
         R-14 (W-39): 부분체결 지원 — 매 체결 통보마다 누적 처리.
+        Phase 2 B: dual-write position. Order 객체는 keyword-only 인자로
+        받음 (하위 호환). Trader 와 동일 패턴으로 "이번 체결분만
+        직접 누적" — Position.add_buy() 미사용 (부분체결 중복 예방).
         """
+        # === 기존 로직 (Watcher 내부 필드) ===
         self.total_buy_amount += filled_price * filled_qty
         self.total_buy_qty += filled_qty
 
@@ -544,6 +555,22 @@ class Watcher:
             self.entered_at = ts
             self.post_entry_low = filled_price
             self.post_entry_low_time = ts
+
+        # === Phase 2 B: dual-write position 갱신 ===
+        # Trader.on_live_buy_filled 과 동일 패턴 — "이번 체결분만 직접 누적".
+        # Position.add_buy() 는 order.filled_qty (누적값) 전체를 더하므로
+        # 부분체결 시 중복 발생 → 사용 금지.
+        if self.position is None:
+            self.position = Position(code=self.code, name=self.name, opened_at=ts)
+        self.position.total_buy_amount += filled_price * filled_qty
+        self.position.total_qty += filled_qty
+        if self.position.opened_at is None:
+            self.position.opened_at = ts
+        # buy_orders list: 같은 order 객체는 첫 체결 시에만 append.
+        # Python reference 의존 — Trader 가 order.filled_qty / status 갱신하면
+        # watcher.position.buy_orders 안의 같은 객체도 자동 반영.
+        if order is not None and order not in self.position.buy_orders:
+            self.position.buy_orders.append(order)
 
         avg = self.total_buy_amount / self.total_buy_qty if self.total_buy_qty > 0 else 0
         logger.info(
@@ -884,7 +911,8 @@ class WatcherCoordinator:
     # ── 3-6. on_buy_filled / on_sell_filled ──────────────
 
     def on_buy_filled(self, code: str, label: str, filled_price: int,
-                       filled_qty: int, ts: datetime) -> None:
+                       filled_qty: int, ts: datetime, *,
+                       order: Optional[Order] = None) -> None:
         """KIS 체결 통보 콜백. main.py 또는 Trader 가 호출.
 
         Args:
@@ -893,10 +921,11 @@ class WatcherCoordinator:
             filled_price: 체결가
             filled_qty: 체결수량
             ts: 체결 시각
+            order: Phase 2 B — Order 객체 (dual-write 시 buy_orders list 관리용)
         """
         for w in self.watchers:
             if w.code == code:
-                w.on_buy_filled(label, filled_price, filled_qty, ts)
+                w.on_buy_filled(label, filled_price, filled_qty, ts, order=order)
                 logger.info(
                     f"[Coordinator] {w.name} {label} 체결 반영"
                 )
@@ -904,7 +933,8 @@ class WatcherCoordinator:
         logger.warning(f"[Coordinator] on_buy_filled: 종목 미일치 {code}")
 
     def on_sell_filled(self, code: str, filled_price: int,
-                        filled_qty: int, ts: datetime) -> None:
+                        filled_qty: int, ts: datetime, *,
+                        order: Optional[Order] = None) -> None:
         """매도 체결 통보. avg_sell_price / total_sell_amount 갱신.
 
         Args:
@@ -912,9 +942,11 @@ class WatcherCoordinator:
             filled_price: 체결가
             filled_qty: 체결수량
             ts: 체결 시각
+            order: Phase 2 B — Order 객체 (dual-write 시 sell_orders list 관리용)
         """
         for w in self.watchers:
             if w.code == code:
+                # === 기존 로직 (Watcher 내부 필드) ===
                 w.total_sell_amount += filled_price * filled_qty
                 # avg_sell_price 갱신 (가중 평균)
                 if w.total_buy_qty > 0:
@@ -923,6 +955,21 @@ class WatcherCoordinator:
                     f"[Coordinator] {w.name} 매도 체결 반영: "
                     f"{filled_price:,} × {filled_qty}"
                 )
+
+                # === Phase 2 B: dual-write position 갱신 ===
+                if w.position is None:
+                    logger.error(
+                        f"[Phase 2 B] 매도 체결 수신했으나 watcher.position 없음: code={code}"
+                    )
+                    return
+                # total_qty 차감 (부분체결 지원 — 매번 차감)
+                w.position.total_qty -= filled_qty
+                if w.position.total_qty <= 0:
+                    w.position.is_open = False
+                    w.position.closed_at = ts
+                # sell_orders list: 같은 order 객체는 첫 체결 시에만 append
+                if order is not None and order not in w.position.sell_orders:
+                    w.position.sell_orders.append(order)
                 return
         logger.warning(f"[Coordinator] on_sell_filled: 종목 미일치 {code}")
 
