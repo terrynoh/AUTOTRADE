@@ -388,15 +388,28 @@ class Trader:
         if self._fill_manager is not None:
             filled_data = self._fill_manager.check_fills(watcher, self.pending_buy_orders, ts)
             
+            # R-14 디버그: position 생성 추적
+            logger.debug(
+                f"[simulate_fills] 체결 전: filled_data={len(filled_data)}건, "
+                f"position={self.position is not None}, "
+                f"pending_orders={len(self.pending_buy_orders)}"
+            )
+            
             # R-14 버그픽스: 부분체결(PARTIAL)도 Position에 반영
             # 기존: _find_filled_order가 FILLED만 찾아서 PARTIAL 시 Position 미생성
             # 수정: filled_data의 (label, price, qty)를 직접 Position에 추가
             for label, price, qty in filled_data:
                 if self.position is None:
                     self.position = Position(code=watcher.code, opened_at=ts)
+                    logger.debug(f"[simulate_fills] Position 생성: {watcher.code}")
                 # 이번 체결분만 직접 추가 (PARTIAL/FILLED 상태와 무관)
                 self.position.total_buy_amount += price * qty
                 self.position.total_qty += qty
+            
+            if filled_data:
+                logger.debug(
+                    f"[simulate_fills] 체결 후: position.total_qty={self.position.total_qty if self.position else 0}"
+                )
             
             return filled_data
 

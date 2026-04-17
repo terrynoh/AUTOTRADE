@@ -536,7 +536,8 @@ class AutoTrader:
                 if self._cash_manager.used > 0:
                     # CashManager가 예수금을 추적 중인 경우 (W-35+ 이후)
                     # 청산 금액 = 현재가 × 보유수량
-                    exit_value = watcher.current_price * self.trader.position.total_qty if self.trader.position else 0
+                    # R-14 버그픽스: self.trader.position이 None일 수 있으므로 watcher.total_buy_qty 사용
+                    exit_value = watcher.current_price * watcher.total_buy_qty if watcher.total_buy_qty > 0 else 0
                     self._cash_manager.restore(exit_value, reason=watcher.exit_reason)
                     new_cash = self._cash_manager.available
                 else:
