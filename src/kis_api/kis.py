@@ -984,6 +984,13 @@ class KISAPI:
                                         "change": int(fields[4]),
                                         "change_pct": float(fields[5]),
                                         "volume": int(fields[9]) if len(fields) > 9 else 0,
+                                        # VI-Observer (W-SAFETY-1): H0UNCNT0 공식 문서 46 필드 기준
+                                        # 팩트: 인덱스 확정. 값 해석은 Stage 2 실측 후.
+                                        "new_mkop_cls_code": fields[34] if len(fields) > 34 else "",
+                                        "trht_yn":           fields[35] if len(fields) > 35 else "",
+                                        "hour_cls_code":     fields[43] if len(fields) > 43 else "",
+                                        "mrkt_trtm_cls_code": fields[44] if len(fields) > 44 else "",
+                                        "vi_stnd_prc":       fields[45] if len(fields) > 45 else "",
                                     }
                                     for cb in self._realtime_callbacks.get(WS_TR_PRICE, []):
                                         try:
