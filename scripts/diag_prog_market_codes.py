@@ -73,8 +73,8 @@ async def query_raw(api: KISAPI, code: str, mkt_code: str) -> dict[str, Any]:
 
 async def main() -> None:
     stamp = now_kst().strftime("%Y-%m-%d_%H%M%S")
-    log_dir = ROOT / "logs"
-    log_dir.mkdir(exist_ok=True)
+    log_dir = ROOT / "logs" / "diag"
+    log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"diag_mcodes_{stamp}.log"
     json_path = log_dir / f"diag_mcodes_{stamp}.json"
 

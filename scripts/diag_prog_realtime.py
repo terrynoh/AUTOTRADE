@@ -90,8 +90,8 @@ async def diag_round(api: KISAPI, round_num: int, raw_records: list[dict[str, An
 
 async def main() -> None:
     stamp = now_kst().strftime("%Y-%m-%d_%H%M%S")
-    log_dir = ROOT / "logs"
-    log_dir.mkdir(exist_ok=True)
+    log_dir = ROOT / "logs" / "diag"
+    log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"diag_prog_{stamp}.log"
     json_path = log_dir / f"diag_prog_{stamp}.json"
 
