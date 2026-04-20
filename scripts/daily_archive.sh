@@ -110,4 +110,9 @@ log "Archive size: $(du -sh "$OUTPUT" | cut -f1)"
 find "$ARCHIVE_DIR" -name "*.tar.gz" -mtime +30 -delete
 log "Retention cleanup done."
 
+# --- systemd stdout/stderr 초기화 (journal에 이미 포함, 디스크 누수 방지) ---
+truncate -s 0 "$LOG_DIR/autotrade.log" 2>/dev/null || true
+truncate -s 0 "$LOG_DIR/autotrade.err" 2>/dev/null || true
+log "Truncated autotrade.log / autotrade.err"
+
 log "=== Done: $OUTPUT ==="
