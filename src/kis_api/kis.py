@@ -465,26 +465,45 @@ class KISAPI:
         시간대별 누적 프로그램 순매수 데이터를 반환하며,
         최신(마지막) 레코드에 현재까지의 누적값이 들어있다.
 
-        M-DIAG-PROG v2 (ISSUE-LIVE-02 가설 D 증명):
-        - 매 호출 DEBUG 1줄 요약
-        - 이상 케이스 4가지 중 하나라도 해당 시 WARNING + 상세 덤프
-          (a) EMPTY: output 빈 배열/None
+        M-LIVE-02-FIX (ISSUE-LIVE-02 근본 원인 해소):
+        - FID_COND_MRKT_DIV_CODE="UN" (통합) = KRX + NXT 합산 반환
+        - NXT 미상장 종목은 UN 조회 시 곧바로 빈 배열 반환 (fallback 없음)
+        - 수정: UN 반환값 빈 배열 시 "J" (KRX 단독) 재조회
+        - NXT 이중상장 종목은 UN 그대로 사용 (기존 정상 동작 유지)
+        - UN + J 모두 빈 배열 = 진짜 이상 (PROG-ANOMALY-EMPTY)
+
+        M-DIAG-PROG v2 (ISSUE-LIVE-02 가설 D 증명 — 사용 상태 유지):
+        - 매 호출 DEBUG 1줄 요약 ([PROG-UN] 또는 [PROG-J-FALLBACK])
+        - 이상 케이스 4가지 중 해당 시 WARNING + 상세 덤프
+          (a) EMPTY: UN + J 모두 빈 배열/None (fallback 후에도 실패)
           (b) ZERO_ASYM: net_buy==0 이고 buy_amount>0 OR sell_amount>0
           (c) ALL_ZERO: net/buy/sell 모두 0 이지만 output 존재
           (d) ORDER: len(output)>1 이고 output[0].bsop_hour < output[-1].bsop_hour
         """
+        # 1차: UN (통합) — 기존 동작
         params = {
             "FID_COND_MRKT_DIV_CODE": "UN",
             "FID_INPUT_ISCD": code,
         }
         data = await self._get(EP_PROGRAM_TRADE_BY_STOCK, TR_PROGRAM_TRADE_BY_STOCK, params)
-
         output = data.get("output", [])
+        source = "UN"
 
-        # ── 이상 조건 (a) EMPTY ──────────────────────────
+        # M-LIVE-02-FIX: UN 빈 배열 시 J fallback (NXT 미상장 종목 대응)
+        if not (isinstance(output, list) and output):
+            logger.info(
+                f"[PROG-FALLBACK-J] {code} UN=EMPTY → J(KRX) 재조회 "
+                f"rt_cd={data.get('rt_cd')!r}"
+            )
+            params["FID_COND_MRKT_DIV_CODE"] = "J"
+            data = await self._get(EP_PROGRAM_TRADE_BY_STOCK, TR_PROGRAM_TRADE_BY_STOCK, params)
+            output = data.get("output", [])
+            source = "J-FALLBACK"
+
+        # ── 이상 조건 (a) EMPTY — UN + J 모두 빈 배열 (진짜 이상) ──
         if not (isinstance(output, list) and output):
             logger.warning(
-                f"[PROG-ANOMALY-EMPTY] {code} output={output!r} "
+                f"[PROG-ANOMALY-EMPTY] {code} UN+J 모두 empty — 진짜 데이터 없음 "
                 f"rt_cd={data.get('rt_cd')!r} msg={data.get('msg1')!r}"
             )
             return {"program_net_buy": 0, "buy_amount": 0, "sell_amount": 0}
@@ -495,23 +514,23 @@ class KISAPI:
         sell_amt = int(latest.get("whol_smtn_seln_tr_pbmn", "0"))
         bsop_hour = latest.get("bsop_hour", "")
 
-        # ── 매 호출 1줄 요약 (DEBUG) ─────────────────────
+        # ── 매 호출 1줄 요약 (DEBUG) — source 태그 추가 ──
         logger.debug(
-            f"[PROG] {code} len={len(output)} bsop={bsop_hour} "
+            f"[PROG-{source}] {code} len={len(output)} bsop={bsop_hour} "
             f"net={net_buy} buy={buy_amt} sell={sell_amt}"
         )
 
         # ── 이상 조건 (b) ZERO_ASYM ──────────────────────
         if net_buy == 0 and (buy_amt > 0 or sell_amt > 0):
             logger.warning(
-                f"[PROG-ANOMALY-ZERO_ASYM] {code} net=0 but buy={buy_amt} sell={sell_amt} "
+                f"[PROG-ANOMALY-ZERO_ASYM] {code} ({source}) net=0 but buy={buy_amt} sell={sell_amt} "
                 f"bsop={bsop_hour} — 가설D 강력 시그니처. output[0]={latest!r}"
             )
 
         # ── 이상 조건 (c) ALL_ZERO ───────────────────────
         elif net_buy == 0 and buy_amt == 0 and sell_amt == 0:
             logger.warning(
-                f"[PROG-ANOMALY-ALL_ZERO] {code} 전부 0 but output 존재 "
+                f"[PROG-ANOMALY-ALL_ZERO] {code} ({source}) 전부 0 but output 존재 "
                 f"len={len(output)} bsop={bsop_hour} output[0]={latest!r}"
             )
 
@@ -521,7 +540,7 @@ class KISAPI:
             tail_bsop = tail.get("bsop_hour", "")
             if bsop_hour and tail_bsop and bsop_hour < tail_bsop:
                 logger.warning(
-                    f"[PROG-ANOMALY-ORDER] {code} output[0].bsop={bsop_hour} < "
+                    f"[PROG-ANOMALY-ORDER] {code} ({source}) output[0].bsop={bsop_hour} < "
                     f"output[-1].bsop={tail_bsop} — 배열 순서 가정 붕괴 "
                     f"len={len(output)}"
                 )
