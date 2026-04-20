@@ -33,7 +33,7 @@ def main() -> None:
         help="대시보드만 실행 (매매 엔진 없이 뷰어 모드)",
     )
     parser.add_argument("--host", default="127.0.0.1", help="대시보드 바인드 주소")
-    parser.add_argument("--port", type=int, default=8501, help="대시보드 포트")
+    parser.add_argument("--port", type=int, default=8503, help="대시보드 포트 (기본 8503, Cloudflare Named Tunnel app.hwrimlab.trade 연결)")
     args = parser.parse_args()
 
     if args.dashboard_only:
