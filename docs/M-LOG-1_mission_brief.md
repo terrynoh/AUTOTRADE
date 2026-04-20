@@ -65,7 +65,8 @@ C:\Users\terryn\AUTOTRADE\logs\
 `ops_HHMMSS` 로 실행 시각별 하위 폴더를 만드는 이유: 하루에 여러 번 실행해도 덮어쓰지 않음.
 
 ### 운영 서버 정보
-- **호스트**: `ubuntu@134.185.115.229` (Oracle Cloud Seoul)
+- **호스트**: `ubuntu@34.47.69.63` (GCP Seoul, asia-northeast3-a)
+- **SSH 키**: `~/.ssh/autotrade_gcp`
 - **프로젝트 경로**: `/home/ubuntu/AUTOTRADE`
 - **systemd 서비스명**: `autotrade` (확인 필요)
 
