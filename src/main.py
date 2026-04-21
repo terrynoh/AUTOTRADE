@@ -104,6 +104,15 @@ class AutoTrader:
         # capital 은 run() 초기 잔고 확인 후 self._initial_cash 로 갱신됨.
         self._trade_logger = TradeLogger()
 
+        # ── VI-Observer (W-SAFETY-1) ──
+        # 각 종목 이전 VI 필드 상태 (변화 감지용). 해석 안 함 — Stage 2 실측 후 확정.
+        self._prev_vi_state: dict[str, dict] = {}
+        # 당일 종목별 첫 변화 알림 발송 여부 (중복 방지)
+        self._vi_notified_codes: set[str] = set()
+
+        # ── H2 중복 알림 방지 (W-SAFETY-1) ──
+        self._h2_notified: bool = False
+
     # ── 수동 종목 설정 ────────────────────────────────────
 
     def set_manual_codes(self, codes: list[str]) -> None:
@@ -211,6 +220,39 @@ class AutoTrader:
                 await self.api.subscribe_futures()
             except Exception as e:
                 logger.error(f"선물 구독 실패: {e}")
+
+            # ── F1 SA-5e: 시작 시 미청산 포지션 감지 (W-SAFETY-1) ──
+            # 팩트: get_balance() 공식 API. holdings 존재 시 매매 거부 (자동 복구 X).
+            # 의도: 재시작 시 KIS 계좌 잔고와 AUTOTRADE 메모리 불일치 방지.
+            try:
+                _initial_balance = await self.api.get_balance()
+                _holdings = _initial_balance.get("holdings", []) or []
+            except Exception as e:
+                logger.error(f"[F1 SA-5e] 잔고 조회 실패 — 방어적으로 매매 거부: {e}")
+                self.notifier.notify_error(
+                    f"🚨 [F1 SA-5e] 시작 시 잔고 조회 실패\n"
+                    f"AUTOTRADE 매매 거부됨.\n"
+                    f"에러: {e}\n"
+                    f"수동 확인 후 재시작 필요"
+                )
+                return
+
+            if _holdings:
+                _holdings_msg = "\n".join(
+                    f"  {h.get('code','')} {h.get('name','')} "
+                    f"{h.get('qty',0)}주 @ {h.get('buy_price',0):,}원"
+                    for h in _holdings
+                )
+                logger.critical(
+                    f"[F1 SA-5e] 시작 시 미청산 포지션 감지 → 매매 거부\n{_holdings_msg}"
+                )
+                self.notifier.notify_error(
+                    f"⚠️ 재시작 시 미청산 포지션 감지!\n"
+                    f"AUTOTRADE 매매 거부됨.\n"
+                    f"HTS/MTS 에서 수동 청산 후 재시작 필요.\n\n"
+                    f"{_holdings_msg}"
+                )
+                return
 
             # ── 초기 예수금 확인 (R15-007) ──
             # get_buy_available() 반환 buyable_cash (nrcvb_buy_amt) = MTS 주문가능원화
@@ -370,11 +412,35 @@ class AutoTrader:
         logger.info(f"매수 마감 ({self.params.entry.entry_deadline}) — Coordinator 통지 완료")
 
     async def _schedule_force_liquidate(self):
-        """강제 청산 시각 도달 시 Coordinator 에 통지."""
+        """강제 청산 시각 도달 시 Coordinator 에 통지.
+
+        W-SAFETY-1 (H2): 통지 후 30초 대기 → 포지션 잔존 시 critical 알림.
+        VI/서킷브레이커로 시장가 매도가 지연되는 케이스 대응.
+        """
         force_time = time.fromisoformat(self.params.exit.force_liquidate_time)
         await self._wait_until(force_time)
         await self._coordinator.on_force_liquidate(now_kst())
         logger.info(f"강제 청산 ({self.params.exit.force_liquidate_time}) — Coordinator 통지 완료")
+
+        # H2: 30초 대기 후 포지션 잔존 체크
+        # 정상 시장가 체결: 1~5초. 체결통보 전달 포함 10초 이내. 30초 = 안전 마진.
+        await asyncio.sleep(30)
+        if self.trader.has_position() and not self._h2_notified:
+            self._h2_notified = True
+            _pos = self.trader.position
+            _code = _pos.code if _pos else "(unknown)"
+            _qty = _pos.total_qty if _pos else 0
+            logger.critical(
+                f"[H2] 11:20 강제 청산 실패 — 포지션 잔존\n"
+                f"code={_code} total_qty={_qty}"
+            )
+            self.notifier.notify_error(
+                f"🚨 11:20 강제 청산 실패!\n"
+                f"종목: {_code}\n"
+                f"수량: {_qty}주\n"
+                f"원인 가능성: VI 발동 / 서킷브레이커 / 유동성 부족\n"
+                f"HTS 수동 청산 즉시 필요!"
+            )
 
     # ── 스케줄: 15:30 장 마감 + 일일 리포트 ─────────────────
 
@@ -403,13 +469,70 @@ class AutoTrader:
     # ── 실시간 가격 콜백 ──────────────────────────────────
 
     def _on_realtime_price(self, data: dict) -> None:
-        """WebSocket 실시간 체결가 수신 콜백. Coordinator 로 위임."""
+        """WebSocket 실시간 체결가 수신 콜백. Coordinator 로 위임.
+
+        W-SAFETY-1: VI-Observer 추가. 가격 라우팅 전 VI 필드 변화 감지.
+        """
         code = data.get("code", "")
         price = data.get("current_price", 0)
         ts = now_kst()
 
+        # VI-Observer: 필드 변화 감지 (팩트 영역만, 해석 안 함)
+        self._check_vi_observer(code, data, ts)
+
         # Coordinator 가 모든 watcher 라우팅 (async fire-and-forget)
         asyncio.create_task(self._coordinator.on_realtime_price(code, price, ts))
+
+    def _check_vi_observer(self, code: str, data: dict, ts: datetime) -> None:
+        """VI-Observer (W-SAFETY-1 Stage 1): VI 관련 필드 변화 감지.
+
+        팩트: H0UNCNT0 공식 문서 인덱스 34/35/43/44/45 파싱.
+        동작: 값 변화 시 critical 로그 + 당일 종목별 첫 변화 텔레그램 1회.
+        Stage 2: LIVE 실측 + HTS 대조로 필드값 의미 확정 후 매매 반영 예정.
+        """
+        if not code:
+            return
+        current = {
+            "trht_yn":            data.get("trht_yn", ""),
+            "mrkt_trtm_cls_code": data.get("mrkt_trtm_cls_code", ""),
+            "hour_cls_code":      data.get("hour_cls_code", ""),
+            "new_mkop_cls_code":  data.get("new_mkop_cls_code", ""),
+            "vi_stnd_prc":        data.get("vi_stnd_prc", ""),
+        }
+        prev = self._prev_vi_state.get(code)
+        if prev is None:
+            self._prev_vi_state[code] = current
+            return
+        if current == prev:
+            return
+
+        # 변화 감지 → critical 로그 (항상)
+        logger.critical(
+            f"[VI-OBSERVER] {code} 장 상태 필드 변화:\n"
+            f"  TRHT_YN:            {prev['trht_yn']!r} → {current['trht_yn']!r}\n"
+            f"  MRKT_TRTM_CLS_CODE: {prev['mrkt_trtm_cls_code']!r} → {current['mrkt_trtm_cls_code']!r}\n"
+            f"  HOUR_CLS_CODE:      {prev['hour_cls_code']!r} → {current['hour_cls_code']!r}\n"
+            f"  NEW_MKOP_CLS_CODE:  {prev['new_mkop_cls_code']!r} → {current['new_mkop_cls_code']!r}\n"
+            f"  VI_STND_PRC:        {prev['vi_stnd_prc']!r} → {current['vi_stnd_prc']!r}\n"
+            f"  price={data.get('current_price', 0):,}"
+        )
+
+        # 텔레그램: 당일 종목별 첫 변화 1회만
+        if code not in self._vi_notified_codes:
+            self._vi_notified_codes.add(code)
+            self.notifier.notify_system(
+                f"🔍 [VI-OBSERVER] {code} {ts.strftime('%H:%M:%S')}\n"
+                f"필드값 변화 감지 (당일 최초):\n"
+                f" TRHT_YN: {prev['trht_yn']!r} → {current['trht_yn']!r}\n"
+                f" MRKT_TRTM_CLS_CODE: {prev['mrkt_trtm_cls_code']!r} → {current['mrkt_trtm_cls_code']!r}\n"
+                f" HOUR_CLS_CODE: {prev['hour_cls_code']!r} → {current['hour_cls_code']!r}\n"
+                f" NEW_MKOP_CLS_CODE: {prev['new_mkop_cls_code']!r} → {current['new_mkop_cls_code']!r}\n"
+                f" VI_STND_PRC: {prev['vi_stnd_prc']!r} → {current['vi_stnd_prc']!r}\n"
+                f"가격: {data.get('current_price', 0):,}\n\n"
+                f"HTS 에서 실제 상태 확인 (Stage 2 분석용)"
+            )
+
+        self._prev_vi_state[code] = current
 
     def _on_futures_price(self, data: dict) -> None:
         """KOSPI200 선물 실시간 체결가 수신 콜백. Coordinator + RiskManager 로 위임."""
@@ -561,6 +684,35 @@ class AutoTrader:
                     # 매수 체결
                     order = self.trader.on_live_buy_filled(order_id, filled_price, filled_qty, ts)
                     if order is None:
+                        # F2' (W-SAFETY-1): 정책 확정 — 외부 거래 금지.
+                        # unmatched = Timeout 오진 또는 동기 안 맞은 체결 의심.
+                        _active = self._coordinator.active
+                        if _active and _active.code == code:
+                            logger.critical(
+                                f"[F2-Timeout] 자기 종목 매수 체결 매칭 실패 — "
+                                f"Timeout 오진 의심\n"
+                                f"code={code} active={_active.name} "
+                                f"order_id={order_id} "
+                                f"price={filled_price:,} qty={filled_qty}"
+                            )
+                            self.notifier.notify_error(
+                                f"🚨 자기 종목 체결 매칭 실패 (F2-Timeout)\n"
+                                f"종목: {code} ({_active.name})\n"
+                                f"체결: {filled_qty}주 @ {filled_price:,}원\n"
+                                f"order_id={order_id}\n"
+                                f"AUTOTRADE 는 체결 인지 못함 → HTS 즉시 확인 필요"
+                            )
+                        else:
+                            logger.critical(
+                                f"[F2-Unmatched] 매수 체결통보 unmatched, active 불일치\n"
+                                f"code={code} active_code={self._coordinator._active_code} "
+                                f"order_id={order_id} price={filled_price:,} qty={filled_qty}"
+                            )
+                            self.notifier.notify_error(
+                                f"🚨 매수 체결 unmatched (active 불일치)\n"
+                                f"code={code} order_id={order_id}\n"
+                                f"HTS 확인 필요"
+                            )
                         return
                     # Coordinator 에 매수 체결 라우팅 (Watcher.on_buy_filled → ENTERED 전이 + T2 콜백)
                     # Phase 2 B: order 도 전달 (dual-write position.buy_orders list 관리용)
@@ -575,6 +727,36 @@ class AutoTrader:
                     # 매도 체결
                     order = self.trader.on_live_sell_filled(order_id, filled_price, filled_qty, ts)
                     if order is None:
+                        # F2' 매도 (W-SAFETY-1): 매도 체결통보 매칭 실패.
+                        # 특히 위험: 청산 실패로 인식 → T3 연쇄 중단.
+                        _active = self._coordinator.active
+                        if _active and _active.code == code:
+                            logger.critical(
+                                f"[F2-Timeout] 자기 종목 매도 체결 매칭 실패 — "
+                                f"청산 처리 누락 의심\n"
+                                f"code={code} active={_active.name} "
+                                f"order_id={order_id} "
+                                f"price={filled_price:,} qty={filled_qty}"
+                            )
+                            self.notifier.notify_error(
+                                f"🚨 자기 종목 매도 매칭 실패 (F2-Timeout)\n"
+                                f"종목: {code} ({_active.name})\n"
+                                f"체결: {filled_qty}주 @ {filled_price:,}원\n"
+                                f"order_id={order_id}\n"
+                                f"청산 처리 꼬임 가능 → T3 연쇄 중단 위험\n"
+                                f"HTS 즉시 확인 필요"
+                            )
+                        else:
+                            logger.critical(
+                                f"[F2-Unmatched] 매도 체결통보 unmatched, active 불일치\n"
+                                f"code={code} active_code={self._coordinator._active_code} "
+                                f"order_id={order_id} price={filled_price:,} qty={filled_qty}"
+                            )
+                            self.notifier.notify_error(
+                                f"🚨 매도 체결 unmatched (active 불일치)\n"
+                                f"code={code} order_id={order_id}\n"
+                                f"HTS 확인 필요"
+                            )
                         return
                     # Coordinator 에 매도 체결 라우팅 (avg_sell_price 갱신)
                     # Phase 2 B: order 도 전달 (dual-write position.sell_orders list 관리용)

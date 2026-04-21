@@ -177,7 +177,7 @@ class KISAPI:
         self._realtime_callbacks: dict[str, list[Callable]] = {}
         self._subscribed_codes: set[str] = set()
         self._futures_subscribed: bool = False  # 선물 구독 상태
-        self._prog_trade_logged: bool = False
+        # M-DIAG-PROG v2: _prog_trade_logged 플래그 제거 — 매 호출 1줄 요약 + 이상 시 WARNING
         self._ws_connected: bool = False  # WebSocket 연결 상태
         self._ws_last_recv: float = 0.0   # 마지막 수신 시각 (time.time())
         self._on_ws_disconnect: Optional[Callable] = None  # 연결 끊김 콜백
@@ -464,35 +464,86 @@ class KISAPI:
         program-trade-by-stock (FHPPG04650101) 엔드포인트 사용.
         시간대별 누적 프로그램 순매수 데이터를 반환하며,
         최신(마지막) 레코드에 현재까지의 누적값이 들어있다.
+
+        M-LIVE-02-FIX (ISSUE-LIVE-02 근본 원인 해소):
+        - FID_COND_MRKT_DIV_CODE="UN" (통합) = KRX + NXT 합산 반환
+        - NXT 미상장 종목은 UN 조회 시 곧바로 빈 배열 반환 (fallback 없음)
+        - 수정: UN 반환값 빈 배열 시 "J" (KRX 단독) 재조회
+        - NXT 이중상장 종목은 UN 그대로 사용 (기존 정상 동작 유지)
+        - UN + J 모두 빈 배열 = 진짜 이상 (PROG-ANOMALY-EMPTY)
+
+        M-DIAG-PROG v2 (ISSUE-LIVE-02 가설 D 증명 — 사용 상태 유지):
+        - 매 호출 DEBUG 1줄 요약 ([PROG-UN] 또는 [PROG-J-FALLBACK])
+        - 이상 케이스 4가지 중 해당 시 WARNING + 상세 덤프
+          (a) EMPTY: UN + J 모두 빈 배열/None (fallback 후에도 실패)
+          (b) ZERO_ASYM: net_buy==0 이고 buy_amount>0 OR sell_amount>0
+          (c) ALL_ZERO: net/buy/sell 모두 0 이지만 output 존재
+          (d) ORDER: len(output)>1 이고 output[0].bsop_hour < output[-1].bsop_hour
         """
+        # 1차: UN (통합) — 기존 동작
         params = {
             "FID_COND_MRKT_DIV_CODE": "UN",
             "FID_INPUT_ISCD": code,
         }
         data = await self._get(EP_PROGRAM_TRADE_BY_STOCK, TR_PROGRAM_TRADE_BY_STOCK, params)
-
         output = data.get("output", [])
+        source = "UN"
 
-        # 디버그: 실제 응답 구조 로깅 (최초 1회)
-        if not self._prog_trade_logged:
-            self._prog_trade_logged = True
-            logger.debug(f"프로그램매매 응답 키: {list(data.keys())}")
-            if isinstance(output, list) and output:
-                logger.debug(f"프로그램매매 output[0] 키: {list(output[0].keys())}")
-                logger.debug(f"프로그램매매 output[0]: {output[0]}")
-            else:
-                logger.debug(f"프로그램매매 output: {output}")
-            logger.debug(f"프로그램매매 rt_cd={data.get('rt_cd')}, msg1={data.get('msg1')}")
+        # M-LIVE-02-FIX: UN 빈 배열 시 J fallback (NXT 미상장 종목 대응)
+        if not (isinstance(output, list) and output):
+            logger.info(
+                f"[PROG-FALLBACK-J] {code} UN=EMPTY → J(KRX) 재조회 "
+                f"rt_cd={data.get('rt_cd')!r}"
+            )
+            params["FID_COND_MRKT_DIV_CODE"] = "J"
+            data = await self._get(EP_PROGRAM_TRADE_BY_STOCK, TR_PROGRAM_TRADE_BY_STOCK, params)
+            output = data.get("output", [])
+            source = "J-FALLBACK"
 
-        # output이 시간대별 리스트 — 첫 번째가 최신(누적값)
-        if isinstance(output, list) and output:
-            latest = output[0]
-        else:
+        # ── 이상 조건 (a) EMPTY — UN + J 모두 빈 배열 (진짜 이상) ──
+        if not (isinstance(output, list) and output):
+            logger.warning(
+                f"[PROG-ANOMALY-EMPTY] {code} UN+J 모두 empty — 진짜 데이터 없음 "
+                f"rt_cd={data.get('rt_cd')!r} msg={data.get('msg1')!r}"
+            )
             return {"program_net_buy": 0, "buy_amount": 0, "sell_amount": 0}
 
+        latest = output[0]
         net_buy = int(latest.get("whol_smtn_ntby_tr_pbmn", "0"))
         buy_amt = int(latest.get("whol_smtn_shnu_tr_pbmn", "0"))
         sell_amt = int(latest.get("whol_smtn_seln_tr_pbmn", "0"))
+        bsop_hour = latest.get("bsop_hour", "")
+
+        # ── 매 호출 1줄 요약 (DEBUG) — source 태그 추가 ──
+        logger.debug(
+            f"[PROG-{source}] {code} len={len(output)} bsop={bsop_hour} "
+            f"net={net_buy} buy={buy_amt} sell={sell_amt}"
+        )
+
+        # ── 이상 조건 (b) ZERO_ASYM ──────────────────────
+        if net_buy == 0 and (buy_amt > 0 or sell_amt > 0):
+            logger.warning(
+                f"[PROG-ANOMALY-ZERO_ASYM] {code} ({source}) net=0 but buy={buy_amt} sell={sell_amt} "
+                f"bsop={bsop_hour} — 가설D 강력 시그니처. output[0]={latest!r}"
+            )
+
+        # ── 이상 조건 (c) ALL_ZERO ───────────────────────
+        elif net_buy == 0 and buy_amt == 0 and sell_amt == 0:
+            logger.warning(
+                f"[PROG-ANOMALY-ALL_ZERO] {code} ({source}) 전부 0 but output 존재 "
+                f"len={len(output)} bsop={bsop_hour} output[0]={latest!r}"
+            )
+
+        # ── 이상 조건 (d) ORDER ──────────────────────────
+        if len(output) > 1:
+            tail = output[-1]
+            tail_bsop = tail.get("bsop_hour", "")
+            if bsop_hour and tail_bsop and bsop_hour < tail_bsop:
+                logger.warning(
+                    f"[PROG-ANOMALY-ORDER] {code} ({source}) output[0].bsop={bsop_hour} < "
+                    f"output[-1].bsop={tail_bsop} — 배열 순서 가정 붕괴 "
+                    f"len={len(output)}"
+                )
 
         return {
             "program_net_buy": net_buy,
@@ -984,6 +1035,13 @@ class KISAPI:
                                         "change": int(fields[4]),
                                         "change_pct": float(fields[5]),
                                         "volume": int(fields[9]) if len(fields) > 9 else 0,
+                                        # VI-Observer (W-SAFETY-1): H0UNCNT0 공식 문서 46 필드 기준
+                                        # 팩트: 인덱스 확정. 값 해석은 Stage 2 실측 후.
+                                        "new_mkop_cls_code": fields[34] if len(fields) > 34 else "",
+                                        "trht_yn":           fields[35] if len(fields) > 35 else "",
+                                        "hour_cls_code":     fields[43] if len(fields) > 43 else "",
+                                        "mrkt_trtm_cls_code": fields[44] if len(fields) > 44 else "",
+                                        "vi_stnd_prc":       fields[45] if len(fields) > 45 else "",
                                     }
                                     for cb in self._realtime_callbacks.get(WS_TR_PRICE, []):
                                         try:
