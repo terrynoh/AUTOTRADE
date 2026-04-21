@@ -770,17 +770,18 @@ class KISAPI:
         암문으로 취급.
         """
         import base64
-        from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-        from cryptography.hazmat.primitives.padding import PKCS7
+        # ISSUE-LIVE-08 FIX: cryptography → pycryptodome(Crypto) 전환
+        # 운영 환경 cryptography 의존성 충돌 → pycryptodome 으로 교체
+        # AES-256-CBC / PKCS7 복호화 동작 동일
+        # 2026-04-21 운영 직접 수정 → git 동기화
+        from Crypto.Cipher import AES
+        from Crypto.Util.Padding import unpad
 
         ct = base64.b64decode(cipher_b64)
         k = self._execution_aes_key.encode("utf-8")
         i = self._execution_aes_iv.encode("utf-8")
-        cipher = Cipher(algorithms.AES(k), modes.CBC(i))
-        decryptor = cipher.decryptor()
-        padded = decryptor.update(ct) + decryptor.finalize()
-        unpadder = PKCS7(128).unpadder()
-        plain = unpadder.update(padded) + unpadder.finalize()
+        cipher = AES.new(k, AES.MODE_CBC, i)
+        plain = unpad(cipher.decrypt(ct), AES.block_size)
         return plain.decode("utf-8")
 
     def _parse_execution_body(self, plain: str) -> dict:
