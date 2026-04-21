@@ -237,6 +237,38 @@ class AutoTrader:
                 )
                 return
 
+            # ── F1 확장 (ISSUE-LIVE-10): 미체결 매수 고아 주문 감지/회수 ──
+            # 시나리오: 포지션 0 + 미체결 있음 → F1 SA-5e (holdings 기반) 는 못 잡음.
+            # inquire_unfilled_orders (TTTC0084R) 로 감지 → 전량 취소 → critical 알림.
+            try:
+                _unfilled = await self.api.inquire_unfilled_orders()
+                _buy_unfilled = [
+                    u for u in _unfilled
+                    if u.get("sll_buy_dvsn_cd") == "02"
+                    and int(u.get("psbl_qty", "0") or 0) > 0
+                ]
+                if _buy_unfilled:
+                    logger.critical(
+                        f"[F1 확장] 시작 시 미체결 매수 {len(_buy_unfilled)}건 감지 → 전량 취소"
+                    )
+                    _recovered = 0
+                    for u in _buy_unfilled:
+                        try:
+                            await self.api.cancel_order(u["odno"], u["pdno"])
+                            _recovered += 1
+                            logger.warning(
+                                f"[F1 확장] 미체결 고아 취소: "
+                                f"odno={u['odno']} pdno={u['pdno']} psbl_qty={u.get('psbl_qty')}"
+                            )
+                        except Exception as e:
+                            logger.error(f"[F1 확장] 고아 취소 실패 odno={u.get('odno')}: {e}")
+                    if _recovered > 0:
+                        self.notifier.notify_error(
+                            f"🚨 [F1 확장] 시작 시 미체결 매수 {_recovered}건 고아 주문 회수"
+                        )
+            except Exception as e:
+                logger.error(f"[F1 확장] 미체결 조회 실패 (안전망 비활성): {e}")
+
             if _holdings:
                 _holdings_msg = "\n".join(
                     f"  {h.get('code','')} {h.get('name','')} "

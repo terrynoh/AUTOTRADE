@@ -839,13 +839,29 @@ class WatcherCoordinator:
             key=lambda w: abs(w.distance_to_buy1(w.current_price))
         )
 
-        await self._execute_buy(chosen, ts)
-        self._active_code = chosen.code  # 즉시 active 잠금 (체결 대기)
+        # ISSUE-LIVE-09: lock-first (await 전 잠금 → 다음 tick 재진입 차단)
+        self._active_code = chosen.code
+        try:
+            await self._execute_buy(chosen, ts)
+        except Exception as e:
+            logger.error(
+                f"[Coordinator] 매수 발주 실패, active 해제: {chosen.code} {e}"
+            )
+            self._active_code = None
+            raise
 
     # ── 3-4. _execute_buy ────────────────────────────────
 
     async def _execute_buy(self, watcher: Watcher, ts: datetime) -> None:
         """매수 1차 + 2차 발주. Trader 호출."""
+        # ISSUE-LIVE-09: 멱등성 가드 (lock-first 실패 시 defense in depth)
+        if watcher.buy1_pending or watcher.buy1_placed:
+            logger.warning(
+                f"[Coordinator] 중복 _execute_buy 차단: {watcher.name} "
+                f"buy1_pending={watcher.buy1_pending} buy1_placed={watcher.buy1_placed}"
+            )
+            return
+
         watcher.buy1_pending = True
         watcher.buy2_pending = True
 
@@ -993,6 +1009,44 @@ class WatcherCoordinator:
         logger.info(
             f"[Coordinator] 10:55 매수 마감: {cancelled_count}개 watcher SKIPPED"
         )
+
+        # ── ISSUE-LIVE-10: 10:55 일일 safety net ──
+        # 중복발주 루프 등으로 tracked 밖에 고아 미체결이 남을 경우 최후 차단.
+        # tracked-only cancel 은 실시간 타이밍상 유지 (수석님 결정) — 일 1회 inquire 로 커버.
+        if self.trader is not None:
+            try:
+                _unfilled = await self.trader.api.inquire_unfilled_orders()
+                _buy_unfilled = [
+                    u for u in _unfilled
+                    if u.get("sll_buy_dvsn_cd") == "02"
+                    and int(u.get("psbl_qty", "0") or 0) > 0
+                ]
+                if _buy_unfilled:
+                    logger.critical(
+                        f"[Coordinator] 10:55 safety net: 고아 미체결 매수 "
+                        f"{len(_buy_unfilled)}건 감지 → 전량 취소"
+                    )
+                    _recovered = 0
+                    for u in _buy_unfilled:
+                        try:
+                            await self.trader.api.cancel_order(u["odno"], u["pdno"])
+                            _recovered += 1
+                            logger.warning(
+                                f"[Coordinator] safety net 취소: "
+                                f"odno={u['odno']} pdno={u['pdno']} "
+                                f"psbl_qty={u.get('psbl_qty')}"
+                            )
+                        except Exception as e:
+                            logger.error(
+                                f"[Coordinator] safety net 취소 실패 "
+                                f"odno={u.get('odno')}: {e}"
+                            )
+                    if _recovered > 0:
+                        logger.critical(
+                            f"[Coordinator] 10:55 safety net: {_recovered}건 고아 회수 완료"
+                        )
+            except Exception as e:
+                logger.error(f"[Coordinator] 10:55 safety net 실패 (fail-open): {e}")
 
     async def on_force_liquidate(self, ts: datetime) -> None:
         """11:20 강제 청산. ENTERED watcher 시장가 청산.
@@ -1282,8 +1336,17 @@ class WatcherCoordinator:
                         f"[Coordinator] T3: 예약 진입 → {reserved_watcher.name}"
                     )
                     self._reserved_snapshot = None
-                    await self._execute_buy(reserved_watcher, ts)
+                    # ISSUE-LIVE-09: lock-first (await 전 잠금)
                     self._active_code = reserved_watcher.code
+                    try:
+                        await self._execute_buy(reserved_watcher, ts)
+                    except Exception as e:
+                        logger.error(
+                            f"[Coordinator] T3 예약 진입 실패, active 해제: "
+                            f"{reserved_watcher.code} {e}"
+                        )
+                        self._active_code = None
+                        raise
                     return
                 else:
                     # 이론상 도달 불가능 (_verify 가 잡았어야 함). 방어.
@@ -1313,8 +1376,16 @@ class WatcherCoordinator:
             return
 
         logger.info(f"[Coordinator] T3: 재판정 진입 → {chosen.name}")
-        await self._execute_buy(chosen, ts)
+        # ISSUE-LIVE-09: lock-first (await 전 잠금)
         self._active_code = chosen.code
+        try:
+            await self._execute_buy(chosen, ts)
+        except Exception as e:
+            logger.error(
+                f"[Coordinator] T3 재판정 진입 실패, active 해제: {chosen.code} {e}"
+            )
+            self._active_code = None
+            raise
 
     # ── 3-10. shutdown / reset ────────────────────────────
 

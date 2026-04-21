@@ -121,6 +121,7 @@ from src.kis_api.constants import (
     EP_ORDER_CANCEL,
     EP_BALANCE,
     EP_BUY_AVAILABLE,
+    EP_UNFILLED,
     EP_MINUTE_CHART,
     TR_PRICE,
     TR_VOLUME_RANK,
@@ -131,6 +132,7 @@ from src.kis_api.constants import (
     TR_ORDER_CANCEL,
     TR_BALANCE,
     TR_BUY_AVAILABLE,
+    TR_UNFILLED,
     TR_MINUTE_CHART,
     WS_TR_PRICE,
     WS_TR_FUTURES,
@@ -754,6 +756,35 @@ class KISAPI:
             "ruse_psbl_amt": int(output.get("ruse_psbl_amt", "0")),
             "raw": output,
         }
+
+    # ── 미체결 매수 조회 (ISSUE-LIVE-10) ─────────────────
+
+    async def inquire_unfilled_orders(self) -> list[dict]:
+        """미체결 매수 주문 조회 (TTTC0084R / inquire-psbl-rvsecncl).
+
+        매수만 (INQR_DVSN_2='2'). 한 호출 최대 50건 (tr_cont 연속조회 미구현).
+        호출 시점: F1 SA-5e 확장 (부팅 1회) + on_buy_deadline (10:55 1회).
+        평시 cancel 경로에는 사용하지 않음 (타이밍 크리티컬).
+
+        Returns:
+            output list. 주요 keys:
+                odno: 주문번호 (10자리) ← cancel_order 에 전달할 값
+                pdno: 종목번호 (뒤 6자리)
+                psbl_qty: 정정/취소 가능 수량
+                sll_buy_dvsn_cd: '02' (매수)
+                ord_unpr: 주문단가, ord_tmd: 주문시각
+        """
+        tr_id = TR_UNFILLED
+        params = {
+            "CANO": self._cano,
+            "ACNT_PRDT_CD": self._acnt_prdt_cd,
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+            "INQR_DVSN_1": "0",    # 주문 정렬
+            "INQR_DVSN_2": "2",    # 매수만
+        }
+        data = await self._get(EP_UNFILLED, tr_id, params)
+        return data.get("output", []) or []
 
     # ── 체결통보 (H0STCNI0) ── R15-005 ──────────────────
 

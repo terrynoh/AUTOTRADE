@@ -59,6 +59,20 @@ class Trader:
         buy1_qty = max(1, buy1_amount // buy1_price) if buy1_price > 0 else 0
         buy2_qty = max(1, buy2_amount // buy2_price) if buy2_price > 0 else 0
 
+        # ISSUE-LIVE-09/10: 재진입 차단 (active pending 존재 시 거부)
+        # Coordinator lock-first / _execute_buy 멱등성 가드에 이은 최후 방어선.
+        # 진행 중인 주문이 있는데 pending_buy_orders 를 덮어쓰면 cancel 대상을
+        # 추적할 수 없게 되므로 (ISSUE-LIVE-10 뿌리), 애초에 덮어쓰기 전 거부.
+        active_pending = [o for o in self.pending_buy_orders if o.is_active]
+        if active_pending:
+            logger.error(
+                f"[Trader] CRITICAL: place_buy_orders 재진입 차단 — "
+                f"active pending {len(active_pending)}건 존재: "
+                f"{[o.order_id for o in active_pending]}. "
+                f"종목: {watcher.code} ({watcher.name})"
+            )
+            return
+
         now = now_kst()
         self.pending_buy_orders = []
 

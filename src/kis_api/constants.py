@@ -54,6 +54,7 @@ TR_ORDER_CANCEL = "TTTC0803U"           # 주문취소
 
 TR_BALANCE = "TTTC8434R"                # 주식잔고조회
 TR_BUY_AVAILABLE = "TTTC8908R"          # 매수가능조회 (R15-007)
+TR_UNFILLED = "TTTC0084R"               # 주식정정취소가능주문조회 (ISSUE-LIVE-10, 구 TTTC8036R)
 
 # ── WebSocket TR ID ────────────────────────────────────────────
 WS_TR_PRICE = "H0UNCNT0"                # 실시간 체결가 (통합 KRX+NXT)
