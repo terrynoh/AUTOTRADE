@@ -2,7 +2,7 @@
 
 > **목적**: 신규 Claude 세션이 AUTOTRADE 프로젝트의 정체성, 매매 철학, 아키텍처, 협업 규칙을 즉시 파악할 수 있는 self-contained 명세서.
 >
-> **버전**: vLive 2.3 (2026-04-21 W-LIVE-09/10 배포 완료)
+> **버전**: vLive 2.4 (2026-04-22 §3.1 라인 동기화 + W-N-GHOST-01 + M-N-GAP-A 진단)
 > **현재 단계**: R16 Phase 1 + Phase 2 B + W-SAFETY-1 + M-LIVE-02-FIX + M-LIVE-08-FIX + W-LIVE-09/10 완료 → Day 4 (2026-04-22 예정) 체결통보 + race fix + orphan safety net 실전 검증
 
 ---
@@ -286,9 +286,9 @@ AutoTrader().run()
 ```
 
 **핵심 메서드 파일:라인**:
-- `main.py::main() L1007` → `AutoTrader.run() L151`
-- `main.py::_start_dashboard_server() L914`
-- `kis.py::get_buy_available() L672`
+- `main.py::main() L1261` → `AutoTrader.run() L163`
+- `main.py::_start_dashboard_server() L1183`
+- `kis.py::get_buy_available() L725`
 
 ### B. 09:50 스크리닝 → Watcher 생성
 
@@ -306,8 +306,8 @@ _on_screening(is_final=True)
 ```
 
 **핵심 메서드**:
-- `main.py::_schedule_screening() L296`, `_on_screening() L310`
-- `watcher.py::WatcherCoordinator.start_screening() L688`
+- `main.py::_schedule_screening() L374`, `_on_screening() L388`
+- `watcher.py::WatcherCoordinator.start_screening() L719`
 - `screener.py::Screener.run_manual()`
 
 ### C. 실시간 가격 라우팅 → state 전이
@@ -336,9 +336,9 @@ coordinator._process_signals(ts)
 ```
 
 **핵심 메서드**:
-- `main.py::_on_realtime_price() L405`
-- `watcher.py::Watcher.on_tick() L281`, `_handle_watching() L302`, `_handle_triggered() L369`, `_handle_entered() L438`
-- `watcher.py::WatcherCoordinator._process_signals() L786`
+- `main.py::_on_realtime_price() L507`
+- `watcher.py::Watcher.on_tick() L282`, `_handle_watching() L317`, `_handle_triggered() L384`, `_handle_entered() L453`
+- `watcher.py::WatcherCoordinator._process_signals() L825`
 
 ### D. 매수 발주 → 체결통보
 
@@ -365,9 +365,9 @@ KIS WebSocket → _on_execution_notify(parsed) → _process_execution_notify()
 ```
 
 **핵심 메서드**:
-- `main.py::_process_execution_notify() L479`, `_check_position_invariant() L442`
-- `trader.py::place_buy_orders() L36`, `on_live_buy_filled() L355`
-- `watcher.py::Watcher.on_buy_filled() L519`, `WatcherCoordinator.on_buy_filled() L913`
+- `main.py::_process_execution_notify() L642`, `_check_position_invariant() L605`
+- `trader.py::place_buy_orders() L36`, `on_live_buy_filled() L369`
+- `watcher.py::Watcher.on_buy_filled() L549`, `WatcherCoordinator.on_buy_filled() L968`
 
 ### E. 청산 → 매도 체결 → _on_exit_done
 
@@ -403,9 +403,9 @@ _on_exit_done(watcher) [main.py]  ← 최종 체인
 ```
 
 **핵심 메서드**:
-- `main.py::_on_exit_done() L684`
-- `watcher.py::WatcherCoordinator._execute_exit() L862`, `on_sell_complete() L893`
-- `trader.py::execute_exit() L239`, `on_live_sell_filled() L411`, `reset() L496`
+- `main.py::_on_exit_done() L906`
+- `watcher.py::WatcherCoordinator._execute_exit() L917`, `on_sell_complete() L948`
+- `trader.py::execute_exit() L253`, `on_live_sell_filled() L425`, `reset() L510`
 
 ### F. T1/T2/T3 연쇄 매매
 
@@ -435,8 +435,8 @@ T3: 첫 종목 EXITED 확정 → _on_exit_done() → handle_t3(ts)
 ```
 
 **핵심 메서드**:
-- `watcher.py::_on_t2() L1031`, `_try_reserve_at_t2() L1083`, `_tiebreaker_for_next() L1119`
-- `watcher.py::_verify_reservation_at_t3() L1163`, `handle_t3() L1246`
+- `watcher.py::_on_t2() L1124`, `_try_reserve_at_t2() L1176`, `_tiebreaker_for_next() L1212`
+- `watcher.py::_verify_reservation_at_t3() L1256`, `handle_t3() L1339`
 
 ### G. R-13 실시간 비중 업데이트
 
@@ -456,9 +456,9 @@ _ratio_updater() [1초 간격 loop]
 ```
 
 **핵심 메서드**:
-- `main.py::_ratio_updater() L769`
-- `watcher.py::Watcher._recalc_prices() L246`
-- `trader.py::cancel_and_reorder_buy2() L149`
+- `main.py::_ratio_updater() L991`
+- `watcher.py::Watcher._recalc_prices() L247`
+- `trader.py::cancel_and_reorder_buy2() L163`
 
 ### H. 시각 기반 이벤트
 
@@ -496,7 +496,8 @@ _on_ws_disconnect() [main.py] — 동기
 ```
 
 **핵심 메서드**:
-- `main.py::_on_ws_disconnect() L620`, `_emergency_cancel_orders() L641`, `_network_health_check() L874`
+- `main.py::_on_ws_disconnect() L842`, `_emergency_cancel_orders() L863`, `_network_health_check() L1143`
+- `kis.py::inquire_unfilled_orders() L762` (LIVE-10, F1 SA-5e 확장 + 10:55 safety net 에서 호출, `INQR_DVSN_2="2"` 매수만 조회)
 
 ---
 
@@ -868,6 +869,44 @@ sudo systemctl restart autotrade
 
 **근본 원인 완전 규명 미완료**: 재현 실패로 cryptography 의 어느 내부 경로가 실패했는지 불명. 환경 이전(Oracle Cloud → GCP Seoul) 시 wheel ABI 미스매치 추정. 향후 cryptography 의존성 제거 (requirements.txt cleanup) 추진.
 
+### GAP-A 매도 체결 WS notification 유실 공백 (🔴 발견, M-N-GAP-A 2026-04-22)
+
+**상태**: 미해결, 미구현. 의미론적 트레이스로 갭 확정.
+
+**의미론적 체인 (유실 시나리오)**:
+1. `_execute_exit` (watcher.py L917) → `_exit_signal_pending=False` + Watcher `state=EXITED` + `trader.execute_exit` REST 매도 발주 성공
+2. KIS 측 체결 완료 — 그러나 WS 유실로 execution notification 미수신
+3. `trader.on_live_sell_filled` / `WatcherCoordinator.on_sell_filled` / `on_sell_complete` / `_on_exit_done` 체인 **전원 미발화**
+4. `trader.position.is_open=True` 잔존, `_active_code` 미리셋
+
+**방어 사각지대 전수 확인**:
+| 방어선 | 커버 범위 | 유실 커버 |
+|------|----------|---------|
+| F2-Timeout (main.py L766-798) | notification 도착 + `order_id` unmatched | ✗ 유실은 도달 자체 실패 |
+| `_emergency_cancel_orders` (main.py L863) | 미체결 매수 REST 취소 | ✗ 매도 대상 아님 |
+| F1 SA-5e + 10:55 safety net | 매수 unfilled (`INQR_DVSN_2="2"`) | ✗ 매도 미쿼리 |
+| `on_force_liquidate` (watcher.py L1090) | `state == ENTERED` 만 iterate | ✗ EXITED skip (L1097) |
+| `_check_position_invariant` (main.py L605) | notification 트리거 | ✗ 트리거 없음 |
+
+**영향**:
+- T3 연쇄 중단 (다음 매매 봉쇄)
+- `_trade_logger.record_trade` 미호출 → DB/Summary 누락
+- 11:20 `on_force_liquidate` 복구 경로 없음 (EXITED skip)
+- 운영자 인지 실패 가능 (critical 알림 미발화)
+
+**Mitigation 후보** (구현은 별도 W-N, 우선순위 검토 필요):
+1. 주기적 `api.inquire_balance` 호출 → position reconciliation
+2. `trader.execute_exit` 발주 후 N초 timeout → `api.inquire_ccld` 조회 → 체결 확인 → 누락 시 강제 on_sell_complete
+3. `on_force_liquidate` 를 "position 잔존" 기준으로 확장 (`trader.position.is_open == True` 도 포함 → EXITED dead lock 강제 recovery)
+
+### W-N-GHOST-01 완료 기록 (2026-04-22)
+
+**수정**: src/main.py L76 + L434 `self._subscribed_codes` 고스트 변수 2곳 제거.
+
+**근거**: main.py 내 소비처 0건 (Read 경로 없음). 실제 WS 재구독은 `kis.py::_subscribed_codes` (set, L180/L885-887/L899/L924/L1130) 별개 소유.
+
+**검증**: grep 재확인 → main.py 참조 0 (백업 `.pre-staleness*` + 역사 문서 `docs/W-06*` 만 잔존, 정상). `python -m py_compile src/main.py` OK. `AutoTrader` import OK.
+
 ### 환경 백로그
 
 | # | 항목 | 우선순위 |
@@ -901,7 +940,7 @@ sudo systemctl restart autotrade
 
 ---
 
-**문서 끝 (vLive 2.3, 2026-04-21 W-LIVE-09/10 배포 완료)**
+**문서 끝 (vLive 2.4, 2026-04-22 §3.1 라인 동기화 + W-N-GHOST-01 + M-N-GAP-A 진단)**
 
 **변경 이력**:
 - v4.1 (2026-04-16): R-14 DRY_RUN 시뮬레이션 모듈 문서화
@@ -921,3 +960,8 @@ sudo systemctl restart autotrade
   - §8 ISSUE-LIVE-09 를 "해결 완료" 로 전환 — 원인 확정 (c) asyncio tick race, 해결 3중 방어 (Coordinator lock-first + `_execute_buy` idempotency + Trader 재진입 차단), Day 4 검증 포인트 기술.
   - §8 ISSUE-LIVE-10 을 "해결 완료" 로 전환 — cancel_buy_orders tracked-only 유지 결정 + 시각 기반 독립 safety net (F1 SA-5e 확장 부팅 1회 + on_buy_deadline 10:55 1회 inquire_unfilled_orders).
   - 헤더 현재 단계 라인 갱신 (Day 4 체결통보 + race fix + orphan safety net 실전 검증 예정).
+- **vLive 2.4 (2026-04-22)**: §3.1 라인 드리프트 동기화 + W-N-GHOST-01 + M-N-GAP-A 진단.
+  - §3.1 A-I 전 메서드 라인 번호 13개 실제 소스 기준 재확정 (W-LIVE-09/10 + STALENESS-01b 누적 패치로 +14~+269 드리프트 존재).
+  - §3.1 I 네트워크 방어에 `kis.py::inquire_unfilled_orders() L762` (LIVE-10) 문서화 추가.
+  - §8 **GAP-A 매도 체결 WS notification 유실 공백** 신규 백로그 — 의미론적 트레이스 사실 기반 (방어 사각지대 5개 전수 확인, Mitigation 후보 3 기록, 구현은 별도 W-N 대기).
+  - §8 **W-N-GHOST-01 완료 기록** — `main.py._subscribed_codes` 고스트 변수 제거 (L76 Init + L434 Set 소비처 0 확인 후 삭제, grep + py_compile + import 검증).

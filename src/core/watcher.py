@@ -139,6 +139,7 @@ class Watcher:
 
     # === 선물 가격 (외부 주입) ===
     futures_price: float = 0.0
+    futures_price_ts: Optional[datetime] = None  # STALENESS-01: 선물 WS 수신 ts (주가 ts 아님)
 
     # === 매수 발주 / 체결 추적 ===
     buy1_pending: bool = False
@@ -278,13 +279,27 @@ class Watcher:
 
     # (5-3) on_tick
 
-    def on_tick(self, price: int, ts: datetime, futures_price: float) -> None:
-        """실시간 체결가 수신 시 호출. state 별 분기."""
+    def on_tick(
+        self,
+        price: int,
+        ts: datetime,
+        futures_price: float,
+        futures_ts: Optional[datetime] = None,
+    ) -> None:
+        """실시간 체결가 수신 시 호출. state 별 분기.
+
+        Args:
+            price: 주가 체결가
+            ts: 주가 수신 ts (stock_ts) — _handle_* 로 전달
+            futures_price: 최근 선물가 (Coordinator._latest_futures_price)
+            futures_ts: 선물 WS 수신 ts (Coordinator._latest_futures_ts) — staleness 감지용
+        """
         if self.is_terminal:
             return
 
         self.current_price = price
         self.futures_price = futures_price
+        self.futures_price_ts = futures_ts  # STALENESS-01: 선물 ts 저장 (주가 ts 아님!)
 
         if self.state == WatcherState.WATCHING:
             self._handle_watching(price, ts)
@@ -463,7 +478,7 @@ class Watcher:
             return
 
         # ④ 선물 급락
-        if self._check_futures_drop():
+        if self._check_futures_drop(ts):
             self._emit_exit("futures_stop", 0, ts)
             logger.warning(
                 f"[{self.name}] 선물 급락: "
@@ -489,9 +504,24 @@ class Watcher:
 
     # (5-11) _check_futures_drop
 
-    def _check_futures_drop(self) -> bool:
-        """종목 고점 시각의 선물가 대비 N% 하락."""
+    def _check_futures_drop(self, ts: datetime) -> bool:
+        """종목 고점 시각의 선물가 대비 N% 하락.
+
+        Args:
+            ts: 주가 수신 ts (stock_ts) — 매 tick 평가 기준 시각.
+
+        STALENESS-01: 선물 ts 기준 30초 이상 stale 시 skip (fail-open).
+            비교식: age = stock_ts − self.futures_price_ts
+            매매원칙: 매 tick 평가 → 평가 기준 시각 = stock_ts.
+            경고 알림은 main._futures_staleness_monitor 가 담당.
+        """
         if self.futures_at_confirmed_high <= 0 or self.futures_price <= 0:
+            return False
+        # staleness guard (STALENESS-01)
+        if self.futures_price_ts is None:
+            return False
+        age_sec = (ts - self.futures_price_ts).total_seconds()
+        if age_sec > 30:
             return False
         drop_pct = (self.futures_at_confirmed_high - self.futures_price) / self.futures_at_confirmed_high * 100
         return drop_pct >= self.params.exit.futures_drop_pct
@@ -633,6 +663,7 @@ class WatcherCoordinator:
         self.watchers: list[Watcher] = []
         self._active_code: Optional[str] = None
         self._latest_futures_price: float = 0.0
+        self._latest_futures_ts: Optional[datetime] = None  # STALENESS-01: 선물 WS 수신 ts
         self._available_cash: int = 0  # main.py 에서 주입
         self._exit_callback = None  # 청산 후 콜백 (main.py 에서 주입)
         self._risk_manager = None  # R-14 버그픽스: 리스크 매니저 (main.py에서 주입)
@@ -772,14 +803,22 @@ class WatcherCoordinator:
         """
         for w in self.watchers:
             if w.code == code and not w.is_terminal:
-                w.on_tick(price, ts, self._latest_futures_price)
+                w.on_tick(price, ts, self._latest_futures_price, self._latest_futures_ts)
 
         # 매 틱 후 신호 폴링 + 매수 발주 평가
         await self._process_signals(ts)
 
-    def on_realtime_futures(self, futures_price: float) -> None:
-        """선물 가격 갱신. 다음 on_tick 에서 사용."""
+    def on_realtime_futures(self, futures_price: float, ts: datetime) -> None:
+        """선물 가격 갱신. 다음 on_tick 에서 사용.
+
+        Args:
+            futures_price: 선물 체결가
+            ts: 선물 WS 수신 ts (main._on_futures_price 에서 now_kst()) — STALENESS-01
+
+        staleness 감지는 Watcher._check_futures_drop + main._futures_staleness_monitor.
+        """
         self._latest_futures_price = futures_price
+        self._latest_futures_ts = ts
 
     # ── 3-3. _process_signals ────────────────────────────
 

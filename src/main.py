@@ -73,7 +73,6 @@ class AutoTrader:
             params=self.params,
             trader=self.trader,
         )
-        self._subscribed_codes: list[str] = []  # 현재 WebSocket 구독 중인 종목코드들
         self._realtime_callback_registered: bool = False  # 실시간 콜백 등록 여부
 
         # ── 수동 종목 입력 ──
@@ -88,6 +87,9 @@ class AutoTrader:
         # ── 기타 ──
         self._futures_price: float = 0.0
         self._running: bool = False
+        # STALENESS-01: 선물가 staleness 추적
+        self._futures_last_update_ts: Optional[datetime] = None
+        self._futures_stale_alerted: bool = False
         self._network_ok: bool = True       # 네트워크 정상 여부
         self._emergency_cancel_done: bool = False  # 긴급 취소 실행 여부 (중복 방지)
         self.on_state_update = None  # 대시보드 동기화 콜백 (run.py에서 설정)
@@ -330,6 +332,7 @@ class AutoTrader:
                 asyncio.create_task(self._schedule_market_close(), name="market_close"),
                 asyncio.create_task(self._network_health_check(), name="health_check"),
                 asyncio.create_task(self._ratio_updater(), name="ratio_updater"),  # R-13
+                asyncio.create_task(self._futures_staleness_monitor(), name="futures_staleness"),  # STALENESS-01
             ]
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
 
@@ -427,7 +430,6 @@ class AutoTrader:
         if codes:
             try:
                 await self.api.subscribe_realtime(codes)
-                self._subscribed_codes = codes
                 logger.info(f"실시간 감시 시작: {len(codes)}종목 {codes}")
             except Exception as e:
                 logger.error(f"실시간 구독 실패: {e}")
@@ -573,6 +575,10 @@ class AutoTrader:
             return
         self._futures_price = price
 
+        # STALENESS-01: 선물 WS 수신 ts 기록 (staleness 감지 기준)
+        f_ts = now_kst()
+        self._futures_last_update_ts = f_ts
+
         # R-12: RiskManager 에 선물 가격 전달 (지수 급락 체크)
         halted = self.risk.update_futures_price(price)
         if halted and not getattr(self, '_index_halt_notified', False):
@@ -581,8 +587,8 @@ class AutoTrader:
                 f"🚨 지수 급락 → 매매 중단\n{self.risk.halt_reason}"
             )
 
-        # Coordinator 에 선물 가격 전달
-        self._coordinator.on_realtime_futures(price)
+        # Coordinator 에 선물 가격 + ts 전달 (STALENESS-01)
+        self._coordinator.on_realtime_futures(price, f_ts)
 
     # ── R15-005: 체결통보 (H0STCNI0) 콜백 ────────────────
 
@@ -1084,6 +1090,53 @@ class AutoTrader:
             except Exception as e:
                 logger.error(f"_ratio_updater 에러: {e}")
                 await asyncio.sleep(5)  # 에러 시 5초 대기 후 재시도
+
+    async def _futures_staleness_monitor(self) -> None:
+        """STALENESS-01: 선물가 30초 이상 무수신 시 Telegram 경고 (최초 1회) + 회복 시 1회.
+
+        - 10초 간격 폴링
+        - 30초 초과 = stale → 최초 감지 1회 알림
+        - 회복 시 1회 알림
+
+        Watcher._check_futures_drop 의 staleness guard 와 독립 작동:
+        - Watcher 쪽은 청산 평가 시점에 skip (fail-open) 결정
+        - 이 모니터는 운영자 알림 채널 (수석님이 수동 판단 개입 가능하게)
+        """
+        interval = 10.0
+        threshold = 30.0
+        while self._running:
+            try:
+                await asyncio.sleep(interval)
+                if self._futures_last_update_ts is None:
+                    continue
+                age_sec = (now_kst() - self._futures_last_update_ts).total_seconds()
+                if age_sec > threshold:
+                    if not self._futures_stale_alerted:
+                        self._futures_stale_alerted = True
+                        logger.warning(
+                            f"선물가 staleness 감지: {age_sec:.0f}초 무수신 → 청산 조건 ④ skip"
+                        )
+                        try:
+                            self.notifier.notify_error(
+                                f"⚠️ 선물가 {age_sec:.0f}초 무수신\n"
+                                f"청산 조건 ④ 일시 skip (fail-open)"
+                            )
+                        except Exception as e:
+                            logger.error(f"staleness 알림 실패: {e}")
+                else:
+                    if self._futures_stale_alerted:
+                        self._futures_stale_alerted = False
+                        logger.info(f"선물가 staleness 회복 (age={age_sec:.0f}초)")
+                        try:
+                            self.notifier.notify_system("✅ 선물가 수신 회복")
+                        except Exception as e:
+                            logger.error(f"staleness 회복 알림 실패: {e}")
+            except asyncio.CancelledError:
+                logger.info("_futures_staleness_monitor 종료")
+                break
+            except Exception as e:
+                logger.error(f"_futures_staleness_monitor 에러: {e}")
+                await asyncio.sleep(5)
 
     async def _network_health_check(self) -> None:
         """
