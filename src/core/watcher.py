@@ -120,8 +120,8 @@ class Watcher:
     # === 시세 ===
     current_price: int = 0
 
-    # === 09:00~09:49 사전 고가 추적 ===
-    pre_950_high: int = 0
+    # === 09:00~09:54 사전 고가 추적 ===
+    pre_955_high: int = 0
 
     # === 신고가 추적 ===
     intraday_high: int = 0
@@ -301,6 +301,25 @@ class Watcher:
         self.futures_price = futures_price
         self.futures_price_ts = futures_ts  # STALENESS-01: 선물 ts 저장 (주가 ts 아님!)
 
+        # ── W-31 로깅 (임시, 검증 종료 후 제거) ──
+        try:
+            from src.utils.ws_runtime_logger import log_event, get_listing_scope
+            log_event({
+                "layer": "watcher_tick",
+                "code": self.code,
+                "name": self.name,
+                "market_type": self.market.value,
+                "listing_scope": get_listing_scope(self.code),
+                "prpr": price,
+                "watcher_state": self.state.value,
+                "intraday_high": self.intraday_high,
+                "pre_955_high": self.pre_955_high,
+                "confirmed_high": self.confirmed_high if self.confirmed_high else None,
+            })
+        except Exception:
+            pass
+        # ── W-31 끝 ──
+
         if self.state == WatcherState.WATCHING:
             self._handle_watching(price, ts)
         elif self.state == WatcherState.TRIGGERED:
@@ -317,13 +336,13 @@ class Watcher:
     def _handle_watching(self, price: int, ts: datetime) -> None:
         """WATCHING 상태 처리.
 
-        09:50 이전: 사전 고가 추적 (pre_950_high)
-        09:50 이후: 신고가 달성 평가 + 1% 하락 트리거 평가
+        09:55 이전: 사전 고가 추적 (pre_955_high)
+        09:55 이후: 신고가 달성 평가 + 1% 하락 트리거 평가
         """
-        # === A. 09:50 이전: 사전 고가 추적만 ===
+        # === A. 09:55 이전: 사전 고가 추적만 ===
         if ts.time() < self._watch_start:
-            if price > self.pre_950_high:
-                self.pre_950_high = price
+            if price > self.pre_955_high:
+                self.pre_955_high = price
                 self.intraday_high = price
                 self.intraday_high_time = ts
             return
@@ -336,13 +355,13 @@ class Watcher:
             )
             return
 
-        # === C. 09:50 이후: 신고가 달성 평가 ===
+        # === C. 09:55 이후: 신고가 달성 평가 ===
         if not self.new_high_achieved:
-            if price > self.pre_950_high:
+            if price > self.pre_955_high:
                 self.update_intraday_high(price, ts)
                 self.new_high_achieved = True
                 logger.info(
-                    f"[{self.name}] 09:50 이후 신고가 달성: {price:,}원"
+                    f"[{self.name}] 09:55 이후 신고가 달성: {price:,}원"
                 )
             elif price > self.intraday_high:
                 self.update_intraday_high(price, ts)
@@ -695,10 +714,9 @@ class WatcherCoordinator:
         self._exit_callback = callback
 
     def set_risk_manager(self, risk_manager) -> None:
-        """R-14 버그픽스: 리스크 매니저 주입. main.py 가 호출.
-        
-        _process_signals에서 trading_halted 상태를 체크하여
-        지수 급락(-1.5%) 또는 손절 2회 후 신규 매수 차단.
+        """R-12 재설계: 리스크 매니저 주입. main.py 가 호출.
+
+        trading_halted (2회 halt 또는 daily_loss) + strict_mode (1회 strict) 2중 체크.
         """
         self._risk_manager = risk_manager
 
@@ -760,10 +778,10 @@ class WatcherCoordinator:
                 is_double_digit=is_double,  # R-11
                 program_ratio=ratio,        # R-13
             )
-            # R-09b: API 조회한 당일 고가 사용 (pre_950_high 정확도 향상)
+            # R-09b: API 조회한 당일 고가 사용 (pre_955_high 정확도 향상)
             actual_high = getattr(cand, 'intraday_high', cand.current_price) or cand.current_price
             w.intraday_high = actual_high
-            w.pre_950_high = actual_high  # 09:00~09:49 실제 고가 반영
+            w.pre_955_high = actual_high  # 09:00~09:54 실제 고가 반영
             w.current_price = cand.current_price
 
             # W-11d: T2 이벤트 콜백 주입
@@ -801,6 +819,21 @@ class WatcherCoordinator:
         모든 watcher 에 라우팅 (terminal 제외). _active_monitor 단독 폴링 X.
         ISSUE-036 의 결함 (single watcher 폴링) 을 해소.
         """
+        # ── W-31 로깅 (임시, 검증 종료 후 제거) ──
+        try:
+            from src.utils.ws_runtime_logger import log_event, get_listing_scope
+            _routed = sum(1 for w in self.watchers if w.code == code and not w.is_terminal)
+            log_event({
+                "layer": "coord_route",
+                "code": code,
+                "prpr": price,
+                "routed_watcher_count": _routed,
+                "listing_scope": get_listing_scope(code),
+            })
+        except Exception:
+            pass
+        # ── W-31 끝 ──
+
         for w in self.watchers:
             if w.code == code and not w.is_terminal:
                 w.on_tick(price, ts, self._latest_futures_price, self._latest_futures_ts)
@@ -857,7 +890,7 @@ class WatcherCoordinator:
         if self._active_code is not None:
             return  # active 잠금 (체결 대기 또는 청산 대기)
 
-        # R-14 버그픽스: 리스크 체크 (지수 급락 -1.5% 또는 손절 2회)
+        # R-12 재설계: 리스크 체크 (trading_halted — 2회 halt 또는 daily_loss)
         if self._risk_manager is not None and self._risk_manager.trading_halted:
             return
 
@@ -871,6 +904,17 @@ class WatcherCoordinator:
         yes_watchers = [w for w in self.watchers if w.is_yes and not w.is_terminal]
         if not yes_watchers:
             return
+
+        # R-12 재설계: strict 모드 필터 (하드손절 1회 후 KOSPI 비중 ≥18% 만)
+        if self._risk_manager is not None and self._risk_manager.strict_mode:
+            th = self._risk_manager.params.risk.strict_mode_program_ratio_threshold
+            wl = self._risk_manager.params.risk.strict_mode_market_whitelist
+            yes_watchers = [
+                w for w in yes_watchers
+                if w.market.value in wl and w.program_ratio >= th
+            ]
+            if not yes_watchers:
+                return
 
         # tie-breaker: 1차 매수가에 가장 가까운 종목
         chosen = min(
@@ -1226,6 +1270,17 @@ class WatcherCoordinator:
             tiebreaker 통과 + 눌림폭 최대 Watcher
             None: 필터 통과 종목 0개
         """
+        # R-12 재설계: strict 모드 필터 (하드손절 1회 후 KOSPI 비중 ≥18% 만)
+        if self._risk_manager is not None and self._risk_manager.strict_mode:
+            th = self._risk_manager.params.risk.strict_mode_program_ratio_threshold
+            wl = self._risk_manager.params.risk.strict_mode_market_whitelist
+            candidates = [
+                w for w in candidates
+                if w.market.value in wl and w.program_ratio >= th
+            ]
+            if not candidates:
+                return None
+
         kospi_threshold = self.params.multi_trade.kospi_next_entry_max_pct / 100.0
         kosdaq_threshold = self.params.multi_trade.kosdaq_next_entry_max_pct / 100.0
 
@@ -1329,6 +1384,17 @@ class WatcherCoordinator:
                 f"({current_pullback:.2%} < {threshold:.2%})"
             )
             return False
+
+        # ⑥ R-12 재설계: strict 모드 시 KOSPI AND ratio≥18 재확인
+        if self._risk_manager is not None and self._risk_manager.strict_mode:
+            th = self._risk_manager.params.risk.strict_mode_program_ratio_threshold
+            wl = self._risk_manager.params.risk.strict_mode_market_whitelist
+            if reserved_watcher.market.value not in wl or reserved_watcher.program_ratio < th:
+                logger.warning(
+                    f"[Coordinator] T3 재확인 실패 (⑥ strict): "
+                    f"market={reserved_watcher.market.value}, ratio={reserved_watcher.program_ratio:.1f}"
+                )
+                return False
 
         logger.info(
             f"[Coordinator] T3 재확인 통과: {snapshot.name} "

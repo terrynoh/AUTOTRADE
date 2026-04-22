@@ -211,7 +211,7 @@ class AutoTrader:
             # Coordinator 청산 콜백 등록 (W-06b1)
             self._coordinator.set_exit_callback(self._on_exit_done)
 
-            # R-14 버그픽스: 리스크 매니저 주입 (지수 급락/-1.5% 또는 손절 2회 시 매수 차단)
+            # R-12 재설계: 리스크 매니저 주입 (하드손절 1회=strict / 2회=halt)
             self._coordinator.set_risk_manager(self.risk)
 
             # WebSocket 끊김 콜백 등록 (1차 방어: 즉시 미체결 매수 취소)
@@ -333,6 +333,7 @@ class AutoTrader:
                 asyncio.create_task(self._network_health_check(), name="health_check"),
                 asyncio.create_task(self._ratio_updater(), name="ratio_updater"),  # R-13
                 asyncio.create_task(self._futures_staleness_monitor(), name="futures_staleness"),  # STALENESS-01
+                asyncio.create_task(self._ws_runtime_rest_polling(), name="ws_runtime"),  # W-31 임시
             ]
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
 
@@ -591,14 +592,6 @@ class AutoTrader:
         # STALENESS-01: 선물 WS 수신 ts 기록 (staleness 감지 기준)
         f_ts = now_kst()
         self._futures_last_update_ts = f_ts
-
-        # R-12: RiskManager 에 선물 가격 전달 (지수 급락 체크)
-        halted = self.risk.update_futures_price(price)
-        if halted and not getattr(self, '_index_halt_notified', False):
-            self._index_halt_notified = True
-            self.notifier.notify_error(
-                f"🚨 지수 급락 → 매매 중단\n{self.risk.halt_reason}"
-            )
 
         # Coordinator 에 선물 가격 + ts 전달 (STALENESS-01)
         self._coordinator.on_realtime_futures(price, f_ts)
@@ -932,12 +925,18 @@ class AutoTrader:
         pnl = self.trader.get_pnl(watcher.current_price)
         self.risk.record_trade_result(pnl)
 
-        # 2. R-12: 손절 횟수 기록 (hard_stop인 경우)
+        # 2. R-12 재설계: 하드손절 처리 (1회=strict, 2회=halt)
         if watcher.exit_reason == "hard_stop":
-            halted = self.risk.record_hard_stop()
-            if halted:
+            result = self.risk.record_hard_stop()
+            if result["halted"]:
                 self.notifier.notify_error(
-                    f"🚨 손절 {self.risk._hard_stop_count}회 → 매매 중단\n{self.risk.halt_reason}"
+                    f"🚨 하드손절 {self.risk._hard_stop_count}회 → 당일 매매 중단\n"
+                    f"{self.risk.halt_reason}"
+                )
+            elif result["entered_strict"]:
+                self.notifier.notify_error(
+                    f"⚠️ 하드손절 청산 → 당일 strict 모드 진입\n"
+                    f"KOSPI 비중 ≥{self.params.risk.strict_mode_program_ratio_threshold}% 종목만 매수 허용"
                 )
 
         # 3. TradeLogger로 거래 기록 + 로그 출력 + 텔레그램 알림 (R-10 새 로그 시스템)
@@ -1150,6 +1149,75 @@ class AutoTrader:
             except Exception as e:
                 logger.error(f"_futures_staleness_monitor 에러: {e}")
                 await asyncio.sleep(5)
+
+    async def _ws_runtime_rest_polling(self) -> None:
+        """
+        W-31 WebSocket 런타임 로깅 검증 (임시, 검증 종료 후 메서드 제거).
+
+        1. observe_codes 격리 WebSocket 구독 (매매 대상 아님, 관측 전용)
+        2. N초 간격 REST get_current_price 폴링 → WS tick 과 교차 검증
+
+        Obsidian/W-31_WebSocket_런타임로깅_검증.md §4.4/§4.5 참조.
+        """
+        ws_params = self.params.ws_runtime
+        if not ws_params.enabled or not ws_params.observe_codes:
+            logger.info("[W-31] ws_runtime 비활성 or observe_codes 없음 — 건너뜀")
+            return
+
+        try:
+            from src.utils.ws_runtime_logger import log_event, get_listing_scope
+        except Exception as e:
+            logger.error(f"[W-31] ws_runtime_logger import 실패: {e}")
+            return
+
+        # (1) 격리 WebSocket 구독
+        try:
+            await self.api.subscribe_realtime(ws_params.observe_codes)
+            logger.info(
+                f"[W-31] 관측 전용 구독 {len(ws_params.observe_codes)}종목: "
+                f"{ws_params.observe_codes}"
+            )
+        except Exception as e:
+            logger.error(f"[W-31] 관측 구독 실패: {e}")
+
+        # (2) REST 폴링 루프
+        import time as _time_mod
+        market_open = time.fromisoformat(self.params.market.open_time)
+        market_close = time.fromisoformat(self.params.market.close_time)
+
+        while self._running:
+            # 장중에만 폴링 (장외에는 REST 호출 의미 없음)
+            _now = now_kst().time()
+            if _now < market_open or _now > market_close:
+                try:
+                    await asyncio.sleep(30)
+                except asyncio.CancelledError:
+                    break
+                continue
+
+            for code in ws_params.observe_codes:
+                t0 = _time_mod.monotonic()
+                try:
+                    snap = await self.api.get_current_price(code)
+                    log_event({
+                        "layer": "rest_snapshot",
+                        "code": code,
+                        "listing_scope": get_listing_scope(code),
+                        "rest_prpr": snap.get("current_price", 0),
+                        "rest_high": snap.get("high", 0),
+                        "rest_low": snap.get("low", 0),
+                        "rest_change_pct": snap.get("change_pct", 0.0),
+                        "rest_lag_ms": int((_time_mod.monotonic() - t0) * 1000),
+                    })
+                except Exception:
+                    pass
+
+            try:
+                await asyncio.sleep(ws_params.rest_polling_interval_sec)
+            except asyncio.CancelledError:
+                break
+
+        logger.info("[W-31] _ws_runtime_rest_polling 종료")
 
     async def _network_health_check(self) -> None:
         """

@@ -140,8 +140,9 @@ class OrderParams(BaseModel):
 class RiskParams(BaseModel):
     daily_loss_limit_pct: float = Field(default=3.0, ge=0.1, le=50.0)
     max_position_size_pct: float = Field(default=100.0, ge=1.0, le=100.0)  # 예수금 대비 100%
-    index_drop_halt_pct: float = Field(default=1.5, ge=0.1, le=10.0)  # 지수 당일 고점 대비 N% 하락 시 매매 중단
-    max_hard_stops_daily: int = Field(default=2, ge=1, le=10)  # 일일 손절 횟수 한도
+    max_hard_stops_daily: int = Field(default=2, ge=1, le=10)  # 1회=strict, 2회=halt (2026-04-22 의미 재정의)
+    strict_mode_program_ratio_threshold: float = Field(default=18.0, ge=0.0, le=100.0)
+    strict_mode_market_whitelist: list[str] = Field(default_factory=lambda: ["KOSPI"])
 
 
 class ApiParams(BaseModel):
@@ -185,6 +186,16 @@ class InfraParams(BaseModel):
     upper_limit_multiplier: float = Field(default=1.30, ge=1.0, le=1.50)
 
 
+class WSRuntimeParams(BaseModel):
+    """W-31 WebSocket 런타임 로깅 (임시, 검증 종료 후 삭제).
+
+    Obsidian/W-31_WebSocket_런타임로깅_검증.md §4.5 참조.
+    """
+    enabled: bool = False                         # W-31 관측 활성화 (기본 False)
+    observe_codes: list[str] = Field(default_factory=list)  # 격리 구독 리스트
+    rest_polling_interval_sec: float = Field(default=1.0, ge=0.1, le=60.0)
+
+
 class StrategyParams(BaseModel):
     """strategy_params.yaml 전체 로드."""
 
@@ -197,6 +208,7 @@ class StrategyParams(BaseModel):
     api: ApiParams = ApiParams()
     market: MarketParams = MarketParams()
     infra: InfraParams = InfraParams()
+    ws_runtime: WSRuntimeParams = WSRuntimeParams()  # W-31 임시
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> StrategyParams:

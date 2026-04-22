@@ -17,7 +17,7 @@ multi_trade:
 
 # ── 매수 진입 ──────────────────────────────────────────────
 entry:
-  new_high_watch_start: "09:50"       # 신고가 감시 시작 시각
+  new_high_watch_start: "09:55"       # 신고가 감시 시작 시각
   entry_deadline: "10:55"             # 매수 진입 마감 (이후 신규 매수 불가)
   high_confirm_drop_pct: 1.0          # 고가 확정 트리거: 고가 대비 N% 하락
   high_confirm_timeout_min: 20        # 고가 확정 후 N분 내 미체결 시 주문 취소 (모멘텀 소멸, 2026-04-10 W-13: 10→20)
@@ -74,8 +74,9 @@ order:
 risk:
   daily_loss_limit_pct: 3.0           # 일일 손실 한도 (예수금 대비 %)
   max_position_size_pct: 100          # 최대 포지션 크기 (예수금 대비 %)
-  index_drop_halt_pct: 1.5            # 지수(선물) 당일 고점 대비 N% 하락 시 매매 중단
-  max_hard_stops_daily: 2             # 일일 손절 횟수 한도 (도달 시 매매 중단)
+  max_hard_stops_daily: 2             # 1회=strict, 2회=halt (2026-04-22 의미 재정의)
+  strict_mode_program_ratio_threshold: 18.0   # 하드손절 1회 후 당일 strict 필터 (%)
+  strict_mode_market_whitelist: ["KOSPI"]     # strict 허용 시장 (KOSDAQ 제외)
 
 # ── API ────────────────────────────────────────────────────
 api:
@@ -117,6 +118,18 @@ infra:
   # 상한가 체크
   upper_limit_check_pct: 20.0         # 상한가 체크 대상 등락률 임계값
   upper_limit_multiplier: 1.30        # 상한가 배수 (1.30 = +30%)
+
+# ── W-31 WebSocket 런타임 로깅 검증 (임시, 검증 종료 후 섹션 삭제) ──
+ws_runtime:
+  enabled: true                         # W-31 관측 활성화
+  observe_codes:                        # 격리 구독 리스트 (매매 대상 아님, 관측 전용)
+    - "001250"   # GS글로벌 (KRX-only, W-30 분봉 UN=0)
+    - "011930"   # 신성이엔지 (KRX-only, 극미 돌파 +10원 09:55:00)
+    - "092190"   # KEC (KRX-only)
+    - "097230"   # HJ중공업 (KRX-only)
+    - "278470"   # 에이피알 (KRX+NXT 대조, 04-22 매매 성공)
+    - "010140"   # 삼성중공업 (KRX+NXT 대조)
+  rest_polling_interval_sec: 1.0        # REST 교차 검증 폴링 간격 (초)
 
 # ── 시뮬레이션 (R-14: W-34) ───────────────────────────
 simulation:

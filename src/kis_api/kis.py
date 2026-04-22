@@ -1075,6 +1075,22 @@ class KISAPI:
                                         "mrkt_trtm_cls_code": fields[44] if len(fields) > 44 else "",
                                         "vi_stnd_prc":       fields[45] if len(fields) > 45 else "",
                                     }
+                                    # ── W-31 로깅 (임시, 검증 종료 후 제거) ──
+                                    try:
+                                        from src.utils.ws_runtime_logger import log_event, get_listing_scope
+                                        log_event({
+                                            "layer": "ws_handler",
+                                            "code": price_data["code"],
+                                            "tick_time": price_data["time"],
+                                            "prpr": price_data["current_price"],
+                                            "cntg_vol": price_data["volume"],
+                                            "vi_stnd_prc": price_data["vi_stnd_prc"],
+                                            "hour_cls_code": price_data["hour_cls_code"],
+                                            "listing_scope": get_listing_scope(price_data["code"]),
+                                        })
+                                    except Exception:
+                                        pass
+                                    # ── W-31 끝 ──
                                     for cb in self._realtime_callbacks.get(WS_TR_PRICE, []):
                                         try:
                                             cb(price_data)
