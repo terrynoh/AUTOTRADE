@@ -540,28 +540,41 @@ class AutoTrader:
         if current == prev:
             return
 
-        # 변화 감지 → critical 로그 (항상)
+        # 실제 변경된 필드만 추출 (before != after 가드)
+        field_defs = [
+            ("trht_yn",            "TRHT_YN",            "TRHT_YN"),
+            ("mrkt_trtm_cls_code", "MRKT_TRTM_CLS_CODE", "MRKT_TRTM_CLS_CODE"),
+            ("hour_cls_code",      "HOUR_CLS_CODE",      "HOUR_CLS_CODE"),
+            ("new_mkop_cls_code",  "NEW_MKOP_CLS_CODE",  "NEW_MKOP_CLS_CODE"),
+            ("vi_stnd_prc",        "VI_STND_PRC",        "VI_STND_PRC"),
+        ]
+        changed_log_lines = []
+        changed_tg_lines = []
+        for key, log_label, tg_label in field_defs:
+            if prev[key] == current[key]:
+                continue
+            changed_log_lines.append(f"  {log_label:<18} {prev[key]!r} → {current[key]!r}")
+            changed_tg_lines.append(f" {tg_label}: {prev[key]!r} → {current[key]!r}")
+
+        if not changed_log_lines:
+            # 방어: current != prev 통과했으나 5필드 기준으로는 동일 (이론상 도달 불가)
+            self._prev_vi_state[code] = current
+            return
+
+        # 변화 감지 → critical 로그 (변경된 필드만)
         logger.critical(
             f"[VI-OBSERVER] {code} 장 상태 필드 변화:\n"
-            f"  TRHT_YN:            {prev['trht_yn']!r} → {current['trht_yn']!r}\n"
-            f"  MRKT_TRTM_CLS_CODE: {prev['mrkt_trtm_cls_code']!r} → {current['mrkt_trtm_cls_code']!r}\n"
-            f"  HOUR_CLS_CODE:      {prev['hour_cls_code']!r} → {current['hour_cls_code']!r}\n"
-            f"  NEW_MKOP_CLS_CODE:  {prev['new_mkop_cls_code']!r} → {current['new_mkop_cls_code']!r}\n"
-            f"  VI_STND_PRC:        {prev['vi_stnd_prc']!r} → {current['vi_stnd_prc']!r}\n"
+            + "\n".join(changed_log_lines) + "\n"
             f"  price={data.get('current_price', 0):,}"
         )
 
-        # 텔레그램: 당일 종목별 첫 변화 1회만
+        # 텔레그램: 당일 종목별 첫 변화 1회만 (변경된 필드만)
         if code not in self._vi_notified_codes:
             self._vi_notified_codes.add(code)
             self.notifier.notify_system(
                 f"🔍 [VI-OBSERVER] {code} {ts.strftime('%H:%M:%S')}\n"
                 f"필드값 변화 감지 (당일 최초):\n"
-                f" TRHT_YN: {prev['trht_yn']!r} → {current['trht_yn']!r}\n"
-                f" MRKT_TRTM_CLS_CODE: {prev['mrkt_trtm_cls_code']!r} → {current['mrkt_trtm_cls_code']!r}\n"
-                f" HOUR_CLS_CODE: {prev['hour_cls_code']!r} → {current['hour_cls_code']!r}\n"
-                f" NEW_MKOP_CLS_CODE: {prev['new_mkop_cls_code']!r} → {current['new_mkop_cls_code']!r}\n"
-                f" VI_STND_PRC: {prev['vi_stnd_prc']!r} → {current['vi_stnd_prc']!r}\n"
+                + "\n".join(changed_tg_lines) + "\n"
                 f"가격: {data.get('current_price', 0):,}\n\n"
                 f"HTS 에서 실제 상태 확인 (Stage 2 분석용)"
             )
