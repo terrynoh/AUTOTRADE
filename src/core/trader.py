@@ -84,9 +84,13 @@ class Trader:
             watcher.buy1_order_id = order1.order_id
             watcher.buy1_placed = True
             self.pending_buy_orders.append(order1)
+            buy1_pct_actual = (
+                (watcher.intraday_high - buy1_price) / watcher.intraday_high * 100
+                if watcher.intraday_high > 0 else 0.0
+            )
             logger.info(
                 f"[{watcher.name}] 1차 매수 주문: {buy1_price:,}원 × {buy1_qty}주 "
-                f"(고가 {watcher.intraday_high:,}원 대비 -{ep.kospi_buy1_pct if watcher.market.value == 'KOSPI' else ep.kosdaq_buy1_pct}%)"
+                f"(고가 {watcher.intraday_high:,}원 대비 -{buy1_pct_actual:.1f}%)"
             )
 
         # 2차 매수
@@ -97,9 +101,13 @@ class Trader:
             watcher.buy2_order_id = order2.order_id
             watcher.buy2_placed = True
             self.pending_buy_orders.append(order2)
+            buy2_pct_actual = (
+                (watcher.intraday_high - buy2_price) / watcher.intraday_high * 100
+                if watcher.intraday_high > 0 else 0.0
+            )
             logger.info(
                 f"[{watcher.name}] 2차 매수 주문: {buy2_price:,}원 × {buy2_qty}주 "
-                f"(고가 {watcher.intraday_high:,}원 대비 -{ep.kospi_buy2_pct if watcher.market.value == 'KOSPI' else ep.kosdaq_buy2_pct}%)"
+                f"(고가 {watcher.intraday_high:,}원 대비 -{buy2_pct_actual:.1f}%)"
             )
 
     async def _send_buy_order(
