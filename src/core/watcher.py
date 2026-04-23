@@ -279,12 +279,16 @@ class Watcher:
     # (5-3) on_tick
 
     def on_tick(self, price: int, ts: datetime, futures_price: float) -> None:
-        """실시간 체결가 수신 시 호출. state 별 분기."""
-        if self.is_terminal:
-            return
+        """실시간 체결가 수신 시 호출. state 별 분기.
 
+        표시 필드(current_price, futures_price)는 terminal 상태와 무관하게 갱신.
+        매매 로직 분기(_handle_*)만 terminal 가드로 차단.
+        """
         self.current_price = price
         self.futures_price = futures_price
+
+        if self.is_terminal:
+            return
 
         if self.state == WatcherState.WATCHING:
             self._handle_watching(price, ts)
@@ -767,11 +771,11 @@ class WatcherCoordinator:
     async def on_realtime_price(self, code: str, price: int, ts: datetime) -> None:
         """KIS WebSocket 체결가 수신. 해당 종목 watcher 에 라우팅.
 
-        모든 watcher 에 라우팅 (terminal 제외). _active_monitor 단독 폴링 X.
-        ISSUE-036 의 결함 (single watcher 폴링) 을 해소.
+        terminal watcher 도 표시 필드 갱신 위해 on_tick 호출.
+        매매 로직 차단은 on_tick 내부 is_terminal 가드가 책임.
         """
         for w in self.watchers:
-            if w.code == code and not w.is_terminal:
+            if w.code == code:
                 w.on_tick(price, ts, self._latest_futures_price)
 
         # 매 틱 후 신호 폴링 + 매수 발주 평가
