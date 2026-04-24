@@ -186,16 +186,6 @@ class InfraParams(BaseModel):
     upper_limit_multiplier: float = Field(default=1.30, ge=1.0, le=1.50)
 
 
-class WSRuntimeParams(BaseModel):
-    """W-31 WebSocket 런타임 로깅 (임시, 검증 종료 후 삭제).
-
-    Obsidian/W-31_WebSocket_런타임로깅_검증.md §4.5 참조.
-    """
-    enabled: bool = False                         # W-31 관측 활성화 (기본 False)
-    observe_codes: list[str] = Field(default_factory=list)  # 격리 구독 리스트
-    rest_polling_interval_sec: float = Field(default=1.0, ge=0.1, le=60.0)
-
-
 class StrategyParams(BaseModel):
     """strategy_params.yaml 전체 로드."""
 
@@ -208,7 +198,6 @@ class StrategyParams(BaseModel):
     api: ApiParams = ApiParams()
     market: MarketParams = MarketParams()
     infra: InfraParams = InfraParams()
-    ws_runtime: WSRuntimeParams = WSRuntimeParams()  # W-31 임시
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> StrategyParams:

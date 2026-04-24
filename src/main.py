@@ -36,12 +36,13 @@ from loguru import logger
 
 from config.settings import Settings, StrategyParams
 from src.kis_api.kis import KISAPI
-from src.kis_api.constants import WS_TR_PRICE, WS_TR_FUTURES
+from src.kis_api.constants import WS_TR_PRICE, WS_TR_PRICE_UN, WS_TR_FUTURES
 from src.core.screener import Screener
 from src.core.stock_master import StockMaster
 from src.core.trader import Trader
 from src.core.risk_manager import RiskManager
 from src.core.watcher import Watcher, WatcherCoordinator, WatcherState
+from src.core.channel_resolver import ChannelResolver
 from src.storage.trade_logger import TradeLogger
 from src.utils.notifier import Notifier
 from src.utils.logger import setup_logger
@@ -73,6 +74,11 @@ class AutoTrader:
             params=self.params,
             trader=self.trader,
         )
+
+        # ── R-17: ChannelResolver (시세 채널 자동 분기) ──
+        self._channel_resolver: ChannelResolver = ChannelResolver(self.api)
+        self._coordinator.set_channel_resolver(self._channel_resolver)
+
         self._realtime_callback_registered: bool = False  # 실시간 콜백 등록 여부
 
         # ── 수동 종목 입력 ──
@@ -188,8 +194,9 @@ class AutoTrader:
             await self.api.connect()
 
             # 실시간 콜백 1회 등록 (중복 방지)
+            # R-17: WS_TR_PRICE_UN 키로 등록 (_ws_receiver 가 UN/ST 모두 이 키로 발화)
             if not self._realtime_callback_registered:
-                self.api.add_realtime_callback(WS_TR_PRICE, self._on_realtime_price)
+                self.api.add_realtime_callback(WS_TR_PRICE_UN, self._on_realtime_price)
                 self.api.add_realtime_callback(WS_TR_FUTURES, self._on_futures_price)
                 self._realtime_callback_registered = True
 
@@ -333,7 +340,6 @@ class AutoTrader:
                 asyncio.create_task(self._network_health_check(), name="health_check"),
                 asyncio.create_task(self._ratio_updater(), name="ratio_updater"),  # R-13
                 asyncio.create_task(self._futures_staleness_monitor(), name="futures_staleness"),  # STALENESS-01
-                asyncio.create_task(self._ws_runtime_rest_polling(), name="ws_runtime"),  # W-31 임시
             ]
             done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
 
@@ -426,12 +432,13 @@ class AutoTrader:
         # Coordinator 에 watchers 주입 (R-09: is_final 전달)
         self._coordinator.start_screening(targets, is_final=is_final)
 
-        # 3종목 KIS WebSocket 구독
+        # R-17: ChannelResolver 가 dual subscribe (UN+ST) 를 대체
+        # 10초 윈도우 후 자동 분기 결정 + 불필요한 채널 unsubscribe
         codes = [w.code for w in self._coordinator.watchers]
         if codes:
             try:
-                await self.api.subscribe_realtime(codes)
-                logger.info(f"실시간 감시 시작: {len(codes)}종목 {codes}")
+                await self._channel_resolver.start(codes)
+                logger.info(f"실시간 감시 시작 (dual subscribe): {len(codes)}종목 {codes}")
             except Exception as e:
                 logger.error(f"실시간 구독 실패: {e}")
 
@@ -507,7 +514,20 @@ class AutoTrader:
         """WebSocket 실시간 체결가 수신 콜백. Coordinator 로 위임.
 
         W-SAFETY-1: VI-Observer 추가. 가격 라우팅 전 VI 필드 변화 감지.
+
+        R-17:
+          (1) ChannelResolver 가 active 면 카운트 전달 (분기 판정용)
+          (2) dual 윈도우 (10초) 동안은 watcher 라우팅 skip (ghost high 방지)
+              09:50~09:50:10 의 10초만 — 신고가 감시 시작 09:55 이전이므로 안전.
         """
+        # R-17 (1): ChannelResolver 에 카운트 전달
+        if self._channel_resolver:
+            self._channel_resolver.on_realtime_price(data)
+
+        # R-17 (2): dual 윈도우 active 중 watcher 라우팅 skip
+        if self._channel_resolver and self._channel_resolver.is_active():
+            return
+
         code = data.get("code", "")
         price = data.get("current_price", 0)
         ts = now_kst()
@@ -708,6 +728,17 @@ class AutoTrader:
 
             # ── 케이스 2: 체결 통보 (CNTG_YN=2) ──
             if cntg_yn == "2":
+                # R-17: ORD_EXG_GB 로깅 (Decision D = KRX 고정, 응답 1 또는 3 예상)
+                ord_exg_gb = parsed.get("ORD_EXG_GB", "")
+                exg_label = {
+                    "1": "KRX", "2": "NXT", "3": "SOR-KRX", "4": "SOR-NXT"
+                }.get(ord_exg_gb, f"UNK({ord_exg_gb})")
+                logger.info(
+                    f"[체결통보] {code} "
+                    f"{'매수' if side == '02' else ('매도' if side == '01' else side)} "
+                    f"체결 EXG={exg_label}"
+                )
+
                 try:
                     filled_price = int(parsed.get("CNTG_UNPR", "0"))
                     filled_qty = int(parsed.get("CNTG_QTY", "0"))
@@ -1150,74 +1181,6 @@ class AutoTrader:
                 logger.error(f"_futures_staleness_monitor 에러: {e}")
                 await asyncio.sleep(5)
 
-    async def _ws_runtime_rest_polling(self) -> None:
-        """
-        W-31 WebSocket 런타임 로깅 검증 (임시, 검증 종료 후 메서드 제거).
-
-        1. observe_codes 격리 WebSocket 구독 (매매 대상 아님, 관측 전용)
-        2. N초 간격 REST get_current_price 폴링 → WS tick 과 교차 검증
-
-        Obsidian/W-31_WebSocket_런타임로깅_검증.md §4.4/§4.5 참조.
-        """
-        ws_params = self.params.ws_runtime
-        if not ws_params.enabled or not ws_params.observe_codes:
-            logger.info("[W-31] ws_runtime 비활성 or observe_codes 없음 — 건너뜀")
-            return
-
-        try:
-            from src.utils.ws_runtime_logger import log_event, get_listing_scope
-        except Exception as e:
-            logger.error(f"[W-31] ws_runtime_logger import 실패: {e}")
-            return
-
-        # (1) 격리 WebSocket 구독
-        try:
-            await self.api.subscribe_realtime(ws_params.observe_codes)
-            logger.info(
-                f"[W-31] 관측 전용 구독 {len(ws_params.observe_codes)}종목: "
-                f"{ws_params.observe_codes}"
-            )
-        except Exception as e:
-            logger.error(f"[W-31] 관측 구독 실패: {e}")
-
-        # (2) REST 폴링 루프
-        import time as _time_mod
-        market_open = time.fromisoformat(self.params.market.open_time)
-        market_close = time.fromisoformat(self.params.market.close_time)
-
-        while self._running:
-            # 장중에만 폴링 (장외에는 REST 호출 의미 없음)
-            _now = now_kst().time()
-            if _now < market_open or _now > market_close:
-                try:
-                    await asyncio.sleep(30)
-                except asyncio.CancelledError:
-                    break
-                continue
-
-            for code in ws_params.observe_codes:
-                t0 = _time_mod.monotonic()
-                try:
-                    snap = await self.api.get_current_price(code)
-                    log_event({
-                        "layer": "rest_snapshot",
-                        "code": code,
-                        "listing_scope": get_listing_scope(code),
-                        "rest_prpr": snap.get("current_price", 0),
-                        "rest_high": snap.get("high", 0),
-                        "rest_low": snap.get("low", 0),
-                        "rest_change_pct": snap.get("change_pct", 0.0),
-                        "rest_lag_ms": int((_time_mod.monotonic() - t0) * 1000),
-                    })
-                except Exception:
-                    pass
-
-            try:
-                await asyncio.sleep(ws_params.rest_polling_interval_sec)
-            except asyncio.CancelledError:
-                break
-
-        logger.info("[W-31] _ws_runtime_rest_polling 종료")
 
     async def _network_health_check(self) -> None:
         """

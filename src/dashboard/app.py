@@ -167,6 +167,10 @@ class DashboardState:
                 "buy2_price": watcher.target_buy2_price,
                 "hard_stop_price": watcher.hard_stop_price_value,
                 "pnl": round(at.trader.get_pnl(watcher.current_price)),
+                "channel_used": watcher.channel_used,  # R-17
+                "channel_decided_at": watcher.channel_decided_at.isoformat() if watcher.channel_decided_at else None,
+                "un_push_count": watcher.un_push_count_at_decision,
+                "st_push_count": watcher.st_push_count_at_decision,
             })
 
         log_size = params.infra.dashboard_log_return_size

@@ -135,6 +135,8 @@ from src.kis_api.constants import (
     TR_UNFILLED,
     TR_MINUTE_CHART,
     WS_TR_PRICE,
+    WS_TR_PRICE_UN,
+    WS_TR_PRICE_ST,
     WS_TR_FUTURES,
     WS_TR_EXECUTION,
     FUTURES_KOSPI200_NEAR,
@@ -177,7 +179,7 @@ class KISAPI:
         self._ws_task: Optional[asyncio.Task] = None
 
         self._realtime_callbacks: dict[str, list[Callable]] = {}
-        self._subscribed_codes: set[str] = set()
+        self._subscribed_codes: dict[str, str] = {}  # code → tr_id (R-17)
         self._futures_subscribed: bool = False  # 선물 구독 상태
         # M-DIAG-PROG v2: _prog_trade_logged 플래그 제거 — 매 호출 1줄 요약 + 이상 시 WARNING
         self._ws_connected: bool = False  # WebSocket 연결 상태
@@ -886,8 +888,13 @@ class KISAPI:
         """구독 종목 코드 초기화 (재스크리닝 시 호출)."""
         self._subscribed_codes.clear()
 
-    async def subscribe_realtime(self, codes: list[str]):
-        """실시간 체결가 구독."""
+    async def subscribe_realtime(self, codes: list[str], tr_id: str = WS_TR_PRICE_UN):
+        """실시간 체결가 구독.
+
+        Args:
+            codes: 구독 종목 코드 리스트
+            tr_id: WS_TR_PRICE_UN (통합) 또는 WS_TR_PRICE_ST (KRX 전용). R-17.
+        """
         if not self._ws_key:
             await self._get_ws_key()
 
@@ -896,7 +903,7 @@ class KISAPI:
             self._ws_task = asyncio.create_task(self._ws_receiver())
 
         for code in codes:
-            self._subscribed_codes.add(code)
+            self._subscribed_codes[code] = tr_id   # dict 등록 (R-17: set.add → dict)
             msg = {
                 "header": {
                     "approval_key": self._ws_key,
@@ -906,22 +913,33 @@ class KISAPI:
                 },
                 "body": {
                     "input": {
-                        "tr_id": WS_TR_PRICE,
+                        "tr_id": tr_id,             # R-17: WS_TR_PRICE → tr_id 파라미터
                         "tr_key": code,
                     }
                 },
             }
             await self._ws.send(json.dumps(msg))
-            logger.info(f"실시간 구독: {code}")
+            logger.info(f"실시간 구독: {code} (tr_id={tr_id})")
 
-    async def unsubscribe_realtime(self, codes: list[str] | None = None):
-        """실시간 구독 해제."""
+    async def unsubscribe_realtime(self, codes: list[str] | None = None, tr_id: str | None = None):
+        """실시간 구독 해제.
+
+        Args:
+            codes: 해제할 종목 코드. None 이면 전체 해제 (ws close).
+            tr_id: 명시 시 해당 tr_id 만 해제 (dual subscribe 정리 용).
+                   None 이면 _subscribed_codes 의 tr_id 사용. R-17.
+        """
         if not self._ws:
             return
 
         if codes:
             for code in codes:
-                self._subscribed_codes.discard(code)
+                target_tr = tr_id or self._subscribed_codes.get(code)
+                if not target_tr:
+                    continue
+                # dict 갱신: tr_id 명시 없거나 현재 등록과 일치할 때만 제거
+                if tr_id is None or self._subscribed_codes.get(code) == tr_id:
+                    self._subscribed_codes.pop(code, None)
                 msg = {
                     "header": {
                         "approval_key": self._ws_key,
@@ -931,12 +949,13 @@ class KISAPI:
                     },
                     "body": {
                         "input": {
-                            "tr_id": WS_TR_PRICE,
+                            "tr_id": target_tr,     # R-17: WS_TR_PRICE → target_tr
                             "tr_key": code,
                         }
                     },
                 }
                 await self._ws.send(json.dumps(msg))
+                logger.info(f"실시간 해제: {code} (tr_id={target_tr})")
         else:
             if self._ws_task:
                 self._ws_task.cancel()
@@ -1056,7 +1075,8 @@ class KISAPI:
                                     )
                                 continue  # 시세/선물 분기로 내려가지 않음
 
-                            if tr_id == WS_TR_PRICE:
+                            if tr_id in (WS_TR_PRICE_UN, WS_TR_PRICE_ST):
+                                # R-17: UN/ST 양쪽 모두 처리 (dual subscribe 지원)
                                 fields = body.split("^")
                                 if len(fields) >= 12:
                                     price_data = {
@@ -1074,24 +1094,10 @@ class KISAPI:
                                         "hour_cls_code":     fields[43] if len(fields) > 43 else "",
                                         "mrkt_trtm_cls_code": fields[44] if len(fields) > 44 else "",
                                         "vi_stnd_prc":       fields[45] if len(fields) > 45 else "",
+                                        "tr_id": tr_id,  # R-17: ChannelResolver 분기 판정용
                                     }
-                                    # ── W-31 로깅 (임시, 검증 종료 후 제거) ──
-                                    try:
-                                        from src.utils.ws_runtime_logger import log_event, get_listing_scope
-                                        log_event({
-                                            "layer": "ws_handler",
-                                            "code": price_data["code"],
-                                            "tick_time": price_data["time"],
-                                            "prpr": price_data["current_price"],
-                                            "cntg_vol": price_data["volume"],
-                                            "vi_stnd_prc": price_data["vi_stnd_prc"],
-                                            "hour_cls_code": price_data["hour_cls_code"],
-                                            "listing_scope": get_listing_scope(price_data["code"]),
-                                        })
-                                    except Exception:
-                                        pass
-                                    # ── W-31 끝 ──
-                                    for cb in self._realtime_callbacks.get(WS_TR_PRICE, []):
+                                    # 단일 콜백 라우팅 (UN/ST 모두 WS_TR_PRICE_UN 키로)
+                                    for cb in self._realtime_callbacks.get(WS_TR_PRICE_UN, []):
                                         try:
                                             cb(price_data)
                                         except Exception as e:
@@ -1142,8 +1148,8 @@ class KISAPI:
                 self._ws_key = ""
                 await self._get_ws_key()
                 logger.info("WebSocket 키 재발급 완료")
-                # 기존 구독 코드 재구독
-                for code in list(self._subscribed_codes):
+                # 기존 구독 코드 재구독 (R-17: dict 의 tr_id 사용)
+                for code, resubscribe_tr_id in list(self._subscribed_codes.items()):
                     msg = {
                         "header": {
                             "approval_key": self._ws_key,
@@ -1153,13 +1159,13 @@ class KISAPI:
                         },
                         "body": {
                             "input": {
-                                "tr_id": WS_TR_PRICE,
+                                "tr_id": resubscribe_tr_id,  # R-17: WS_TR_PRICE → dict tr_id
                                 "tr_key": code,
                             }
                         },
                     }
                     await self._ws.send(json.dumps(msg))
-                    logger.info(f"재구독 완료: {code}")
+                    logger.info(f"재구독 완료: {code} (tr_id={resubscribe_tr_id})")
 
                 # 선물 재구독
                 if self._futures_subscribed:

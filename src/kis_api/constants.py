@@ -57,7 +57,14 @@ TR_BUY_AVAILABLE = "TTTC8908R"          # 매수가능조회 (R15-007)
 TR_UNFILLED = "TTTC0084R"               # 주식정정취소가능주문조회 (ISSUE-LIVE-10, 구 TTTC8036R)
 
 # ── WebSocket TR ID ────────────────────────────────────────────
-WS_TR_PRICE = "H0UNCNT0"                # 실시간 체결가 (통합 KRX+NXT)
+# R-17: 종목별 채널 분기
+WS_TR_PRICE_UN = "H0UNCNT0"             # 통합 (NXT 활성 종목, SOR 집계)
+WS_TR_PRICE_ST = "H0STCNT0"             # KRX 전용 (KRX-only 종목)
+WS_TR_PRICE_NX = "H0NXCNT0"             # NXT 전용 (현재 미사용, 예비)
+
+# 기존 호환 (deprecated, 점진 제거 예정)
+WS_TR_PRICE = WS_TR_PRICE_UN
+
 WS_TR_ORDERBOOK = "H0STASP0"            # 실시간 호가 (KRX)
 WS_TR_PROGRAM = "H0STPGM0"             # 실시간 프로그램매매 (KRX)
 WS_TR_FUTURES = "H0IFCNT0"              # 실시간 선물 체결 (KOSPI200)

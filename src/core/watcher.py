@@ -185,6 +185,12 @@ class Watcher:
     _watch_start: Optional[time] = None
     _entry_deadline: Optional[time] = None
 
+    # === R-17: 채널 분기 메타 (3A-2) ===
+    channel_used: Optional[str] = None              # WS_TR_PRICE_UN / WS_TR_PRICE_ST
+    channel_decided_at: Optional[datetime] = None   # 분기 결정 시각
+    un_push_count_at_decision: int = 0              # 윈도우 동안 UN push 수
+    st_push_count_at_decision: int = 0              # 윈도우 동안 ST push 수
+
     def __post_init__(self):
         """파라미터 캐싱."""
         self._watch_start = time.fromisoformat(self.params.entry.new_high_watch_start)
@@ -300,25 +306,6 @@ class Watcher:
         self.current_price = price
         self.futures_price = futures_price
         self.futures_price_ts = futures_ts  # STALENESS-01: 선물 ts 저장 (주가 ts 아님!)
-
-        # ── W-31 로깅 (임시, 검증 종료 후 제거) ──
-        try:
-            from src.utils.ws_runtime_logger import log_event, get_listing_scope
-            log_event({
-                "layer": "watcher_tick",
-                "code": self.code,
-                "name": self.name,
-                "market_type": self.market.value,
-                "listing_scope": get_listing_scope(self.code),
-                "prpr": price,
-                "watcher_state": self.state.value,
-                "intraday_high": self.intraday_high,
-                "pre_955_high": self.pre_955_high,
-                "confirmed_high": self.confirmed_high if self.confirmed_high else None,
-            })
-        except Exception:
-            pass
-        # ── W-31 끝 ──
 
         if self.state == WatcherState.WATCHING:
             self._handle_watching(price, ts)
@@ -686,6 +673,7 @@ class WatcherCoordinator:
         self._available_cash: int = 0  # main.py 에서 주입
         self._exit_callback = None  # 청산 후 콜백 (main.py 에서 주입)
         self._risk_manager = None  # R-14 버그픽스: 리스크 매니저 (main.py에서 주입)
+        self._channel_resolver = None  # R-17: ChannelResolver (main.py 에서 주입)
 
         # 매수 마감 / 강제 청산 시각 (캐싱)
         self._entry_deadline = time.fromisoformat(params.entry.entry_deadline)
@@ -719,6 +707,43 @@ class WatcherCoordinator:
         trading_halted (2회 halt 또는 daily_loss) + strict_mode (1회 strict) 2중 체크.
         """
         self._risk_manager = risk_manager
+
+    def set_channel_resolver(self, resolver) -> None:
+        """R-17: 채널 분기 resolver 주입. main.py 가 호출.
+
+        스크리닝 후 main.py 가 resolver.start(codes) 호출 +
+        resolver 의 결정 콜백 → Coordinator._on_channel_decided 자동 등록.
+        """
+        self._channel_resolver = resolver
+        resolver.set_channel_decided_callback(self._on_channel_decided)
+
+    def _on_channel_decided(
+        self,
+        code: str,
+        channel: str,
+        un_count: int,
+        st_count: int,
+        decided_at: datetime,
+    ) -> None:
+        """ChannelResolver 콜백 — Watcher 채널 메타 갱신.
+
+        주의: 동기 함수 (resolver 가 동기 호출).
+        watcher 가 watchers 목록에 없으면 무시.
+        """
+        watcher = next((w for w in self.watchers if w.code == code), None)
+        if watcher is None:
+            logger.warning(
+                f"[Coordinator] _on_channel_decided: {code} watcher 없음 — skip"
+            )
+            return
+        watcher.channel_used = channel
+        watcher.channel_decided_at = decided_at
+        watcher.un_push_count_at_decision = un_count
+        watcher.st_push_count_at_decision = st_count
+        logger.info(
+            f"[Coordinator] {code} 채널 메타 갱신: {channel} "
+            f"(UN={un_count} ST={st_count})"
+        )
 
     @property
     def active(self) -> Optional[Watcher]:
@@ -819,21 +844,6 @@ class WatcherCoordinator:
         모든 watcher 에 라우팅 (terminal 제외). _active_monitor 단독 폴링 X.
         ISSUE-036 의 결함 (single watcher 폴링) 을 해소.
         """
-        # ── W-31 로깅 (임시, 검증 종료 후 제거) ──
-        try:
-            from src.utils.ws_runtime_logger import log_event, get_listing_scope
-            _routed = sum(1 for w in self.watchers if w.code == code and not w.is_terminal)
-            log_event({
-                "layer": "coord_route",
-                "code": code,
-                "prpr": price,
-                "routed_watcher_count": _routed,
-                "listing_scope": get_listing_scope(code),
-            })
-        except Exception:
-            pass
-        # ── W-31 끝 ──
-
         for w in self.watchers:
             if w.code == code and not w.is_terminal:
                 w.on_tick(price, ts, self._latest_futures_price, self._latest_futures_ts)
