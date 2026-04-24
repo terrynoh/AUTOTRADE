@@ -30,6 +30,10 @@ class Trader:
         self.position: Optional[Position] = None
         self.pending_buy_orders: list[Order] = []
         self.pending_sell_orders: list[Order] = []  # R15-005: LIVE 체결통보 매칭용
+        # Fix 3a (R-18): 자체 cancel 발주한 order_id 추적.
+        # cancel_buy_orders / cancel_and_reorder_buy2 의 cancel_order REST 호출 직전 add.
+        # RCTF=2 (취소 ACK) 수신 시 set 에 있으면 외부 개입 false positive 차단.
+        self._self_cancelled_order_ids: set[str] = set()
 
     # ── 매수 주문 배치 (지정가 2건) ────────────────────────
 
@@ -153,11 +157,16 @@ class Trader:
             if not order.is_active:
                 continue
 
+            # Fix 3b (R-18): cancel REST 호출 직전 self_cancelled set 등록.
+            # RCTF=2 (취소 ACK) 수신 시 false positive 차단용.
+            self._self_cancelled_order_ids.add(order.order_id)
             try:
                 await self.api.cancel_order(order.order_id, order.code)
                 order.status = OrderStatus.CANCELLED
                 logger.info(f"주문 취소: {order.label} {order.order_id}")
             except Exception as e:
+                # 실패 시 set 누수 방지 — discard
+                self._self_cancelled_order_ids.discard(order.order_id)
                 logger.error(f"주문 취소 실패 [{order.label}]: {e}")
 
         watcher.buy1_placed = False
@@ -211,11 +220,16 @@ class Trader:
         old_qty = old_order.qty
 
         # ── 1. 기존 buy2 취소 ──
+        # Fix 3c (R-18): cancel REST 호출 직전 self_cancelled set 등록.
+        _cancelled_id = watcher.buy2_order_id
+        self._self_cancelled_order_ids.add(_cancelled_id)
         try:
-            await self.api.cancel_order(watcher.buy2_order_id, watcher.code)
+            await self.api.cancel_order(_cancelled_id, watcher.code)
             old_order.status = OrderStatus.CANCELLED
             logger.info(f"[{watcher.name}] buy2 취소 완료: {old_price:,}원")
         except Exception as e:
+            # 실패 시 set 누수 방지
+            self._self_cancelled_order_ids.discard(_cancelled_id)
             logger.error(f"[{watcher.name}] buy2 취소 실패: {e}")
             return False
 
@@ -418,6 +432,17 @@ class Trader:
         if self.position is None:
             self.position = Position(code=order.code, opened_at=ts)
             logger.debug(f"[R15-005] Position 생성: {order.code}")
+        elif self.position.code != order.code:
+            # Fix 2 (R-18): stale Position 방어선.
+            # 이전 종목 청산 후 Position reset 누락 시 다른 종목 매수 체결에서
+            # 종목 코드 불일치 → 즉시 교체 + critical 로그.
+            # Fix 5 가 race 근본 차단하지만 방어선으로 유지.
+            logger.critical(
+                f"[Fix 2] stale Position 감지: "
+                f"기존 code={self.position.code} → 새 code={order.code} "
+                f"(Position 교체. Fix 5 race 미완전 차단 신호)"
+            )
+            self.position = Position(code=order.code, opened_at=ts)
 
         # 이번 체결분을 Position 에 누적
         self.position.total_buy_amount += filled_price * filled_qty
@@ -520,3 +545,4 @@ class Trader:
         self.position = None
         self.pending_buy_orders = []
         self.pending_sell_orders = []  # R15-005
+        self._self_cancelled_order_ids.clear()  # Fix 3d (R-18): set 누수 방지

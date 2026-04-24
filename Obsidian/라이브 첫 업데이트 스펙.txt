@@ -1,0 +1,67 @@
+결론 먼저: 매매 로직/타이밍/체결 정확성에 실질적 차이 없음. 단, 운영 리스크 측면에서 차이 있음.
+
+각 영역별 영향 분석
+1. 신호 계산 (매수/매도 판단) — 차이 없음
+watcher._handle_entered(), _handle_triggered() 등 신호 로직은 watcher 자체 필드만 사용:
+
+self.current_price, self.hard_stop_price_value, self.target_price
+Position 데이터 직접 참조 없음
+
+→ A/B 어느 쪽이든 동일한 매수/매도 결정
+2. 매수 발주 타이밍 — 차이 없음
+trader.place_buy_orders(watcher, cash) 는 watcher.target_buy1_price 등 watcher 필드만 사용. Position 무관.
+→ A/B 어느 쪽이든 동일 시점에 동일 가격으로 발주
+3. 체결통보 처리 속도 — 측정 가능한 차이 없음
+항목A (완전)B (dual-write)체결 처리 시간position.add_buy() 1회2회실제 지연< 1μs< 2μsKIS 체결통보 간격수십~수백 ms수십~수백 ms
+→ dual-write 오버헤드는 KIS 전송 지연보다 10,000배 짧음. 매매 타이밍에 영향 불가능.
+4. 매도 수량 계산 — 조건부 차이 (핵심 리스크)
+현재 execute_exit():
+pythonqty = self.position.total_qty  # trader.position 참조
+시나리오AB정상 동작watcher.position.total_qty 사용trader.position.total_qty 사용 (기존 코드 유지)dual-write 깨짐 시해당 없음 (단일 소스)trader.position 과 watcher.position 값 불일치 → 매도 수량 오류 가능
+→ B 의 잠재 위험 지점. 단, 이는 "dual-write 구현이 정확한가" 에 달림. 제대로 구현되면 차이 없음.
+5. P&L 계산 — 차이 없음
+trader.get_pnl(current_price) vs watcher.position.pnl() — 입력 데이터 같으면 결과 같음.
+6. Reconciler (미래 R15-005 잔여) — 차이 있음
+Reconciler 가 "내부 Position 과 KIS 서버 holdings 일치" 체크하는데:
+구조Reconciler 검증 범위A (단일 소스)watcher.position ↔ get_balance().holdings (2자 비교)B (dual-write)trader.position ↔ watcher.position ↔ get_balance().holdings (3자 비교)
+→ 미래 복잡도 차이. 현재 매매에는 무관.
+
+실제 리스크 비교표
+항목A (대규모)B (중규모 dual-write)매매 결정동일동일매수/매도 발주 시점동일동일체결 처리동일동일P&L 계산동일동일코드 무결성 리스크낮음 (단일 소스)중간 (동기화 실패 가능)월요일 LIVE 첫 실행 변경 범위넓음 (5파일)좁음 (3파일)Regression 포착 범위넓음좁음Rollback 용이성어려움쉬움Reconciler 구현 복잡도낮음중간장기 유지보수유리불리
+
+Terry 질문에 대한 직접 답변
+
+"미묘한 차이지만 거래 로직이나 타이밍 포착 매수 매도 등에 영향을 줄 수 있는지"
+
+답: 없음 (dual-write 가 올바르게 구현된다는 전제 하에).
+이유:
+
+매매 결정 로직은 Watcher 내부 필드만 사용 — Position 무관
+매매 발주 타이밍은 event-driven (체결통보 수신 시점) — 코드 구조 무관
+체결가 계산은 KIS 서버가 담당 — 내부 Position 구조 무관
+수량 산정은 get_buy_available() (R15-007) 기반 — Position 독립
+
+단, B 의 dual-write 가 깨지는 상황에서는 매도 수량 오류 가능:
+
+예: 1차 체결은 양쪽 다 반영, 2차 체결 시 한쪽만 반영 → 매도 시 수량 불일치
+이는 구현 품질 문제이지 설계 선택 문제 아님
+
+
+09:50 매수 50주 체결 → trader.position / watcher.position 에 기록
+10:15 프로그램 크래시 (systemd 재시작 or OOM)
+10:16 AutoTrader 재가동
+    → run() 에서 watchers = [] 초기화 (스크리닝 결과 없음)
+    → trader.position = None (메모리 소실)
+    → KIS 계좌에는 50주 보유 중 (ground truth)
+    → AutoTrader 는 이를 모름
+11:20 force_liquidate → watchers 순회 → ENTERED 없음 → 아무 동작 안 함
+종가까지 포지션 방치 → 다음날 open 갭에 노출
+
+10:30 place_buy_orders → api.buy_order 호출
+10:30.4 TCP 패킷 loss → aiohttp TimeoutError
+10:30.4 except 블록 → order.status = REJECTED
+10:31 실제로 KIS 서버에는 주문이 정상 접수되어 체결됨
+10:31 체결통보 수신 → _find_order_by_id(ODER_NO) → pending_buy_orders 에 해당 order 없음
+      (order.order_id 가 빈 문자열이라 매칭 실패)
+→ main.py 의 체결통보 처리 로직이 "외부 개입" 으로 오진 + 텔레그램 알림
+→ 실제로는 AUTOTRADE 가 발주한 정당한 주문

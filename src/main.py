@@ -703,9 +703,31 @@ class AutoTrader:
             if cntg_yn == "1":
                 if rctf == "0":
                     # 정상 접수 → SUBMITTED → ACKNOWLEDGED
-                    self.trader.on_live_acknowledged(order_id, ts)
+                    # Fix 4 (R-18): ACK 수신 시 order_id 매칭 실패 시 1회 retry.
+                    # place_buy_orders REST 응답 → pending_buy_orders append 사이
+                    # WS ACK 가 도달하는 race 방어. 200ms 대기 후 재매칭.
+                    result = self.trader.on_live_acknowledged(order_id, ts)
+                    if result is None:
+                        await asyncio.sleep(0.2)
+                        result = self.trader.on_live_acknowledged(order_id, ts)
+                        if result is None:
+                            logger.warning(
+                                f"[Fix 4] ACK retry 후에도 매칭 실패: "
+                                f"order_id={order_id} code={code} — 외부 개입 의심"
+                            )
                     return
                 elif rctf in ("1", "2"):
+                    # Fix 3e (R-18): RCTF=2 (취소) ACK 의 자체 cancel false positive 차단.
+                    # cancel_buy_orders / cancel_and_reorder_buy2 가 cancel_order REST 발주
+                    # 직전 등록한 oorder_id 를 set 에서 확인. 일치 시 자체 cancel ACK 정상.
+                    if rctf == "2" and oorder_id in self.trader._self_cancelled_order_ids:
+                        logger.info(
+                            f"[Fix 3e] 자체 cancel ACK 수신: "
+                            f"OODER={oorder_id} code={code} → 정상 처리"
+                        )
+                        self.trader._self_cancelled_order_ids.discard(oorder_id)
+                        return
+
                     # 정정(1)/취소(2) — AUTOTRADE 는 정정/취소 발주 안 함 → 외부 개입 확정
                     action = "정정" if rctf == "1" else "취소"
                     logger.critical(
@@ -944,13 +966,14 @@ class AutoTrader:
         책임:
         1. P&L 기록
         2. R-12: 손절 횟수 기록 (hard_stop인 경우)
-        3. TradeLogger로 거래 기록 + 로그 출력
+        3. TradeLogger로 거래 기록 (DB 저장만, 텔레그램은 10 단계에서)
         4. 손실 한도 체크 (get_balance 사용 — 기존 동작 유지)
         5. 멀티 트레이드 가드
         6. 다음 매매 가용 예수금 갱신 (get_buy_available 사용 — R15-007)
         7. trader.reset
         8. T3 위임 (W-11e 두 번째 매매 트리거)
         9. 대시보드 동기화
+        10. What-if 시나리오 시뮬 + 통합 텔레그램 전송 (분봉 API + scenario_sim)
         """
         # 1. P&L 기록
         pnl = self.trader.get_pnl(watcher.current_price)
@@ -970,14 +993,13 @@ class AutoTrader:
                     f"KOSPI 비중 ≥{self.params.risk.strict_mode_program_ratio_threshold}% 종목만 매수 허용"
                 )
 
-        # 3. TradeLogger로 거래 기록 + 로그 출력 + 텔레그램 알림 (R-10 새 로그 시스템)
+        # 3. TradeLogger로 거래 기록 (DB 저장 + 로그 출력)
+        #    텔레그램 전송은 10 단계(시나리오 시뮬 포함)로 이동
+        record = None
         try:
             record = self._trade_logger.record_trade(
                 watcher, self.trader, trade_mode=self.settings.trade_mode
             )
-            if record:
-                # 개별 거래 완료 즉시 텔레그램 전송
-                self.notifier.notify_trade_complete(record)
         except Exception as e:
             logger.error(f"거래 로그 저장 실패 ({watcher.name}): {e}")
 
@@ -1028,6 +1050,85 @@ class AutoTrader:
 
         # 9. 대시보드 동기화
         await self._fire_state_update()
+
+        # === 10. What-if 시나리오 시뮬 + 통합 텔레그램 전송 ===
+        # handle_t3 후에 실행 — 매매 경로에 0 줄 영향 (결과는 이미 확정된 상태).
+        # 실패 시 fallback: 시나리오 없이 기본 notify_trade_complete 로 전송.
+        if record is None:
+            return
+        try:
+            await self._send_trade_complete_with_scenarios(record)
+        except Exception as e:
+            logger.error(f"시나리오 시뮬 실패 ({watcher.name}): {e}")
+            # 최소한 기본 리포트는 전송
+            try:
+                self.notifier.notify_trade_complete(record)
+            except Exception as e2:
+                logger.error(f"기본 리포트 전송도 실패: {e2}")
+
+    async def _send_trade_complete_with_scenarios(self, record) -> None:
+        """분봉 차트 조회 + 60/70% 시뮬 실행 + 통합 리포트 전송 + 분봉 스냅샷 저장.
+
+        매매 루프에 영향 0: _on_exit_done 9 단계 완료 후 호출됨.
+        실패해도 기본 리포트는 Step 10 의 except 블록에서 fallback 실행.
+        """
+        from src.utils.scenario_sim import run_scenarios
+
+        if record.buy1_time is None or record.total_buy_qty <= 0:
+            # 시뮬 조건 미충족 — 기본 리포트만
+            self.notifier.notify_trade_complete(record)
+            return
+
+        # 분봉 차트 조회 (KIS REST, UN 채널)
+        candles = []
+        try:
+            candles = await self.api.get_minute_chart(record.code)
+        except Exception as e:
+            logger.warning(f"분봉 차트 조회 실패 ({record.name}): {e}")
+
+        # 분봉 스냅샷 파일 저장 (batch 재생성/검증용)
+        try:
+            self._save_minute_chart_snapshot(record, candles)
+        except Exception as e:
+            logger.debug(f"분봉 스냅샷 저장 실패 ({record.name}): {e}")
+
+        if not candles:
+            self.notifier.notify_trade_complete(record)
+            return
+
+        # 시뮬 초기 low = buy1_price (체결 시점 저점 = 매수가)
+        initial_low = record.buy1_price if record.buy1_price > 0 else int(record.avg_buy_price)
+        scenarios = run_scenarios(
+            minute_chart=candles,
+            confirmed_high=record.new_high_price,
+            initial_low=initial_low,
+            buy_time=record.buy1_time,
+            recovery_pcts=[60.0, 70.0],
+            force_time=self.params.exit.force_liquidate_time,
+        )
+
+        self.notifier.notify_trade_complete_with_scenarios(record, scenarios)
+
+    def _save_minute_chart_snapshot(self, record, candles: list[dict]) -> None:
+        """분봉 스냅샷을 파일로 저장. batch 재실행 시 재사용.
+
+        경로: logs/minute_charts/YYYY-MM-DD/{code}_{name}.json
+        """
+        if not candles:
+            return
+        date_str = record.trade_date.isoformat() if hasattr(record.trade_date, "isoformat") else str(record.trade_date)
+        out_dir = Path("logs") / "minute_charts" / date_str
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_name = "".join(c for c in record.name if c.isalnum() or c in ("_", "-"))
+        out_path = out_dir / f"{record.code}_{safe_name}.json"
+        payload = {
+            "code": record.code,
+            "name": record.name,
+            "trade_date": date_str,
+            "candles": candles,
+        }
+        out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.debug(f"분봉 스냅샷 저장: {out_path}")
 
     async def _ratio_updater(self) -> None:
         """R-13: 프로그램 순매수 비중 실시간 업데이트.

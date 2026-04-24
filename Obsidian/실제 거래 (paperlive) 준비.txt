@@ -1,0 +1,19 @@
+실제 거래 (paper/live):
+┌─────────────┐    KIS API 체결 통보    ┌────────────────────┐
+│  Trader     │ ─────────────────────→ │  main.py 콜백      │
+│  place_buy  │    (price, qty 정확)   │  on_buy_filled()   │
+└─────────────┘                        └────────────────────┘
+                                                │
+                                                ▼
+                                       Watcher.on_buy_filled(price, qty) ✅
+
+DRY_RUN (버그 경로):
+┌─────────────┐                        ┌────────────────────┐
+│  Trader     │                        │  Coordinator       │
+│  simulate_  │ → label만 반환 ───────→│  _process_signals  │
+│  fills()    │   (price, qty 없음)    │                    │
+└─────────────┘                        └────────────────────┘
+      │                                         │
+      ▼                                         ▼
+  Position.add_buy(정확)              Watcher.on_buy_filled(0, 0) ❌
+  (내부에서 처리됨)                    (qty=0 하드코딩)

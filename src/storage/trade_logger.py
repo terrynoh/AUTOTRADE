@@ -177,6 +177,15 @@ class TradeLogger:
             CREATE INDEX IF NOT EXISTS idx_trades_r10_date ON trades_r10(trade_date);
             CREATE INDEX IF NOT EXISTS idx_trades_r10_code ON trades_r10(code);
         """)
+
+        # 멱등 마이그레이션: post_entry_low 컬럼 추가 (what-if 시나리오 시뮬용)
+        # PRAGMA table_info 로 컬럼 존재 확인 후 없으면 ALTER
+        cols = conn.execute("PRAGMA table_info(trades_r10)").fetchall()
+        col_names = {row["name"] for row in cols}
+        if "post_entry_low" not in col_names:
+            conn.execute("ALTER TABLE trades_r10 ADD COLUMN post_entry_low INTEGER DEFAULT 0")
+            log.info("trades_r10: post_entry_low 컬럼 추가 완료 (마이그레이션)")
+
         conn.commit()
         conn.close()
         log.debug(f"TradeLogger DB 초기화: {self.db_path}")
@@ -274,7 +283,10 @@ class TradeLogger:
             target_buy2_price=watcher.target_buy2_price,        # R10-011
             target_price=float(watcher.target_price),
             hard_stop_price=watcher.hard_stop_price_value,
-            
+
+            # What-if 시나리오 시뮬용
+            post_entry_low=getattr(watcher, "post_entry_low", 0),
+
             trade_mode=trade_mode,
             capital=self.capital,
         )
@@ -313,8 +325,9 @@ class TradeLogger:
                     pnl, pnl_pct, capital_pnl_pct, holding_seconds,
                     confirmed_high, target_buy1_price, target_buy2_price,
                     hard_stop_price, target_price,
+                    post_entry_low,
                     trade_mode, capital
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 str(record.trade_date), trade_id, record.code, record.name, record.market,
                 record.new_high_price, record.new_high_time.isoformat() if record.new_high_time else None,
@@ -327,6 +340,7 @@ class TradeLogger:
                 int(record.pnl), record.pnl_pct, record.capital_pnl_pct, record.holding_seconds,
                 record.rolling_high, record.entry_trigger_price, record.target_buy2_price,  # R10-011 정정
                 record.hard_stop_price, int(record.target_price),
+                record.post_entry_low,
                 record.trade_mode, record.capital,
             ))
             conn.commit()

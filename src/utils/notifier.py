@@ -139,6 +139,94 @@ class Notifier:
         )
         self._send(msg)
 
+    def notify_trade_complete_with_scenarios(
+        self,
+        record: "TradeRecord",
+        scenarios: dict,  # {60.0: ScenarioResult, 70.0: ScenarioResult}
+    ) -> None:
+        """거래 완료 + 60% / 70% what-if 시나리오 시뮬 블록을 한 메시지로 전송.
+
+        기존 notify_trade_complete 의 출력 + 하단에 시나리오 append.
+        분봉 해상도 한계를 헤더로 고지 (실측은 초 단위, 시뮬은 분 단위).
+
+        Args:
+            record: TradeRecord 객체
+            scenarios: {recovery_pct(float): ScenarioResult} 딕트
+                       (src.utils.scenario_sim.run_scenarios 결과)
+        """
+        from src.models.trade import ExitReason
+        from src.utils.scenario_sim import format_scenario_block_html
+
+        # === 상단 블록 = 기존 notify_trade_complete 와 동일 포맷 ===
+        reason_emoji = "✅" if record.exit_reason == ExitReason.TARGET else "🔴"
+        reason_names = {
+            ExitReason.TARGET: "목표가 도달",
+            ExitReason.HARD_STOP: "하드 손절",
+            ExitReason.TIMEOUT: "20분 타임아웃",
+            ExitReason.FUTURES_STOP: "선물 급락",
+            ExitReason.FORCE_LIQUIDATE: "강제 청산",
+            ExitReason.MANUAL: "수동 청산",
+            ExitReason.NO_ENTRY: "미진입",
+        }
+        reason_name = reason_names.get(record.exit_reason, record.exit_reason.value)
+
+        mins, secs = divmod(record.holding_seconds, 60)
+        holding_str = f"{mins}분 {secs}초" if mins > 0 else f"{secs}초"
+
+        high_time = record.new_high_time.strftime("%H:%M:%S") if record.new_high_time else "-"
+        buy1_time_str = record.buy1_time.strftime("%H:%M:%S") if record.buy1_time else "-"
+
+        pnl_sign = "+" if record.pnl >= 0 else ""
+        capital_str = f"{record.capital // 10000:,}만원"
+        exit_price = int(record.avg_sell_price)
+
+        line_buy1 = f"체결    │ 1차 {buy1_time_str} {record.buy1_price:,}원 × {record.buy1_qty}주"
+        if record.buy2_qty > 0 and record.buy2_time is not None:
+            buy2_time_str = record.buy2_time.strftime("%H:%M:%S")
+            line_buy2 = f"        │ 2차 {buy2_time_str} {record.buy2_price:,}원 × {record.buy2_qty}주"
+        else:
+            line_buy2 = f"        │ 2차 {record.target_buy2_price:,}원 매수가 미도달"
+
+        head = (
+            f"<b>[{record.name}] 거래 완료</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"신고가  │ {record.new_high_price:,}원 ({high_time})\n"
+            f"{line_buy1}\n"
+            f"{line_buy2}\n"
+            f"청산    │ {exit_price:,}원 — {reason_name} {reason_emoji}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"손익    │ {pnl_sign}{int(record.pnl):,}원 ({pnl_sign}{record.pnl_pct:.2f}%)\n"
+            f"투자금比│ {pnl_sign}{record.capital_pnl_pct:.2f}% ({capital_str} 기준)\n"
+            f"보유시간│ {holding_str}"
+        )
+
+        # === 하단 블록 = 시나리오 시뮬 ===
+        buy_time_for_sim = record.buy1_time or record.first_buy_time
+        if not buy_time_for_sim or record.total_buy_qty <= 0 or not scenarios:
+            # 시뮬 불가 — 상단만 전송
+            self._send(head)
+            return
+
+        blocks = [head]
+        blocks.append("")
+        blocks.append("<i>※ What-if (분봉 해상도, v1: target/강제청산)</i>")
+        # 정렬된 pct 순서로 출력 (60 → 70)
+        for pct in sorted(scenarios.keys()):
+            sim = scenarios[pct]
+            block = format_scenario_block_html(
+                recovery_pct=pct,
+                sim=sim,
+                avg_buy_price=record.avg_buy_price,
+                total_buy_qty=record.total_buy_qty,
+                buy_time=buy_time_for_sim,
+                capital=record.capital,
+            )
+            blocks.append("━━━━━━━━━━━━━━━━━━━━")
+            blocks.append(block)
+
+        msg = "\n".join(blocks)
+        self._send(msg)
+
     def notify_daily_summary(self, summary: "DailySummaryR10") -> None:
         """
         당일 매매 종료 후 일일 요약 텔레그램 전송.

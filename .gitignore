@@ -73,3 +73,10 @@ Obsidian/*.zip
 # W-16 vault 작업 산출물 (1 회성, 비추적)
 vault_*.zip
 W-*_vault_*.md
+
+# 운영 백업 디렉토리 (로컬 보존, git 비추적)
+backups/
+
+# Staleness/임시 작업 백업
+*.pre-staleness*
+*.backup_v*

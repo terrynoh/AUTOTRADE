@@ -71,6 +71,9 @@ class TradeRecord:
     target_price: float = 0.0          # 목표가
     hard_stop_price: int = 0           # R-10: 손절가
 
+    # What-if 시나리오 시뮬용 (실측 50% 기준 post_entry_low)
+    post_entry_low: int = 0            # 매수 후 저점 (confirmed_high + post_entry_low) / 2 의 그 값
+
     # 메타
     trade_mode: str = "dry_run"         # dry_run | paper | live
     capital: int = 50_000_000          # R-10: 투자금

@@ -892,8 +892,10 @@ class WatcherCoordinator:
         active = self.active
         if active is not None and active._exit_signal_pending:
             await self._execute_exit(active, ts)
-            self._active_code = None
-            # T 시점: active 가 비었음. 다음 매수 평가는 다음 틱에서 자동 처리
+            # Fix 5 (R-18): _active_code 즉시 해제 제거.
+            # 매도 SUBMITTED ~ on_sell_complete 사이 active 잠금 유지.
+            # → 다른 종목 진입 race 차단 (ISSUE-A/D 근본 차단).
+            # active 해제는 main._on_exit_done step 6.5 에서 단일 처리.
             return
 
         # === 3. active 가 비어있으면 매수 발주 평가 ===
