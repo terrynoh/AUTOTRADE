@@ -490,3 +490,27 @@ class TradeLogger:
             return dict(row) if row else None
         finally:
             conn.close()
+
+    def get_monthly_summary(self, year: int, month: int) -> dict:
+        """calendar month (1일~말일) 의 trades_r10 합산 P&L + 거래건수 + 거래일수."""
+        from calendar import monthrange
+        last_day = monthrange(year, month)[1]
+        start = f"{year}-{month:02d}-01"
+        end = f"{year}-{month:02d}-{last_day:02d}"
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(pnl), 0) AS total_pnl, "
+                "COUNT(*) AS trade_count, "
+                "COUNT(DISTINCT trade_date) AS day_count "
+                "FROM trades_r10 "
+                "WHERE trade_date BETWEEN ? AND ? AND exit_reason != 'NO_ENTRY'",
+                (start, end)
+            ).fetchone()
+            return {
+                "total_pnl": int(row["total_pnl"]) if row else 0,
+                "trade_count": int(row["trade_count"]) if row else 0,
+                "day_count": int(row["day_count"]) if row else 0,
+            }
+        finally:
+            conn.close()

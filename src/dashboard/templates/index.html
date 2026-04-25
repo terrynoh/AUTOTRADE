@@ -30,8 +30,6 @@
             font-weight: 600;
             text-transform: uppercase;
         }
-        .mode-dry_run { background: #1e3a5f; color: #60a5fa; }
-        .mode-paper { background: #3b2f1e; color: #fbbf24; }
         .mode-live { background: #3b1e1e; color: #f87171; }
 
         .container { padding: 16px 24px; display: flex; flex-direction: column; gap: 16px; }
@@ -206,7 +204,7 @@
         <h1>AUTOTRADE</h1>
         <div style="display: flex; align-items: center; gap: 12px;">
             <span id="server-time" style="color: #64748b; font-size: 13px;">--:--:--</span>
-            <span id="mode-badge" class="mode mode-dry_run">--</span>
+            <span id="mode-badge" class="mode mode-live">--</span>
             <span id="conn-status">
                 <span class="status-dot dot-red"></span>Disconnected
             </span>
@@ -249,13 +247,14 @@
                 <div class="value" id="cash">-</div>
             </div>
             <div class="card">
-                <h3>평가금액</h3>
-                <div class="value" id="total-eval">-</div>
-            </div>
-            <div class="card">
                 <h3>당일 P&L</h3>
                 <div class="value" id="daily-pnl">-</div>
                 <div class="sub" id="daily-trades">거래 0건</div>
+            </div>
+            <div class="card">
+                <h3>월간 누적 P&L</h3>
+                <div class="value" id="monthly-pnl">-</div>
+                <div class="sub" id="monthly-trades">거래 0건 / 0영업일</div>
             </div>
         </div>
 
@@ -510,12 +509,19 @@
 
             // 계좌
             document.getElementById('cash').textContent = fmtWon(d.available_cash);
-            document.getElementById('total-eval').textContent = fmtWon(d.total_eval);
 
             const pnlEl = document.getElementById('daily-pnl');
             pnlEl.textContent = (d.daily_pnl > 0 ? '+' : '') + fmtWon(d.daily_pnl);
             pnlEl.className = 'value ' + (d.daily_pnl > 0 ? 'pnl-plus' : d.daily_pnl < 0 ? 'pnl-minus' : '');
             document.getElementById('daily-trades').textContent = `거래 ${d.daily_trades}건`;
+
+            const mPnl = d.monthly_pnl ?? 0;
+            const mTrades = d.monthly_trades ?? 0;
+            const mDays = d.monthly_days ?? 0;
+            const mPnlEl = document.getElementById('monthly-pnl');
+            mPnlEl.textContent = (mPnl > 0 ? '+' : '') + fmtWon(mPnl);
+            mPnlEl.className = 'value ' + (mPnl > 0 ? 'pnl-plus' : mPnl < 0 ? 'pnl-minus' : '');
+            document.getElementById('monthly-trades').textContent = `거래 ${mTrades}건 / ${mDays}영업일`;
 
             // 모니터
             const emptyEl = document.getElementById('monitors-empty');

@@ -68,7 +68,9 @@ class DashboardState:
         self.connected: bool = False
         self.trade_mode: str = ""
         self.available_cash: int = 0
-        self.total_eval: int = 0
+        self.monthly_pnl: int = 0
+        self.monthly_trades: int = 0
+        self.monthly_days: int = 0
 
         self.monitors: list[Watcher] = []
 
@@ -132,9 +134,11 @@ class DashboardState:
                 "connected": False,
                 "trade_mode": "",
                 "available_cash": 0,
-                "total_eval": 0,
                 "daily_pnl": 0,
                 "daily_trades": 0,
+                "monthly_pnl": 0,
+                "monthly_trades": 0,
+                "monthly_days": 0,
                 "monitors": [],
                 "manual_codes": [],
                 "logs": list(self.log_messages)[-100:],
@@ -178,9 +182,11 @@ class DashboardState:
             "connected": self.connected,
             "trade_mode": self.trade_mode,
             "available_cash": self.available_cash,
-            "total_eval": self.total_eval,
             "daily_pnl": round(at.risk.daily_pnl),
             "daily_trades": at.risk.daily_trades,
+            "monthly_pnl": self.monthly_pnl,
+            "monthly_trades": self.monthly_trades,
+            "monthly_days": self.monthly_days,
             "monitors": monitors_data,
             "manual_codes": list(at._manual_codes),
             "logs": list(self.log_messages)[-log_size:],
@@ -428,9 +434,12 @@ async def websocket_endpoint(ws: WebSocket):
         while True:
             data = state.to_dict()
             if not is_admin:
-                # 비인증 클라이언트에는 로그/예수금 제외
+                # 비인증 클라이언트에는 로그/예수금/월간 P&L 제외
                 data.pop("logs", None)
                 data.pop("available_cash", None)
+                data.pop("monthly_pnl", None)
+                data.pop("monthly_trades", None)
+                data.pop("monthly_days", None)
             await ws.send_json(data)
             await asyncio.sleep(1)
     except WebSocketDisconnect:
@@ -469,9 +478,18 @@ async def _sync_from_autotrader() -> None:
     state.trade_mode = at.settings.trade_mode
     state.monitors = list(at._coordinator.watchers)
 
-    # 예수금/평가
+    # 예수금
     state.available_cash = at._available_cash
-    state.total_eval = at._available_cash
+
+    # 월간 누적 P&L (calendar month, 매 broadcast 마다 SQL 재집계)
+    try:
+        _now = now_kst()
+        _m = at._trade_logger.get_monthly_summary(_now.year, _now.month)
+        state.monthly_pnl = _m["total_pnl"]
+        state.monthly_trades = _m["trade_count"]
+        state.monthly_days = _m["day_count"]
+    except Exception as _e:
+        logger.debug(f"월간 누적 P&L 조회 실패: {_e}")
 
     # broadcast to WebSocket clients
     try:
